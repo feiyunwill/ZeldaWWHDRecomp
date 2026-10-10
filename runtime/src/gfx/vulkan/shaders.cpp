@@ -9,6 +9,7 @@
 #include "Cafe/HW/Latte/Core/FetchShader.h"
 #include "Cafe/HW/Latte/Core/LatteShader.h"
 #include "Cafe/HW/Latte/ISA/RegDefines.h"
+#include "Cafe/HW/Latte/LegacyShaderDecompiler/LattePSInputDefault.h"
 #include "Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h"
 #include "gx2/gx2.h"
 #include "gx2/gx2_regs.h"
@@ -73,7 +74,7 @@ uint64_t hash_bytes(const void* bytes, size_t size, uint64_t hash = 0x9E3779B97F
 }
 // Disk entries retain exact GLSL to verify hash collisions and translator changes.
 // Bump this compile recipe whenever compilation options/defaults change.
-constexpr char cacheRecipe[] = "WWVKSC02:glsl450:vk1.1:spv1.3:noopt:resources1:"
+constexpr char cacheRecipe[] = "WWVKSC02:glsl450:vk1.1:spv1.3:noopt:resources1:strictmul1:"
     GLSLANG_VERSION_FLAVOR;
 constexpr size_t maxCacheBytes = 128u * 1024u * 1024u;
 constexpr size_t maxSourceBytes = 4u * 1024u * 1024u;
@@ -515,6 +516,10 @@ bool decompile(Shader& shader, const uint32_t* regs, bool vertex, LatteFetchShad
         options.linkPSInputsToVS = true;
         options.vsOutputSemantics = link.exports;
     }
+    // the GPU's MUL/MULADD give 0*anything=0 (rsqrt(0)*0 is NaN otherwise: black letter in the Rito
+    // mail sorting game); Cemu's default too. WWHD_STRICT_MUL=0 turns it off for comparisons
+    static const bool strictMul = !getenv("WWHD_STRICT_MUL") || strcmp(getenv("WWHD_STRICT_MUL"), "0");
+    options.strictMul = strictMul;
     uint64_t packBase=0;
     if(mods::cemu::has_shaders()) {
         packBase=cemu_pack_hash::base(ppc_ptr(address),size,regs,vertex,fetch);
@@ -559,6 +564,13 @@ bool decompile(Shader& shader, const uint32_t* regs, bool vertex, LatteFetchShad
         auto packAux=cemu_pack_hash::auxiliary(*shader.dec,regs,vertex);
         auto custom=mods::cemu::shader_source(packBase,packAux,vertex);
         if(!custom.empty()) {
+            if(!vertex&&link.unfed) {
+                // the inputs the translation made constants (ps_link), with the same values
+                const char* values[32]={};
+                for(uint32_t f=0;f<GPU7_PS_MAX_INPUTS&&f<32;f++)
+                    if(link.unfed&(1u<<f))values[f]=LattePSInputDefaultGLSL(regs[mmSPI_PS_INPUT_CNTL_0+f]);
+                custom=mods::cemu::const_pixel_inputs(std::move(custom),values);
+            }
             std::string error;
             auto replacement=compile_glsl(custom,vertex,&error);
             std::string originalError;

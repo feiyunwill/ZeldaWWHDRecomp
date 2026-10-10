@@ -18,7 +18,14 @@ A release folder contains `portable.txt`. Then everything stays in `<release>/da
 | `data/user/` | settings, controls, graphics options, save states, shader caches (`host::portable_user_dir()`) |
 | `data/captures/` | crash logs (the game runs in `data/`) |
 | `data/install.json`, `data/setup.log` | what was prepared (paths inside `data/` relative, so the folder can move), and the setup log |
-| `data/toolchain/`, `data/python/` | the downloaded compiler (Windows, Linux; removable at the end) and Python (Linux without Python 3; the Windows release ships its Python in `tools/python`) |
+| `data/toolchain/`, `data/python/` | the downloaded compiler (Windows, Linux; kept by default for guest mods and repair) and Python (Linux without Python 3; the Windows release ships its Python in `tools/python`) |
+
+Guest builds use `data/guest-sdk.json`: setup's compiler argument vector, Python, translator
+and runtime headers. Version 2 stores paths inside the portable release relative to the config
+file, so moving the release folder preserves them; external/system tools remain absolute.
+The Zig global cache also stays in the selected toolchain directory. Version 1 configs remain
+readable. Removing the downloaded compiler is optional, but guest builds then require running
+setup again to restore it. No environment secrets are persisted in this file.
 
 Runtime side: a `portable.txt` next to the game executable makes `host::config_dir()` return
 `<folder>/user` (`runtime/src/platform/host.h`); `main.cpp` points the macOS-only paths (save states,
@@ -26,6 +33,15 @@ display settings, Metal shader cache) there through their existing overrides; `g
 graphics options in `user/graphics.plist` instead of NSUserDefaults; the Controls window does not
 autosave its frame. Without the marker (source builds) nothing changes. Shortcuts (Applications link,
 Start menu, applications menu) are only created when the player asks for one.
+
+Without `portable.txt` (a source build, or a Linux AppImage: its mount is read-only, issue #55) the
+same tree lives in the per-user folders of earlier releases instead: `data/` above becomes
+`~/Library/Application Support/wwhd`, `%LOCALAPPDATA%\WWHD` or `$XDG_DATA_HOME/wwhd`
+(`~/.local/share/wwhd`), and `data/user/` becomes that platform's `host::config_dir()`
+(`~/.config/wwhd` on Linux). `setup.py default_data_dir()` and `gui/setup_gui.cpp data_dir_of()`
+implement the same rule; `tools/release/appimage.py` drops `portable.txt` from the package for exactly
+this reason. `install.json` then keeps `exe` and `game_dir` as absolute paths (`rel_to_data` is a
+no-op without the marker).
 
 ## Pieces
 

@@ -13,6 +13,8 @@
 #include "../screenshot.h"
 #include "../input_map.h"
 #include "../overlay/hostui.h"
+#include "../overlay/overlay.h"
+#include "../mods/code_mods.h"
 #include "../crashrec.h"
 #include "../aspect.h"
 #include "renderer.h"
@@ -196,6 +198,7 @@ static void choose_renderer(render::Api a) {
         if (!s.used) return @"empty";
         NSString* d = [NSString stringWithFormat:@"%s%s%s%s", s.when.c_str(), s.area.empty() ? "" : " · ", s.area.c_str(),
                                                     s.portable ? "" : " · full"];
+        if (!s.controller.empty()) d = [d stringByAppendingFormat:@" · %s", s.controller.c_str()];
         return s.compatible ? d : [d stringByAppendingString:@" (incompatible)"];
     };
     for (int i = 1; i <= ss::kSlots; i++) {
@@ -262,6 +265,12 @@ static WWStateMenu* g_state_menu;
     gfx::show_drc_window(item.tag == 0);  // the GamePad window follows the controller choice
     gfx::set_host_setting("proController", item.tag == 1 ? "1" : "0");  // as the settings overlay saves it
 }
+- (void)setFaceLayout:(NSMenuItem*)item {
+    // issue #78: which host face buttons drive the Wii U's A/B/X/Y (the same as the Controls window)
+    input_map::Mapping m = input_map::current();
+    input_map::apply_face_layout(m, item.tag == 1 ? input_map::FaceLayout::kLabels : input_map::FaceLayout::kPosition);
+    input_map::set_current(m);
+}
 - (void)toggleInterp:(NSMenuItem*)item { interp::set_mode(interp::mode() == item.tag ? 0 : (int)item.tag); update_title(); }
 - (void)toggleInterpFps:(NSMenuItem*)item { interp::toggle_fps((int)item.tag); update_title(); }
 - (void)toggleDrcWindow:(NSMenuItem*)item { gfx::show_drc_window(!gfx::drc_window_shown()); }
@@ -287,6 +296,11 @@ static WWStateMenu* g_state_menu;
     }
     if (item.action == @selector(setController:))
         item.state = (item.tag == 1) == input::pro_controller() ? NSControlStateValueOn : NSControlStateValueOff;
+    if (item.action == @selector(setFaceLayout:)) {
+        input_map::FaceLayout fl = input_map::face_layout(input_map::current());
+        bool on = fl == (item.tag == 1 ? input_map::FaceLayout::kLabels : input_map::FaceLayout::kPosition);
+        item.state = on ? NSControlStateValueOn : NSControlStateValueOff;
+    }
     if (item.action == @selector(toggleInterp:)) item.state = interp::mode() == item.tag ? NSControlStateValueOn : NSControlStateValueOff;
     if (item.action == @selector(toggleInterpFps:))
         item.state = interp::mode() == 1 && interp::fps() == item.tag ? NSControlStateValueOn : NSControlStateValueOff;
@@ -445,6 +459,12 @@ void install_menu(NSWindow* tv) {
     [in addItemWithTitle:@"Keyboard and controllers act as" action:nil keyEquivalent:@""].enabled = NO;
     add(in, @"    Wii U GamePad", @selector(setController:), @"", 0);
     add(in, @"    Wii U Pro Controller", @selector(setController:), @"", 1);
+    [in addItemWithTitle:@"Face buttons drive the Wii U's A/B/X/Y" action:nil keyEquivalent:@""].enabled = NO;
+    add(in, @"    By position (Nintendo)", @selector(setFaceLayout:), @"", 0).toolTip =
+        @"The bottom face button is B and the right one is A (Nintendo layout)";
+    add(in, @"    By label (Xbox)", @selector(setFaceLayout:), @"", 1).toolTip =
+        @"The button named A is A: on an Xbox pad A accepts/acts and B goes back (issue #78). "
+        @"Rewrites the A/B/X/Y controller bindings only";
     [in addItem:[NSMenuItem separatorItem]];
     add(in, @"Show GamePad screen (\u2318G)", @selector(toggleDrcWindow:), @"");
     [in addItem:gfx::controls_menu_item()];
@@ -454,6 +474,9 @@ void install_menu(NSWindow* tv) {
     // Gameplay: optional mods, all off by default (runtime/src/mods/). One line per option.
     NSMenuItem* gpItem = [bar addItemWithTitle:@"Gameplay" action:nil keyEquivalent:@""];
     NSMenu* gp = [[NSMenu alloc] initWithTitle:@"Gameplay"];
+    toggle(gp, @"Enable code mods (PowerPC mods)", ^BOOL { return mods::code::enabled(); }, ^(BOOL on) {
+        mods::code::request(on);overlay::set_open(true);
+    }, @"Rebuild game code with mod support; confirmation is in Settings > Mods");
     [gp addItemWithTitle:@"Camera" action:nil keyEquivalent:@""].enabled = NO;
     toggle(gp, @"    Direct right-stick camera (no easing)", ^BOOL { return mods::direct_camera(); }, ^(BOOL on) { mods::set_direct_camera(on); },
            @"The right stick turns the camera at a constant rate as soon as it is pushed");

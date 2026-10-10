@@ -10,6 +10,79 @@ How it works and how it differs from running the game in Cemu: [docs/how-it-work
 
 ## What's new in this update
 
+### Next update
+
+### v0.2.11
+
+- **Linux: one-file AppImage** (issue #55, PR #101, thanks @mhbxyz), next to the zip. Download it,
+  make it executable, run it. It keeps the game, its compiled code, saves and settings in your user
+  folders (`$XDG_DATA_HOME/wwhd`, usually `~/.local/share/wwhd`); `--data-dir` picks another folder.
+  On distributions without libfuse2 (e.g. Ubuntu 24.04+) start it with `--appimage-extract-and-run`.
+  The zip stays as it is.
+
+- **Face buttons by label (Xbox layout)** (issue #78, PR #97, thanks @mhbxyz): settings overlay →
+  Controls → *Face buttons* (also the macOS Controls window and Input menu). *By position
+  (Nintendo)* stays the default; *by label (Xbox)* makes the button named A act as A, so on an Xbox pad
+  A accepts and B goes back.
+
+- **Ultrawide and tall screens: menus fixed** (issue #76, building on PR #16 by @arcadematicas): at
+  21:9, 32:9, 16:10 and 4:3 the pause menu, inventory grid, cursor, map and the tabs stay centred at 16:9
+  and line up again; backgrounds and the sepia filter still fill the picture.
+
+- **Fixed: black letter card in the Rito mail-sorting game** (issues #28, #69, PR #39, thanks
+  @Sean13128): the GPU's "0 × anything = 0" multiply is emulated now (as in Cemu). The shader caches
+  rebuild once after updating, so expect a brief stutter on the first start.
+
+- **Fixed: Cemu graphics packs**
+  - packs that replace pixel shaders (e.g. Contrasty, NoSSAO, RemoveHUD) partly didn't apply on Vulkan
+    since v0.2.10 (PR #87, thanks @rhemfur);
+  - packs for the **European** version were refused with "Cemu pack does not target WWHD USA"
+    (issue #103). A pack is now accepted when its `titleIds` name the version you installed;
+    SDCafiine-style folders named after the title ID follow the same rule.
+
+- **Smoother in busy views on Windows and Android:** the Vulkan buffer cache is now on by default
+  everywhere. It keeps unchanged vertex, index and uniform data on the GPU instead of copying them
+  every frame: on an RX 6700 XT 13–19% less render-thread time and half the uploads (issue #91, thanks
+  @darklinkpower), on a Galaxy S25 Ultra about 34 → 47 fps in heavy Outset views (issue #56, thanks
+  @rhemfur). If you see broken or flickering geometry, start with `WWHD_VK_BUFFER_CACHE=0` and please
+  report it.
+
+- **Less CPU work:**
+  - native versions of the game's two hottest audio loops (PR #81, thanks @depende3000): the audio
+    thread uses about two thirds less CPU, with bit-identical sound (also on the European version);
+  - the scheduler sleeps while nothing is waiting, and GPU context switches copy only the registers
+    that changed;
+  - the recompiler no longer emits signed overflow for `mulli`/`mullw`/`neg` (PR #82, thanks
+    @depende3000), a latent bug a newer compiler could have turned into wrong behaviour.
+
+- **Android:**
+  - when the system driver is too old for the renderer, Adreno phones offer **Install GPU driver…**
+    right in the error message (PR #92, thanks @rhemfur);
+  - on one-screen views the **GamePad screen appears automatically while the game is paused** (map,
+    menus, save prompt) and the TV picture comes back when you resume (PR #59, thanks @rhemfur);
+  - precise Vulkan synchronization (barriers) is on by default, where tile-based GPUs are expected to
+    gain the most (issue #104). On desktop it's opt-in for testing: `WWHD_VK_NARROW_BARRIERS=1`.
+
+- **Save states remember the controller mode** (Pro Controller or GamePad) and restore it on load.
+
+- **"Keep game speed" explained:** with it off, the whole game runs in slow motion whenever the frame
+  target isn't reached (e.g. 120/240 fps at 2x). The setting says so now, is marked as recommended, and
+  the performance overlay warns when it happens (issue #91).
+
+- **A log file for every run:** `captures/wwhd.log` in the game's data folder (the previous run's is
+  kept as `wwhd-previous.log`), with your user paths removed as in crash logs. Please attach it to bug
+  reports. `WWHD_LOG_FILE=<path>` writes it elsewhere, `WWHD_LOG_FILE=0` turns it off.
+
+- **Code mods (Mod SDK v2, off by default):** mods written in C for the console's CPU, translated and
+  built on your machine when you install them, for the USA and the European game. Turn them on in
+  Settings → Mods → *Enable code mods* (this rebuilds the game code once; with it off nothing changes).
+  For modders: [docs/mod-sdk-v2.md](docs/mod-sdk-v2.md).
+
+- **Smaller fixes:** `WWHD_SHADOW_FIX` is gone, use `WWHD_SHADOW_SCALE=1` for console-sized shadow maps
+  (issue #67: since v0.2.9 both sizes look practically the same); the buffer cache's verify mode no
+  longer reads GPU memory (it ran at ~1 fps on some Windows drivers); a crash at exit with SDL 3.4 on
+  Linux is fixed.
+
 ### v0.2.10
 
 - **Fixed: the cheats in v0.2.9 wrote to the wrong place in the save data** (Give all items, Master
@@ -420,7 +493,10 @@ computer (about two minutes); every later start launches the game directly.
      on Apple Silicon, other ARM boards and laptops), glibc 2.35 or newer (Ubuntu 22.04+, Debian 12+,
      Fedora 36+, Arch, SteamOS 3, Raspberry Pi OS 12), a GPU with Vulkan 1.3 drivers (or 1.1 / 1.2 with
      `VK_KHR_dynamic_rendering`). Take the zip
-     that matches `uname -m` (`x86_64` or `aarch64`); setup says so if it doesn't.
+     that matches `uname -m` (`x86_64` or `aarch64`); setup says so if it doesn't. Or take the
+     single-file **AppImage** (same two architectures) instead of the zip (issue #55): `chmod +x` it
+     and start it from anywhere, Steam Deck included. Nothing is unzipped and the file itself is never
+     written to.
 2. Start **Wind Waker HD** (`Wind Waker HD.app`, `Wind Waker HD.exe`, or `wind-waker-hd` /
    `Wind Waker HD.desktop` on Linux). The first start asks for:
    - your **disc image** (`.wux` or `.wud`), a **Cemu archive** (`.wua`), or an already **extracted
@@ -476,6 +552,11 @@ First start, per system:
   it first). It uses your Python 3 and downloads the compiler (zig, 55 MB; the x86-64 or arm64 build
   matching your system) into the release folder;
   you can remove it at the end.
+- **Linux (AppImage)**: `chmod +x WindWakerHD-*-linux-*.AppImage`, then start that file (from a file
+  manager, a terminal or Steam as a non-Steam game). It needs no unzipping and no writable folder of
+  its own. Ubuntu 24.04 and newer have no FUSE by default: install `libfuse2t64` (`libfuse2` on older
+  releases), or start it with `--appimage-extract-and-run`. Repair or change the game with `--setup`.
+  Everything it creates is listed under "Everything stays in the release folder" below.
 
 **Everything stays in the release folder** (in `data/`): the built game, the extracted game files,
 saves (`data/save`), settings, controls, save states and shader caches (`data/user`), crash logs
@@ -485,13 +566,21 @@ the end. To remove everything, delete the folder. Starting a newer release: unzi
 one, start it, choose your game (the old folder's `data/game` can be used in place) and copy your saves
 and settings from the old folder.
 
+The **Linux AppImage is not a portable folder** (issue #55): its file is read-only, so the game, its
+code and saves go to `~/.local/share/wwhd` and the settings, controls, save states and caches to
+`~/.config/wwhd` (or `$XDG_DATA_HOME` / `$XDG_CONFIG_HOME`; `--data-dir FOLDER` chooses another place
+for the first, for example an SD card on a Steam Deck). Nothing is written beside the `.AppImage`; the
+menu entry the setup adds starts the same game. To remove everything, delete the file and those two
+folders.
+
 The setup also runs in a terminal (the fallback): `tools/Setup in Terminal.command` (macOS),
 `tools/Setup in a console window.bat` (Windows), `tools/setup-in-terminal.sh` (Linux). How it works
 and the interface between the window and `tools/installer/setup.py`:
 [tools/installer/README.md](tools/installer/README.md). Scripted use: `tools/installer/setup.py --help`.
 
-Source builds (below) are not portable: they keep using `~/Library/Application Support/wwhd`,
-`%APPDATA%\WWHD` or `~/.config/wwhd`, as before.
+Source builds (below) and the Linux AppImage are not portable: they keep using the per-user folders
+(`~/Library/Application Support/wwhd`, `%LOCALAPPDATA%\WWHD` for the game and saves,
+`~/.config/wwhd` for the settings on Linux), as before.
 
 ## Requirements (building from source)
 
@@ -812,6 +901,11 @@ plays the recorded input back to reproduce the crash. Automatic states can also 
 
 Game controllers (Xbox, PlayStation, Switch Pro, MFi) work too; by default buttons map by
 position (the bottom face button is the Wii U's B), and they can be remapped in the Controls window.
+**Face buttons** in the settings overlay (F1 → Controls) or the Input menu switches that preset:
+*by position (Nintendo)* is the default; *by label (Xbox)* makes the button named A drive the Wii
+U's A instead — on an Xbox pad that means A accepts/acts and B goes back (issue #78), and the X/Y
+items follow the printed labels too. The choice rewrites the four face bindings only; keyboard keys
+and the other inputs stay as they are, and a hand-edited face binding shows as *custom*.
 The **Input** menu switches whether keyboard and controllers act as the Wii U GamePad (default)
 or as a Wii U Pro Controller (`WWHD_PRO_CONTROLLER=1` starts in that mode); with the Pro
 Controller, the GamePad window keeps its screen and touch input.
@@ -867,14 +961,15 @@ title screen and the file select, before a file is loaded, it quits without aski
   override the remembered choices); `WWHD_DISPLAY_HZ=n` replaces the detected display refresh rate
   that 120/240 fps are capped to (0: no cap); `WWHD_UNCAPPED=1` starts with the debug switch
   "Uncapped" on (no frame limit, no vsync; the game runs faster than real time);
-  `WWHD_SHADOW_FIX=1` keeps the shadow maps at the console's 1024x1024 at higher internal resolutions
-  (issue #67: soft, steady shadow edges as on the console; by default the maps scale with the internal
-  resolution, for sharper edges that can shimmer in places); `WWHD_SHADOW_SCALE=n` gives the shadow
-  maps their own resolution factor (overrides both); `WWHD_STATE_DIR=<dir>`
+  `WWHD_SHADOW_SCALE=n` gives the shadow maps their own resolution factor (by default they scale with
+  the internal resolution; since v0.2.9 both look practically the same, issue #67). `=1` keeps the
+  console's 1024x1024 and uses much less GPU memory at 2x/3x, useful on weaker hardware; `WWHD_STATE_DIR=<dir>`
   stores save states elsewhere; `WWHD_FULL_SAVE_STATES=0|1` full or portable save states for this
   start; `WWHD_PORTABLE_LOAD=<file.wwstate>` loads that portable state (e.g. from a bug report) as
   soon as a Quest Log is being played; `WWHD_RUMBLE=0|1` (SDL builds) start value for Controls > Rumble (overrides the remembered
   choice); `WWHD_LOG_RUMBLE=1` logs the game's motor requests and what the motors do.
+  `WWHD_STRICT_MUL=0` turns off the GPU's 0×anything=0 multiply rule in shaders (on by default, as in
+  Cemu; off only for performance comparisons, it brings back e.g. the black letter in the Rito mail sorting game).
 - Crashes and game halts write `captures/crash-<time>.log` (crash address, registers, the guest call
   chain, a host backtrace and the last log lines; useful for bug reports, it contains only addresses,
   function names, the file names of the program's modules and log text). A crash address outside the

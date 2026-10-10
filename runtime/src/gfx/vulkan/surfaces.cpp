@@ -157,19 +157,16 @@ static void target_aspect(const Surface* s, float& kx, float& ky) {
 }
 
 // the factor a render target gets. Shadow maps (depth arrays: the game's cascades) scale with the
-// internal resolution by default (sharper shadows; the user's choice). WWHD_SHADOW_FIX=1 keeps the
-// console's 1024x1024 (issue #67), and WWHD_SHADOW_SCALE=n gives them their own factor (overrides
-// both). The trade-off: the game softens shadow edges by sampling the map with bilinear depth compare at a per-pixel random
-// offset, then blurring the result on screen. At 2048x2048 each compare filters half as wide, so
-// shadow edges came out hard and the random offsets showed as crawling hatching (issue #67: the
-// bridge's shadow on Outset's water, hard and shimmering at 2x). Cemu's graphics packs also keep
-// the shadow maps at the console's size unless asked.
+// internal resolution by default. WWHD_SHADOW_SCALE=n gives them their own factor; =1 keeps the
+// console's 1024x1024, which uses far less GPU memory at 2x/3x. Issue #67: the hard, crawling
+// shadow edges at 2x in v0.2.6-v0.2.8 came mainly from the missing mip chains the game's
+// shadow-mask softening samples (restored in v0.2.9); since then both sizes give practically the
+// same soft edges, the larger maps only a hair crisper.
 static float target_scale(const Surface* s) {
     uint32_t width,height;
     if(!s->fmt.compressed&&s->mips==1&&mods::cemu::texture_extent(s->width,s->height,s->format,s->slices,s->tileMode,width,height))return 1.0f;
     if (s->fmt.compressed || s->mips > 1) return 1.0f;
-    static const float shadow = getenv("WWHD_SHADOW_SCALE") ? parse_scale(getenv("WWHD_SHADOW_SCALE"))
-                                : getenv("WWHD_SHADOW_FIX") && *getenv("WWHD_SHADOW_FIX") && *getenv("WWHD_SHADOW_FIX") != '0' ? 1.0f : 0.0f;
+    static const float shadow = getenv("WWHD_SHADOW_SCALE") ? parse_scale(getenv("WWHD_SHADOW_SCALE")) : 0.0f;
     if (shadow && s->isDepth && s->slices > 1) return shadow;
     return res_scale();
 }
@@ -364,6 +361,9 @@ static Surface* with_mip_chain(Surface* s, const SurfaceDesc& d) {
         }
     }
     to_src(mips - 1);
+    // Per-level transitions above order writes, and the generated levels are
+    // also blit sources. Preserve these reads for the next whole-image write.
+    derive_dependency(c->use, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT, true);
     c->layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;  // every level is now a transfer source
     s->mipChainSeq = key;
     static int logged = 0;
@@ -629,7 +629,7 @@ void create_surface_image(Surface* s, bool forRendering, VkExtent3D explicitExte
         viewInfo.viewType=s->viewType;viewInfo.format=s->fmt.pixel;
         viewInfo.subresourceRange={VkImageAspectFlags(s->fmt.depth?VK_IMAGE_ASPECT_DEPTH_BIT:VK_IMAGE_ASPECT_COLOR_BIT),0,s->mips,0,s->arrayLayers};
         check_vk(vkCreateImageView(R.device,&viewInfo,nullptr,&s->view),"create sampling image view");
-        s->layout=VK_IMAGE_LAYOUT_UNDEFINED;
+        s->layout=VK_IMAGE_LAYOUT_UNDEFINED;s->use={};
     } catch(...) {
         if(s->view)vkDestroyImageView(R.device,s->view,nullptr);
         if(s->image)vkDestroyImage(R.device,s->image,nullptr);
@@ -645,7 +645,7 @@ void destroy_surface_image(Surface* s) {
     auto views=std::move(s->layerViews);if(s->view)views.push_back(s->view);
     for(auto& [key,view]:s->sampledViews)if(view)views.push_back(view);s->sampledViews.clear();
     defer_surface_image(s->image,s->memory,std::move(views));
-    s->image=VK_NULL_HANDLE;s->memory=VK_NULL_HANDLE;s->view=VK_NULL_HANDLE;s->layout=VK_IMAGE_LAYOUT_UNDEFINED;
+    s->image=VK_NULL_HANDLE;s->memory=VK_NULL_HANDLE;s->view=VK_NULL_HANDLE;s->layout=VK_IMAGE_LAYOUT_UNDEFINED;s->use={};
     s->layerViews.clear();
 }
 VkImageView layer_view(Surface* s,uint32_t layer) {
@@ -986,7 +986,7 @@ static Surface* rescale(Surface* s) {
     catch(...) { destroy_surface_image(&replacement);throw; }
     destroy_surface_image(s);
     s->image=replacement.image;s->memory=replacement.memory;s->view=replacement.view;
-    s->extent=replacement.extent;s->layout=replacement.layout;s->usage=replacement.usage;s->createFlags=replacement.createFlags;s->scale=replacement.scale;s->ax=replacement.ax;s->ay=replacement.ay;s->sx=replacement.sx;s->sy=replacement.sy;
+    s->extent=replacement.extent;s->layout=replacement.layout;s->use=replacement.use;s->usage=replacement.usage;s->createFlags=replacement.createFlags;s->scale=replacement.scale;s->ax=replacement.ax;s->ay=replacement.ay;s->sx=replacement.sx;s->sy=replacement.sy;
     forget_texture_views();return s;
 }
 // One guest surface can be rendered and sampled through views of different formats with the same
@@ -1220,9 +1220,8 @@ static std::vector<uint8_t> read_guest_texels(Surface* img,uint32_t layer,uint32
         transition_image(src,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_READ_BIT);
         VkBufferImageCopy region{};region.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,layer,1};region.imageExtent={w,h,1};
         auto cmd=command_buffer();vkCmdCopyImageToBuffer(cmd,src->image,src->layout,b.buffer,1,&region);
-        VkBufferMemoryBarrier barrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};barrier.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_HOST_READ_BIT;
-        barrier.srcQueueFamilyIndex=barrier.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;barrier.buffer=b.buffer;barrier.size=VK_WHOLE_SIZE;
-        vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,0,nullptr,1,&barrier,0,nullptr);
+        derive_dependency(b.use,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_WRITE_BIT);
+        transition_buffer(b,VK_PIPELINE_STAGE_HOST_BIT,VK_ACCESS_HOST_READ_BIT);
         transition_image(src,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         flush();  // waits for the GPU
         const auto* raw=static_cast<const uint8_t*>(b.mapped);

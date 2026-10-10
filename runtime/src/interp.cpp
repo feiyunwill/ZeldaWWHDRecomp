@@ -1,4 +1,5 @@
 #include "interp.h"
+#include "mods/guest_mods.h"
 #include "mods/packages.h"
 // Frame interpolation (60, 120 or 240 fps output, game logic unchanged at 30 steps per second).
 //
@@ -81,6 +82,8 @@ void f_027F55FC_orig(Cpu* c);  // J3DModel::viewCalc
 void f_027F5018_orig(Cpu* c);  // J3DModel UBO update
 
 }
+
+namespace true60_test { void logic_step(uint64_t step); }
 
 namespace interp {
 
@@ -864,12 +867,20 @@ extern "C" void hook_0203593C(Cpu* c) {
     paced_pass_start();
     true60::new_pass();
     true60::pass_begin(!enabled() || !g_hold_next);  // full pass: take back Link's half-pass preview
-    if (!enabled() || !g_hold_next) g_logic_steps++;
+    if (!enabled() || !g_hold_next) {
+        g_logic_steps++;
+        true60_test::logic_step(g_logic_steps);
+    }
     if (!enabled()) {
         g_hold_next = false;
         g_phase = 0;
         g_step_n = 1;
-        f_0203593C_orig(c);
+        {
+            PassTimer timer(0);
+            f_0203593C_orig(c);
+        }
+        static unsigned stats_steps = 0;
+        if (pass_stats() && ++stats_steps % 300 == 0) LOG("[interp]%s", pass_cpu_report().c_str());
         return;
     }
     static uint64_t frames = 0;  // passes drawn with interpolation on (frames per step in the log)
@@ -1054,7 +1065,7 @@ extern "C" void hook_025DE788(Cpu* c) {
     uint32_t execute_fn = c->r[3];
     f_025DE788_orig(c);
     mods::after_execute(c, execute_fn);  // quick doors / fast scene changes: extra steps (full passes only)
-    if (!interp::g_hold_frame) mods::packages::frame(interp::g_logic_steps);
+    if (!interp::g_hold_frame) {guestmods::frame(interp::g_logic_steps);mods::packages::frame(interp::g_logic_steps);}
     g_in_execute = false;
 }
 extern "C" void hook_025DE024(Cpu* c) { if (!skip(2)) f_025DE024_orig(c); }
