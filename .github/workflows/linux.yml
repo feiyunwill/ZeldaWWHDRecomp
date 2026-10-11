@@ -5,6 +5,7 @@ name: linux
 
 on:
   push:
+    branches: ["**"]   # not on tag pushes: a release tag points at a commit CI already tested
   pull_request:
 
 jobs:
@@ -13,19 +14,19 @@ jobs:
     env:
       SDL3_VERSION: release-3.4.18
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y clang cmake ninja-build pkg-config zlib1g-dev liblz4-dev \
-            libvulkan-dev glslang-dev glslang-tools mesa-vulkan-drivers vulkan-validationlayers xvfb \
+            libcurl4-openssl-dev libvulkan-dev glslang-dev glslang-tools mesa-vulkan-drivers vulkan-validationlayers xvfb \
             libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxss-dev libxfixes-dev libxtst-dev \
             libxkbcommon-dev libwayland-dev libasound2-dev libpulse-dev libudev-dev libdbus-1-dev
 
       - name: Cache SDL3
         id: sdl3
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/sdl3
           key: sdl3-${{ env.SDL3_VERSION }}-ubuntu-24.04

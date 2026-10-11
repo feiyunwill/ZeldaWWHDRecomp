@@ -5,6 +5,7 @@ name: windows
 
 on:
   push:
+    branches: ["**"]   # not on tag pushes: a release tag points at a commit CI already tested
   pull_request:
 
 jobs:
@@ -14,7 +15,7 @@ jobs:
       run:
         shell: msys2 {0}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: msys2/setup-msys2@v2
         with:

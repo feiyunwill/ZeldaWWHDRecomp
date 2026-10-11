@@ -106,7 +106,7 @@ def add_setup_gui(pkg, platform, exe, version):
     if platform.startswith("macos"):
         app = os.path.join(pkg, SETUP_APP + ".app", "Contents")
         copy(exe, os.path.join(app, "MacOS", "wind-waker-hd"))
-        v = re.sub(r"[^0-9.]", "", version.lstrip("v")) or "0"
+        v = re.match(r"[0-9.]*", version.lstrip("v")).group().strip(".") or "0"
         with open(os.path.join(app, "Info.plist"), "w") as f:
             f.write(MAC_SETUP_PLIST % (v, v))
         if shutil.which("codesign"):  # ad-hoc: seals the bundle (not a developer signature)
@@ -426,6 +426,7 @@ def main():
         add_setup_gui(pkg, a.platform, a.setup_gui, a.version)
 
     copy(os.path.join(ROOT, "README.md"), os.path.join(pkg, "README.md"))
+    copy(os.path.join(ROOT, "CHANGELOG.md"), os.path.join(pkg, "CHANGELOG.md"))
     lic = os.path.join(ROOT, "LICENSE")
     if os.path.isfile(lic):
         copy(lic, os.path.join(pkg, "LICENSE"))
