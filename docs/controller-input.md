@@ -5,6 +5,25 @@ choices. Controls selects whether your inputs act as a Wii U GamePad or Pro
 Controller. Select that controller in the game's Controller Selection screen too.
 The face-button preset changes A/B/X/Y; it does not change D-pad or stick directions.
 
+**Stick dead zone** defaults to **15%** for both controller sticks. This filters
+small resting-stick drift, which can otherwise keep the Picto Box zooming and its
+picture blurred. Older controls files with the former 0% default automatically
+load as 15%; other saved values are kept. Saving controls writes an
+`options.format` marker of `2`, so a deliberate 0% setting saved in the new format
+is preserved on subsequent loads.
+
+**Stick range** is set per stick (**Left stick range**, **Right stick range**),
+from 100% to 150%; the default 100% changes nothing. Raise it if a stick can't
+reach full deflection, for example when the Wind Waker baton's directions don't
+register because the game needs an almost fully tilted stick. The range applies
+after the dead zone: the stick's tilt is multiplied by the range and capped at
+full deflection, keeping its direction, so diagonals keep their angle. A stick
+that only reaches 90% needs about 112% to reach full deflection. Both sliders
+sit below the dead zone in the Controls tab and in the macOS Controls window, take
+effect immediately and are saved as `left_stick_range` and `right_stick_range`
+in the controls file's `options` (stored as factors, 1.0 to 1.5). Files without
+these keys load at 100%; values outside the range are clamped.
+
 While conducting, the **right stick supplies the notes**, including down. The
 **left stick controls the meter**: hold left or right to change the beat count.
 The D-pad does not substitute for the note stick in the original game. For example,

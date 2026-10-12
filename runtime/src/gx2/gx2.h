@@ -17,6 +17,10 @@ struct ShaderKeyDirtyStats {
 ShaderKeyDirtyStats shader_key_dirty_stats(); // Render-thread diagnostics.
 uint32_t color_buffer_address(const GX2::GX2ColorBuffer* cb);
 LatteFetchShader* build_fetch_shader(uint32_t program);  // from our encoded fetch "program"
+// Local head-start semantic attributes, never guest GPU instructions. Validates
+// the whole WWFA0001 payload before constructing a parsed fetch shader.
+LatteFetchShader* decode_fetch_attributes(uint32_t program, uint32_t size, uint64_t* sourceHash);
+void normalize_fetch_shader(LatteFetchShader* fetch);
 // Uncapped (debug only: settings overlay > Graphics; WWHD_UNCAPPED=1 for any renderer, and the older
 // WWHD_VK_UNCAPPED=1 with Vulkan): flips no longer wait for the virtual vsync and presentation no
 // longer waits for the display (Metal: displaySyncEnabled off; Vulkan: immediate or mailbox), so the

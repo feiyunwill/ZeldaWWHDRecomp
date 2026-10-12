@@ -6,7 +6,7 @@
 
 #include <stdexcept>
 
-namespace gx2 { void checkpoint_vulkan_caches(); }
+namespace gx2 { void shutdown_vulkan_caches(); }
 
 #if defined(__APPLE__) && !defined(WWHD_SDL_HOST)
 // AppKit host (gfx/display.mm): windows exist, each view gets a CAMetalLayer for a Vulkan surface
@@ -69,7 +69,7 @@ const Backend& vulkan_backend() {
         b.frame_count = gfxvk::frame_count;
         b.request_tv_dump = gfxvk::request_tv_dump;
         b.request_capture = gfxvk::request_capture;
-        b.shutdown = gx2::checkpoint_vulkan_caches;
+        b.shutdown = gx2::shutdown_vulkan_caches;
         b.res_scale = gfxvk::requested_res_scale;
         b.set_res_scale = gfxvk::set_res_scale;
         b.ao_mode = gfxvk::ao_mode;

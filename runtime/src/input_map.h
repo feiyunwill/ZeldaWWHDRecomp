@@ -53,10 +53,20 @@ int key_from_id(const std::string& id);  // kNoKey if unknown
 // Controls window reserves (Escape cancels a capture). Returns what the key does, or nullptr.
 const char* reserved_key(int code);
 
+constexpr float kMinStickRange = 1.0f, kMaxStickRange = 1.5f;
+
 struct Mapping {
     std::array<std::array<int, kKeysPerAction>, kActionCount> keys;  // kNoKey = empty slot
     std::array<int, kActionCount> pad;                                // kPadNone = unbound
-    float deadzone = 0.0f;          // radial dead zone for controller sticks, 0..0.9
+    // Real sticks do not reliably return exact zero. In particular, a tiny residual zoom input
+    // keeps the Picto Box's zoom-blur preset active. Format 2 saves preserve an explicit zero;
+    // unmarked saves migrate the former zero default to this value.
+    float deadzone = 0.15f;         // radial dead zone for controller sticks, 0..0.9
+    // Stick range (issue #40), per stick, kMinStickRange..kMaxStickRange. Applied after the dead
+    // zone: the stick vector's length is multiplied by the range and capped at 1, direction kept,
+    // so a worn stick that only reaches 0.9 delivers full deflection at about 1.11.
+    float left_range = 1.0f;
+    float right_range = 1.0f;
     bool invert_camera_y = false;   // right stick Y, keyboard and controller
     bool face_auto = false;         // Automatic face preset: follow the dominant pad's labels
     static Mapping defaults();

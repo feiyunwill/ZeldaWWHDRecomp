@@ -1,9 +1,12 @@
+#include "deferred_dispatch.h"
 #include "../../exception_report.h"
 #include "bc_decode.h"
 #include "bc_reference.h"
 // No game assets: assertions inspect data returned by the actual Vulkan device.
 #include "backend.h"
 #include "android_shared_image.h"
+#include "pipeline_trace.h"
+#include "present.h"
 #include "buffer_cache.h"
 #include "render_prof.h"
 #include "perf_metrics.h"
@@ -32,6 +35,7 @@
 #include <zlib.h>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 namespace gfxvk {
 extern uint64_t g_stat_full_checks, g_stat_uploads;
@@ -50,9 +54,9 @@ std::vector<uint8_t> read_image(Surface& s,VkImageAspectFlags aspect,uint32_t by
  Buffer b=create_readback_buffer(size_t(w)*h*bytes);
  transition_image(&s,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_READ_BIT);
  VkBufferImageCopy copy{};copy.imageSubresource={aspect,mip,layer,1};copy.imageExtent={w,h,1};
- auto cmd=command_buffer();vkCmdCopyImageToBuffer(cmd,s.image,s.layout,b.buffer,1,&copy);
+ auto cmd=command_buffer();record::vkCmdCopyImageToBuffer(cmd,s.image,s.layout,b.buffer,1,&copy);
  VkBufferMemoryBarrier barrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};barrier.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_HOST_READ_BIT;barrier.srcQueueFamilyIndex=barrier.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;barrier.buffer=b.buffer;barrier.size=VK_WHOLE_SIZE;
- vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,0,nullptr,1,&barrier,0,nullptr);
+ record::vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,0,nullptr,1,&barrier,0,nullptr);
  try {flush();std::vector<uint8_t> result(size_t(w)*h*bytes);memcpy(result.data(),b.mapped,result.size());defer_buffer(b);return result;}
  catch(...){defer_buffer(b);throw;}
 }
@@ -62,7 +66,7 @@ void rgba_is(const std::vector<uint8_t>& data,const uint8_t rgba[4],const char* 
 void clear_image(Surface& s,const float rgba[4]) {
  transition_image(&s,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_WRITE_BIT);
  VkClearColorValue value{};std::copy(rgba,rgba+4,value.float32);VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT,0,s.mips,0,s.arrayLayers};
- vkCmdClearColorImage(command_buffer(),s.image,s.layout,&value,1,&range);mark_gpu_written(&s);
+ record::vkCmdClearColorImage(command_buffer(),s.image,s.layout,&value,1,&range);mark_gpu_written(&s);
 }
 // A colour placeholder used by a comparison instruction must retain colour tiling while
 // providing a Vulkan depth image. A subsequently rendered depth alias takes precedence.
@@ -96,7 +100,7 @@ void colour_comparison_check() {
   auto* rendered=find_or_create_surface(depth,true);
   transition_image(rendered,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_WRITE_BIT);
   VkClearDepthStencilValue value{0.25f,0};VkImageSubresourceRange range{rendered->aspect,0,1,0,1};
-  vkCmdClearDepthStencilImage(command_buffer(),rendered->image,rendered->layout,&value,1,&range);
+  record::vkCmdClearDepthStencilImage(command_buffer(),rendered->image,rendered->layout,&value,1,&range);
   mark_gpu_written(rendered);
   require(sampled_texture(words,true)==rendered,"rendered depth alias lost to the colour comparison placeholder");
  }
@@ -126,6 +130,45 @@ void bc_surface_check() {
  }
  fprintf(stderr,"[renderer smoke] BC production uploads, sRGB/signed views, mip/layer cache and invalidation passed\n");
 }
+void completed_scan_retention_check() {
+ require(R.tv.scan && R.tv.scan->image, "completed scan missing for repeat check");
+ const auto frame = R.frame;
+ const auto original = read_image(*R.tv.scan, VK_IMAGE_ASPECT_COLOR_BIT, 4);
+ const auto before = compose_offscreen(R.tv, 64, 64, false);
+ // The real-game diagnostic also captures GamePad. Exercise its published
+ // scan when this smoke configuration supplies one, without changing setup.
+ Surface* drcScan = R.drc.scan && R.drc.scan->image ? R.drc.scan.get() : nullptr;
+ const auto drcBefore = drcScan ? read_image(*drcScan, VK_IMAGE_ASPECT_COLOR_BIT, 4) : std::vector<uint8_t>{};
+ Image next(64, 64, 0x1a);
+ const float blue[4] = {0, 0, 1, 1};
+ clear_image(next.s, blue);
+ if (R.tv.buildingScan) destroy_surface_image(R.tv.buildingScan.get());
+ R.tv.buildingScan = std::make_unique<Surface>(std::move(next.s));
+ next.s = {};
+ R.tv.buildingScanDirty = true; R.tv.buildingScanSrgb = false;
+ begin_pipeline_pending_frame();
+ std::this_thread::sleep_for(std::chrono::milliseconds(20));
+ present_completed_frame_while_pipeline_pending();
+ require(R.frame == frame, "repeated presentation advanced guest frame state");
+ require(read_image(*R.tv.scan, VK_IMAGE_ASPECT_COLOR_BIT, 4) == original,
+         "pending presentation exposed or modified the next scan image");
+ if (drcScan) require(R.drc.scan.get() == drcScan &&
+     read_image(*drcScan, VK_IMAGE_ASPECT_COLOR_BIT, 4) == drcBefore,
+     "pending presentation modified the published GamePad scan");
+ const auto repeated = compose_offscreen(R.tv, 64, 64, false);
+ require(repeated == before, "repeated completed composition differs pixel-for-pixel");
+ swap();
+ const uint8_t rgba[4] = {0, 0, 255, 255};
+ rgba_is(read_image(*R.tv.scan, VK_IMAGE_ASPECT_COLOR_BIT, 4), rgba,
+         "completed next scan was not published at swap");
+ if (const char* path = std::getenv("WWHD_VK_PENDING_PROOF_DIR")) {
+  std::filesystem::create_directories(path);
+  write_rgba_png(std::string(path) + "/completed.png", 64, 64, before);
+  write_rgba_png(std::string(path) + "/repeated.png", 64, 64, repeated);
+  write_rgba_png(std::string(path) + "/resumed.png", 64, 64, compose_offscreen(R.tv, 64, 64, false));
+ }
+ fprintf(stderr, "[renderer smoke] pending presentation retained completed pixels; next scan published only at swap\n");
+}
 void upload_arena_check() {
  const uint64_t before=R.uploadAllocations;
  auto a=allocate_upload(16,256),b=allocate_upload(16,256);
@@ -134,9 +177,9 @@ void upload_arena_check() {
  memset(a.mapped,0x31,16);memset(b.mapped,0x72,16);
  Buffer out=create_readback_buffer(32);
  VkBufferCopy ca{a.offset,0,16},cb{b.offset,16,16};
- auto cmd=command_buffer();vkCmdCopyBuffer(cmd,a.buffer,out.buffer,1,&ca);vkCmdCopyBuffer(cmd,b.buffer,out.buffer,1,&cb);
+ auto cmd=command_buffer();record::vkCmdCopyBuffer(cmd,a.buffer,out.buffer,1,&ca);record::vkCmdCopyBuffer(cmd,b.buffer,out.buffer,1,&cb);
  VkBufferMemoryBarrier barrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};barrier.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_HOST_READ_BIT;barrier.srcQueueFamilyIndex=barrier.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;barrier.buffer=out.buffer;barrier.size=VK_WHOLE_SIZE;
- vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,0,nullptr,1,&barrier,0,nullptr);flush();
+ record::vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,0,nullptr,1,&barrier,0,nullptr);flush();
  auto bytes=static_cast<uint8_t*>(out.mapped);for(int i=0;i<32;i++)require(bytes[i]==(i<16?0x31:0x72),"arena GPU snapshots corrupted");
  auto reuse=allocate_upload(16,256);require(reuse.buffer==a.buffer&&reuse.offset==a.offset,"arena failed fence reuse");
  require(R.uploadAllocations<=before+1,"arena allocated per slice");defer_buffer(out);command_buffer();flush();
@@ -144,9 +187,9 @@ void upload_arena_check() {
 }
 std::vector<uint8_t> read_buffer(VkBuffer source,VkDeviceSize offset,uint32_t size) {
  Buffer out=create_readback_buffer(size);
- VkBufferCopy copy{offset,0,size};auto cmd=command_buffer();vkCmdCopyBuffer(cmd,source,out.buffer,1,&copy);
+ VkBufferCopy copy{offset,0,size};auto cmd=command_buffer();record::vkCmdCopyBuffer(cmd,source,out.buffer,1,&copy);
  VkBufferMemoryBarrier barrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};barrier.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_HOST_READ_BIT;barrier.srcQueueFamilyIndex=barrier.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;barrier.buffer=out.buffer;barrier.size=VK_WHOLE_SIZE;
- vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,0,nullptr,1,&barrier,0,nullptr);
+ record::vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,0,nullptr,1,&barrier,0,nullptr);
  try {flush();std::vector<uint8_t> result(static_cast<uint8_t*>(out.mapped),static_cast<uint8_t*>(out.mapped)+size);defer_buffer(out);return result;}
  catch(...){defer_buffer(out);throw;}
 }
@@ -204,16 +247,16 @@ void asynchronous_submission_check() {
   VkBufferCopy first{a.offset,submission*regionSize,payloadSize};
   VkBufferCopy second{b.offset,submission*regionSize+payloadSize,payloadSize};
   VkBufferCopy toTemporary{a.offset,0,payloadSize};
-  vkCmdCopyBuffer(cmd,a.buffer,out.buffer,1,&first);
-  vkCmdCopyBuffer(cmd,b.buffer,out.buffer,1,&second);
-  vkCmdCopyBuffer(cmd,a.buffer,temporary.buffer,1,&toTemporary);
+  record::vkCmdCopyBuffer(cmd,a.buffer,out.buffer,1,&first);
+  record::vkCmdCopyBuffer(cmd,b.buffer,out.buffer,1,&second);
+  record::vkCmdCopyBuffer(cmd,a.buffer,temporary.buffer,1,&toTemporary);
   VkBufferMemoryBarrier transfer{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
   transfer.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;transfer.dstAccessMask=VK_ACCESS_TRANSFER_READ_BIT;
   transfer.srcQueueFamilyIndex=transfer.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;
   transfer.buffer=temporary.buffer;transfer.size=VK_WHOLE_SIZE;
-  vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,0,nullptr,1,&transfer,0,nullptr);
+  record::vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,0,nullptr,1,&transfer,0,nullptr);
   VkBufferCopy fromTemporary{0,submission*regionSize+payloadSize*2,payloadSize};
-  vkCmdCopyBuffer(cmd,temporary.buffer,out.buffer,1,&fromTemporary);
+  record::vkCmdCopyBuffer(cmd,temporary.buffer,out.buffer,1,&fromTemporary);
   defer_buffer(temporary);
   flush_async();
  }
@@ -221,7 +264,7 @@ void asynchronous_submission_check() {
  host.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;host.dstAccessMask=VK_ACCESS_HOST_READ_BIT;
  host.srcQueueFamilyIndex=host.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;
  host.buffer=out.buffer;host.size=VK_WHOLE_SIZE;
- vkCmdPipelineBarrier(command_buffer(),VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,0,nullptr,1,&host,0,nullptr);
+ record::vkCmdPipelineBarrier(command_buffer(),VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,0,nullptr,1,&host,0,nullptr);
  flush();
  auto* bytes=static_cast<uint8_t*>(out.mapped);
  for(uint32_t submission=0;submission<submissions;++submission)
@@ -265,7 +308,7 @@ void depth_copy_check() {
    Buffer staging=create_buffer(texels.size(),VK_BUFFER_USAGE_TRANSFER_SRC_BIT,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
    require(staging.mapped!=nullptr,"depth copy staging buffer is not mapped");memcpy(staging.mapped,texels.data(),texels.size());
    VkBufferImageCopy copy{};copy.imageSubresource={aspect,0,layer,1};copy.imageExtent={s.extent.width,s.extent.height,1};
-   vkCmdCopyBufferToImage(command_buffer(),staging.buffer,s.image,s.layout,1,&copy);defer_buffer(staging);
+   record::vkCmdCopyBufferToImage(command_buffer(),staging.buffer,s.image,s.layout,1,&copy);defer_buffer(staging);
   }
   mark_gpu_written(&s);
  };
@@ -305,7 +348,7 @@ void depth_copy_check() {
    Image dst(48,32,format,true,1);
    transition_image(&dst.s,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_WRITE_BIT);
    VkClearDepthStencilValue value{0.75f,0x33};VkImageSubresourceRange range{dst.s.aspect,0,1,0,1};
-   vkCmdClearDepthStencilImage(command_buffer(),dst.s.image,dst.s.layout,&value,1,&range);
+   record::vkCmdClearDepthStencilImage(command_buffer(),dst.s.image,dst.s.layout,&value,1,&range);
    resample(&src.s,&dst.s,1,0.5f,0.75f,30,21);
    check(dst.s,20,18,30,21,1,"drawn partial depth copy differs",0.75f,0x33);
   }
@@ -321,7 +364,7 @@ void depth_copy_check() {
   Image part(48,32,0x11,true,1);
   transition_image(&part.s,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_WRITE_BIT);
   VkClearDepthStencilValue value{0.75f,0x33};VkImageSubresourceRange range{part.s.aspect,0,1,0,1};
-  vkCmdClearDepthStencilImage(command_buffer(),part.s.image,part.s.layout,&value,1,&range);
+  record::vkCmdClearDepthStencilImage(command_buffer(),part.s.image,part.s.layout,&value,1,&range);
   resample(&src.s,&part.s,1,0.5f,0.75f,30,21);
   check(part.s,20,18,0,0,1,"unscalable partial depth copy changed the destination",0.75f,0x33);
  }
@@ -363,14 +406,14 @@ void volume_target_check() {
  VkRenderingAttachmentInfo target{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};target.imageView=layer_view(s,selected);target.imageLayout=s->layout;
  target.loadOp=VK_ATTACHMENT_LOAD_OP_CLEAR;target.storeOp=VK_ATTACHMENT_STORE_OP_STORE;target.clearValue.color.float32[1]=1;target.clearValue.color.float32[3]=1;
  VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};ri.renderArea.extent={w,h};ri.layerCount=1;ri.colorAttachmentCount=1;ri.pColorAttachments=&target;
- auto cmd=command_buffer();vkCmdBeginRendering(cmd,&ri);R.rendering=true;end_encoder();mark_gpu_written(s);
+ auto cmd=command_buffer();record::vkCmdBeginRendering(cmd,&ri);R.rendering=true;end_encoder();mark_gpu_written(s);
  auto read_slice=[&](uint32_t z) {
   Buffer b=create_readback_buffer(w*h*4);
   transition_image(s,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_READ_BIT);
   VkBufferImageCopy copy{};copy.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};copy.imageOffset={0,0,int32_t(z)};copy.imageExtent={w,h,1};
-  auto c=command_buffer();vkCmdCopyImageToBuffer(c,s->image,s->layout,b.buffer,1,&copy);
+  auto c=command_buffer();record::vkCmdCopyImageToBuffer(c,s->image,s->layout,b.buffer,1,&copy);
   VkBufferMemoryBarrier barrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};barrier.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_HOST_READ_BIT;barrier.srcQueueFamilyIndex=barrier.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;barrier.buffer=b.buffer;barrier.size=VK_WHOLE_SIZE;
-  vkCmdPipelineBarrier(c,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,0,nullptr,1,&barrier,0,nullptr);
+  record::vkCmdPipelineBarrier(c,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,0,nullptr,1,&barrier,0,nullptr);
   try {flush();std::vector<uint8_t> result(w*h*4);memcpy(result.data(),b.mapped,result.size());defer_buffer(b);return result;}
   catch(...){defer_buffer(b);throw;}
  };
@@ -412,13 +455,13 @@ void triangle(Surface& s) {
  VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};blend.attachmentCount=1;blend.pAttachments=&attachment;
  VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};rendering.colorAttachmentCount=1;rendering.pColorAttachmentFormats=&s.fmt.pixel;
  VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};info.pNext=&rendering;info.stageCount=2;info.pStages=stages;info.pVertexInputState=&vertex;info.pInputAssemblyState=&assembly;info.pViewportState=&vp;info.pRasterizationState=&raster;info.pMultisampleState=&ms;info.pColorBlendState=&blend;info.layout=objects.layout;
- vk_check(vkCreateGraphicsPipelines(R.device,R.pipelineCache,1,&info,nullptr,&objects.pipeline),"smoke triangle pipeline");
+ vk_check(stutter::create_graphics(R.frame, "smoke_pipeline", R.device,R.pipelineCache,1,&info,nullptr,&objects.pipeline),"smoke triangle pipeline");
  R.pipelineCacheDirty=true;
  R.pipelineCacheChangedFrame=R.frame;
  transition_image(&s,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
  VkRenderingAttachmentInfo target{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};target.imageView=layer_view(&s,0);target.imageLayout=s.layout;target.loadOp=VK_ATTACHMENT_LOAD_OP_CLEAR;target.storeOp=VK_ATTACHMENT_STORE_OP_STORE;target.clearValue.color.float32[3]=1;
  VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};ri.renderArea=scissor;ri.layerCount=1;ri.colorAttachmentCount=1;ri.pColorAttachments=&target;
- auto cmd=command_buffer();vkCmdBeginRendering(cmd,&ri);R.rendering=true;vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,objects.pipeline);vkCmdDraw(cmd,3,1,0,0);end_encoder();mark_gpu_written(&s);flush();
+ auto cmd=command_buffer();record::vkCmdBeginRendering(cmd,&ri);R.rendering=true;record::vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,objects.pipeline);record::vkCmdDraw(cmd,3,1,0,0);end_encoder();mark_gpu_written(&s);flush();
  auto pixels=read_image(s,VK_IMAGE_ASPECT_COLOR_BIT,4);
  size_t center=(size_t(s.extent.height/2)*s.extent.width+s.extent.width/2)*4;
  require(pixels[center]==255&&pixels[center+1]==0&&pixels[center+2]==0&&pixels[center+3]==255,"triangle center pixel differs");
@@ -455,7 +498,7 @@ void vertex_window_check(Surface& s) {
  VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};blend.attachmentCount=1;blend.pAttachments=&attachment;
  VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};rendering.colorAttachmentCount=1;rendering.pColorAttachmentFormats=&s.fmt.pixel;
  VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};info.pNext=&rendering;info.stageCount=2;info.pStages=stages;info.pVertexInputState=&vertex;info.pInputAssemblyState=&assembly;info.pViewportState=&vp;info.pRasterizationState=&raster;info.pMultisampleState=&ms;info.pColorBlendState=&blend;info.layout=objects.layout;
- vk_check(vkCreateGraphicsPipelines(R.device,R.pipelineCache,1,&info,nullptr,&objects.pipeline),"smoke triangle pipeline");
+ vk_check(stutter::create_graphics(R.frame, "smoke_pipeline", R.device,R.pipelineCache,1,&info,nullptr,&objects.pipeline),"smoke triangle pipeline");
  R.pipelineCacheDirty=true;
  R.pipelineCacheChangedFrame=R.frame;
  std::array<Vertex,128> data{};
@@ -497,9 +540,9 @@ void vertex_window_check(Surface& s) {
   transition_image(&s,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
   VkRenderingAttachmentInfo target{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};target.imageView=layer_view(&s,0);target.imageLayout=s.layout;target.loadOp=VK_ATTACHMENT_LOAD_OP_CLEAR;target.storeOp=VK_ATTACHMENT_STORE_OP_STORE;target.clearValue.color.float32[3]=1;
   VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};ri.renderArea=scissor;ri.layerCount=1;ri.colorAttachmentCount=1;ri.pColorAttachments=&target;
-  auto cmd=command_buffer();vkCmdBeginRendering(cmd,&ri);R.rendering=true;vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,objects.pipeline);
-  vkCmdBindVertexBuffers(cmd,0,1,&vertices.buffer,&vertices.offset);vkCmdBindIndexBuffer(cmd,indices.buffer,indices.offset,narrow?VK_INDEX_TYPE_UINT16:VK_INDEX_TYPE_UINT32);
-  vkCmdDrawIndexed(cmd,wide.size(),1,0,base,0);end_encoder();mark_gpu_written(&s);flush_async();
+  auto cmd=command_buffer();record::vkCmdBeginRendering(cmd,&ri);R.rendering=true;record::vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,objects.pipeline);
+  record::vkCmdBindVertexBuffers(cmd,0,1,&vertices.buffer,&vertices.offset);record::vkCmdBindIndexBuffer(cmd,indices.buffer,indices.offset,narrow?VK_INDEX_TYPE_UINT16:VK_INDEX_TYPE_UINT32);
+  record::vkCmdDrawIndexed(cmd,wide.size(),1,0,base,0);end_encoder();mark_gpu_written(&s);flush_async();
  };
  for(int test=0;test<12;++test) {
   const uint32_t first=test>=8?101:100;const int32_t base=test%3==0?-5:test%3==1?5:0;
@@ -555,7 +598,7 @@ void dynamic_uniform_check(Surface& s) {
  VkDynamicState dynamicState=VK_DYNAMIC_STATE_SCISSOR;
  VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};dynamic.dynamicStateCount=1;dynamic.pDynamicStates=&dynamicState;
  VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};info.pNext=&rendering;info.stageCount=2;info.pStages=stages;info.pVertexInputState=&vertex;info.pInputAssemblyState=&assembly;info.pViewportState=&vp;info.pRasterizationState=&raster;info.pMultisampleState=&ms;info.pColorBlendState=&blend;info.layout=objects.layout;info.pDynamicState=&dynamic;
- vk_check(vkCreateGraphicsPipelines(R.device,R.pipelineCache,1,&info,nullptr,&objects.pipeline),"smoke triangle pipeline");
+ vk_check(stutter::create_graphics(R.frame, "smoke_pipeline", R.device,R.pipelineCache,1,&info,nullptr,&objects.pipeline),"smoke triangle pipeline");
  R.pipelineCacheDirty=true;
  R.pipelineCacheChangedFrame=R.frame;
  // Two rounds force a pool reset between freshly allocated descriptor sets.
@@ -581,12 +624,12 @@ void dynamic_uniform_check(Surface& s) {
   transition_image(&s,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
   VkRenderingAttachmentInfo target{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};target.imageView=layer_view(&s,0);target.imageLayout=s.layout;target.loadOp=VK_ATTACHMENT_LOAD_OP_CLEAR;target.storeOp=VK_ATTACHMENT_STORE_OP_STORE;
   VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};ri.renderArea=scissor;ri.layerCount=1;ri.colorAttachmentCount=1;ri.pColorAttachments=&target;
-  auto cmd=command_buffer();vkCmdBeginRendering(cmd,&ri);R.rendering=true;vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,objects.pipeline);
+  auto cmd=command_buffer();record::vkCmdBeginRendering(cmd,&ri);R.rendering=true;record::vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,objects.pipeline);
   for(uint32_t draw=0;draw<2;++draw) {
    // Dynamic offsets are ordered by binding within VS set0, then PS set1.
    uint32_t offsets[3]={uint32_t(tintSlices[draw].offset),uint32_t(transforms[draw].offset),uint32_t(factors[draw].offset)};
-   vkCmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,objects.layout,0,2,sets,3,offsets);
-   VkRect2D half{{int32_t(draw*s.extent.width/2),0},{s.extent.width/2,s.extent.height}};vkCmdSetScissor(cmd,0,1,&half);vkCmdDraw(cmd,3,1,0,0);
+   record::vkCmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,objects.layout,0,2,sets,3,offsets);
+   VkRect2D half{{int32_t(draw*s.extent.width/2),0},{s.extent.width/2,s.extent.height}};record::vkCmdSetScissor(cmd,0,1,&half);record::vkCmdDraw(cmd,3,1,0,0);
   }
   end_encoder();mark_gpu_written(&s);flush();
   require(R.submissionGeneration!=generation,"dynamic descriptor pool reset did not change generation");
@@ -912,7 +955,7 @@ int renderer_smoke_test() {
    auto depths=read_image(depth.s,VK_IMAGE_ASPECT_DEPTH_BIT,4);auto stencils=read_image(depth.s,VK_IMAGE_ASPECT_STENCIL_BIT,1);
    for(size_t i=0;i<stencils.size();++i){float value;memcpy(&value,depths.data()+i*4,4);require(std::abs(value-0.5f)<0.00001f&&stencils[i]==0x5a,"depth/stencil guest upload differs");}
    transition_image(&depth.s,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_WRITE_BIT);
-   VkClearDepthStencilValue dv{0.25f,0xa5};VkImageSubresourceRange range{VK_IMAGE_ASPECT_DEPTH_BIT|VK_IMAGE_ASPECT_STENCIL_BIT,0,1,0,1};vkCmdClearDepthStencilImage(command_buffer(),depth.s.image,depth.s.layout,&dv,1,&range);
+   VkClearDepthStencilValue dv{0.25f,0xa5};VkImageSubresourceRange range{VK_IMAGE_ASPECT_DEPTH_BIT|VK_IMAGE_ASPECT_STENCIL_BIT,0,1,0,1};record::vkCmdClearDepthStencilImage(command_buffer(),depth.s.image,depth.s.layout,&dv,1,&range);
    depths=read_image(depth.s,VK_IMAGE_ASPECT_DEPTH_BIT,4);stencils=read_image(depth.s,VK_IMAGE_ASPECT_STENCIL_BIT,1);
    for(size_t i=0;i<stencils.size();++i){float value;memcpy(&value,depths.data()+i*4,4);require(value==0.25f&&stencils[i]==0xa5,"depth/stencil clear differs");}
    fprintf(stderr,"[renderer smoke] depth/stencil upload and clear passed\n");
@@ -927,14 +970,14 @@ int renderer_smoke_test() {
     uint32_t result=mem::host_alloc(256,256);uint32_t cells[]={320,240,result,0,0,result+4};
     for(float z:{0.25f,1.0f}) {
      transition_image(surface,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_WRITE_BIT);
-     VkClearDepthStencilValue value{z,0};vkCmdClearDepthStencilImage(command_buffer(),surface->image,surface->layout,&value,1,&range);
+     VkClearDepthStencilValue value{z,0};record::vkCmdClearDepthStencilImage(command_buffer(),surface->image,surface->layout,&value,1,&range);
      peek_z(cells,6);flush();uint32_t expected=z==1.0f?0xFFFFFFu:0x3FFFFFu;
      require(ld32(result)==expected&&ld32(result+4)==expected,"GPU depth peek differs");
     }
     // A drain retires the newest fence first; an older answer must not replace it.
     for(float z:{0.25f,1.0f}) {
      transition_image(surface,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_WRITE_BIT);
-     VkClearDepthStencilValue value{z,0};vkCmdClearDepthStencilImage(command_buffer(),surface->image,surface->layout,&value,1,&range);
+     VkClearDepthStencilValue value{z,0};record::vkCmdClearDepthStencilImage(command_buffer(),surface->image,surface->layout,&value,1,&range);
      peek_z(cells,6);flush_async();
     }
     flush();require(ld32(result)==0xFFFFFFu&&ld32(result+4)==0xFFFFFFu,"older GPU depth answer replaced newer answer");
@@ -962,6 +1005,7 @@ int renderer_smoke_test() {
    fprintf(stderr,"[renderer smoke] queued GPU PNG capture passed: %s\n",capturePath.string().c_str());
    require(R.tv.swapchain!=VK_NULL_HANDLE,"smoke presentation did not create a swapchain");LOG("[renderer smoke] scan-buffer swapchain presentation and PNG readback passed");
    volume_target_check();
+   completed_scan_retention_check();
   }
   // Ensure deferred objects left by readback and stack-owned images are actually reclaimed.
   command_buffer();flush();require(R.garbageBuffers.empty()&&R.garbageImages.empty()&&R.garbageCacheRegions.empty(),"deferred Vulkan resources were not reclaimed");

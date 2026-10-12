@@ -8,10 +8,16 @@
 #include "Cafe/HW/Latte/ISA/LatteReg.h"
 #include "Cafe/HW/Latte/ISA/RegDefines.h"
 #include "backend.h"
+#include "deferred_dispatch.h"
 #include "buffer_cache.h"
 #include "render_prof.h"
 #include "runtime.h"
 #include "shaders.h"
+#include "stutter_trace.h"
+#include "pipeline_state.h"
+#include "pipeline_worker.h"
+#include "pipeline_demand.h"
+#include "pipeline_failure.h"
 #include "settings.h"
 #include "vertex_formats.h"
 #include "uniform_snapshot.h"
@@ -29,6 +35,7 @@
 #include <filesystem>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <unordered_map>
 extern "C" uint64_t g_shader_state_gen;
 using namespace Latte;
@@ -491,8 +498,23 @@ BindingTrimMetadata binding_trim_metadata(const uint32_t* r, vk::Shader* vs, con
      11) & 0xFFFF;
   return trim;
 }
+struct PendingPipeline {
+  vk::Shader* shaders[2]{};
+  VkDevice device{};
+  VkShaderModule modules[2]{};
+  std::optional<PipelineDemandTicket> ticket;
+  std::shared_ptr<PipelineRecipe> recipe;
+  ~PendingPipeline() {
+    // Even abandoned jobs can still read these immutable prerequisites.
+    if (ticket) ticket->discard_and_wait();
+    for (auto module : modules)
+      if (module) vkDestroyShaderModule(device, module, nullptr);
+  }
+};
 struct Pipeline {
   VkPipeline pipeline{};
+  std::shared_ptr<PendingPipeline> pendingCompile;
+  std::exception_ptr compileError;
   VkPipelineLayout layout{};
   VkDescriptorSetLayout sets[2]{};
   bool dynamicUniforms = false;
@@ -535,13 +557,14 @@ struct PipelineKeyHash {
   }
 };
 static_assert(sizeof(PipelineKey) % 8 == 0);
+static_assert(sizeof(PipelineKey) == 208, "update the persisted pipeline recipe schema");
 std::unordered_map<PipelineKey, Pipeline, PipelineKeyHash> pipelines;
 PipelineKey pipeline_key(const uint32_t* r, const vk::Shader* vs, const vk::Shader* ps,
                          const LatteFetchShader* fs, VkPrimitiveTopology topology,
                          const std::array<Surface*, 8>& colors, const Surface* depth) {
   PipelineKey key;
-  key.vs = vs->pipelineId;
-  key.ps = ps->pipelineId;
+  key.vs = vs->key; // process-local canonical variant; portable identity is separate
+  key.ps = ps->key;
   key.fetch = fs->vkPipelineHashFragment;
   key.topology = uint32_t(topology);
   uint32_t ncolor = 0;
@@ -617,6 +640,63 @@ bool pipeline_lookaside_enabled() {
   }();
   return enabled;
 }
+void capture_pipeline_failure(VkResult result, vk::Shader* vs, vk::Shader* ps,
+                              const std::vector<uint32_t>& vertexWords,
+                              const std::vector<uint32_t>& pixelWords) noexcept {
+  try {
+    LOG("[vulkan] graphics pipeline failed (Vulkan result %d): vs %016llX ps %016llX; its draws are skipped",
+        int(result), (unsigned long long)vs->key, (unsigned long long)ps->key);
+    std::error_code error; std::filesystem::create_directories("captures", error);
+    vk::Shader* shaders[]{vs,ps};
+    const std::vector<uint32_t>* words[]{&vertexWords,&pixelWords};
+    for(size_t i=0;i<2;++i) {
+      char name[96];
+      snprintf(name,sizeof name,"captures/pipeline-failed-%s-%016llX",
+          shaders[i]->vertex ? "vs" : "ps",(unsigned long long)shaders[i]->key);
+      if(FILE* f=fopen((std::string(name)+".glsl").c_str(),"wb")) {
+        fwrite(shaders[i]->glsl.data(),1,shaders[i]->glsl.size(),f); fclose(f);
+      }
+      if(FILE* f=fopen((std::string(name)+".spv").c_str(),"wb")) {
+        fwrite(words[i]->data(),4,words[i]->size(),f); fclose(f);
+      }
+    }
+  } catch(...) { /* Diagnostic capture must never replace driver recovery with a crash. */ }
+}
+Pipeline& resolve_pending_pipeline(Pipeline& pipeline, bool wait = true, bool present = false) {
+  if (pipeline.compileError) std::rethrow_exception(pipeline.compileError);
+  if (!pipeline.pendingCompile) return pipeline;
+  try {
+    auto& pending = *pipeline.pendingCompile;
+    std::optional<PipelineBuildResult> built = pending.ticket->wait_for(0);
+    if (!built && !wait) return pipeline;
+    if (!built) {
+      if (present) begin_pipeline_pending_frame();
+      built = pending.ticket->wait(present ? std::function<void()>(present_completed_frame_while_pipeline_pending)
+                                           : std::function<void()>{});
+    }
+    R.pipelineCreateNs += built->compileNs;
+    ++R.pipelineCreates;
+    if(recoverable_pipeline_failure(built->result)) {
+      capture_pipeline_failure(built->result,pending.shaders[0],pending.shaders[1],pending.recipe->words(0),pending.recipe->words(1));
+      pipeline.pendingCompile.reset(); // terminal failure, never a pending omission
+      return pipeline;
+    }
+    vk_check(built->result, "graphics pipeline");
+    pipeline.pipeline = built->pipeline;
+    auto recipe = std::move(pending.recipe);
+    // Publish the consumed result before fallible recipe bookkeeping. Never
+    // retain a consumed ticket, even when recording or driver validation throws.
+    pipeline.pendingCompile.reset();
+    R.pipelineCacheDirty = true;
+    R.pipelineCacheChangedFrame = R.frame;
+    remember_pipeline_recipe(std::move(recipe));
+    return pipeline;
+  } catch (...) {
+    if (!pipeline.pipeline) pipeline.compileError = std::current_exception();
+    pipeline.pendingCompile.reset();
+    throw;
+  }
+}
 Pipeline &pipeline(const uint32_t *r, vk::Shader *vs, vk::Shader *ps,
                    LatteFetchShader *fs, VkPrimitiveTopology topology,
                    const std::array<Surface *, 8> &colors, Surface *depth) {
@@ -668,9 +748,10 @@ Pipeline &pipeline(const uint32_t *r, vk::Shader *vs, vk::Shader *ps,
   const auto uniformType = p.dynamicUniforms
       ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC
       : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+  std::array<std::vector<VkDescriptorSetLayoutBinding>, 2> descriptorBindings;
   for (int st = 0; st < 2; st++) {
     auto &m = shaders[st]->mapping;
-    std::vector<VkDescriptorSetLayoutBinding> b;
+    auto& b = descriptorBindings[st];
     auto add = [&](int i, VkDescriptorType t) {
       if (i >= 0)
         b.push_back(
@@ -686,6 +767,21 @@ Pipeline &pipeline(const uint32_t *r, vk::Shader *vs, vk::Shader *ps,
           VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
     if (m.tfStorageBindingPoint >= 0)
       exception_report::raise("Vulkan transform feedback unsupported");
+  }
+  auto portableKey = key;
+  portableKey.vs = vs->pipelineId; portableKey.ps = ps->pipelineId;
+  const auto* keyBytes = reinterpret_cast<const uint8_t*>(&portableKey);
+  std::vector<uint8_t> recipeKey(keyBytes, keyBytes + sizeof key);
+  // Own prerequisite identities independently of the mutable shader cache.
+  const std::array<std::shared_ptr<vk::ShaderBinary>, 2> shaderBinaries{vs->binary, ps->binary};
+  std::array<std::vector<uint32_t>, 2> recipeSpirv{vs->spirv, ps->spirv};
+  for(size_t i=0;i<shaderBinaries.size();++i)
+    if(recipeSpirv[i].empty() && shaderBinaries[i]) {
+      if(!async_pipeline_enabled()) recipeSpirv[i]=vk::shader_binary_words_exact(shaderBinaries[i],R.frame);
+      else if(vk::shader_binary_ready(shaderBinaries[i])) recipeSpirv[i]=vk::shader_binary_words(shaderBinaries[i]);
+    }
+  for (int st = 0; st < 2; st++) {
+    auto& b = descriptorBindings[st];
     VkDescriptorSetLayoutCreateInfo ci{
         VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     ci.bindingCount = b.size();
@@ -701,11 +797,12 @@ Pipeline &pipeline(const uint32_t *r, vk::Shader *vs, vk::Shader *ps,
   VkShaderModule modules[2]{};
   VkPipelineShaderStageCreateInfo stages[2]{};
   for (int i = 0; i < 2; i++) {
-    VkShaderModuleCreateInfo mc{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-    mc.codeSize = shaders[i]->spirv.size() * 4;
-    mc.pCode = shaders[i]->spirv.data();
-    vk_check(vkCreateShaderModule(R.device, &mc, nullptr, &modules[i]),
-             "shader module");
+    if(!async_pipeline_enabled()) {
+      VkShaderModuleCreateInfo mc{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+      mc.codeSize = recipeSpirv[i].size() * sizeof(uint32_t);
+      mc.pCode = recipeSpirv[i].data();
+      vk_check(vkCreateShaderModule(R.device, &mc, nullptr, &modules[i]), "shader module");
+    }
     stages[i] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
     stages[i].stage =
         i ? VK_SHADER_STAGE_FRAGMENT_BIT : VK_SHADER_STAGE_VERTEX_BIT;
@@ -968,41 +1065,97 @@ Pipeline &pipeline(const uint32_t *r, vk::Shader *vs, vk::Shader *ps,
   ci.pColorBlendState = &bs;
   ci.pDynamicState = &dy;
   ci.layout = p.layout;
+  GraphicsPipelineState pipelineState(ci);
+  WarmPipeline warmed;
+  if (!recipeSpirv[0].empty() && !recipeSpirv[1].empty() &&
+      take_warm_pipeline(recipeKey, recipeSpirv, descriptorBindings, p.dynamicUniforms, pipelineState, warmed)) {
+    for (auto module : modules) if (module) vkDestroyShaderModule(R.device, module, nullptr);
+    vkDestroyPipelineLayout(R.device, p.layout, nullptr);
+    for (auto set : p.sets) vkDestroyDescriptorSetLayout(R.device, set, nullptr);
+    p.pipeline = warmed.pipeline; p.layout = warmed.layout;
+    std::copy(std::begin(warmed.sets), std::end(warmed.sets), p.sets);
+    if (stutter::trace().enabled()) {
+      const auto now = stutter::now();
+      stutter::trace().add("startup_pipeline_hit", R.frame, PipelineKeyHash{}(key), now, now, 0);
+    }
+    return remember(pipelines.emplace(key, std::move(p)).first->second);
+  }
   const auto pipelineStarted = std::chrono::steady_clock::now();
-  auto result = vkCreateGraphicsPipelines(R.device, R.pipelineCache, 1, &ci,
-                                          nullptr, &p.pipeline);
-  R.pipelineCreateNs += std::chrono::duration_cast<std::chrono::nanoseconds>(
-      std::chrono::steady_clock::now()-pipelineStarted).count();
+  VkResult result;
+  uint64_t compileNs = 0;
+  if (async_pipeline_enabled()) {
+    auto pending = std::make_shared<PendingPipeline>();
+    pending->device = R.device;
+    std::copy(std::begin(modules), std::end(modules), pending->modules);
+    auto recipe = std::make_shared<PipelineRecipe>();
+    recipe->key = std::move(recipeKey); recipe->spirv = std::move(recipeSpirv);
+    recipe->descriptors = std::move(descriptorBindings);
+    recipe->dynamicUniforms = p.dynamicUniforms;
+    recipe->state = std::make_unique<GraphicsPipelineState>(std::move(pipelineState));
+    pending->recipe = std::move(recipe);
+    // The owner waits for its ticket before destroying modules or itself.
+    // Capturing a shared owner here would form an owner/ticket/job cycle.
+    pending->shaders[0]=vs; pending->shaders[1]=ps;
+    auto* owner=pending.get();
+    const VkDevice device=pending->device;
+    const std::function<void(GraphicsPipelineState&)> prepare=[owner,device,shaderBinaries](GraphicsPipelineState& ownedState) {
+      for(uint32_t i=0;i<2;++i) {
+        auto& words=owner->recipe->spirv[i];
+        if(words.empty()) words=vk::shader_binary_words(shaderBinaries[i]);
+        if(words.empty()) throw std::runtime_error("empty pipeline shader binary");
+        VkShaderModuleCreateInfo mc{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        mc.codeSize=words.size()*sizeof(uint32_t);mc.pCode=words.data();
+        vk_check(vkCreateShaderModule(device,&mc,nullptr,&owner->modules[i]),"shader module");
+        ownedState.set_stage_module(i,owner->modules[i]);
+        owner->recipe->state->set_stage_module(i,owner->modules[i]);
+      }
+    };
+    pending->ticket = begin_pipeline_async(*pending->recipe->state, R.frame,
+        PipelineKeyHash{}(key), "guest_pipeline", prepare);
+    if (!pending->ticket) {
+      // Capacity pressure always completes this draw exactly. No new snapshot
+      // is retained and no silently omitted draw is introduced by admission.
+      deferred_commands().finish_exact();
+      begin_pipeline_pending_frame();
+      auto built = build_pipeline_async(*pending->recipe->state, R.frame,
+          PipelineKeyHash{}(key), "guest_pipeline", present_completed_frame_while_pipeline_pending, prepare);
+      R.pipelineCreateNs += built.compileNs; ++R.pipelineCreates;
+      if(recoverable_pipeline_failure(built.result))
+        capture_pipeline_failure(built.result,vs,ps,pending->recipe->words(0),pending->recipe->words(1));
+      else vk_check(built.result, "graphics pipeline");
+      p.pipeline = built.pipeline;
+      if(p.pipeline) remember_pipeline_recipe(std::move(pending->recipe));
+      pending.reset();
+      R.pipelineCacheDirty = true; R.pipelineCacheChangedFrame = R.frame;
+    } else p.pendingCompile = std::move(pending);
+    return remember(pipelines.emplace(key, std::move(p)).first->second);
+  } else {
+    result = vkCreateGraphicsPipelines(R.device, R.pipelineCache, 1, pipelineState.get(), nullptr, &p.pipeline);
+  }
+  const bool recordRecipe = result == VK_SUCCESS;
+  if (!async_pipeline_enabled() && stutter::trace().enabled())
+    stutter::trace().add("guest_pipeline", R.frame, PipelineKeyHash{}(key),
+        std::chrono::duration_cast<std::chrono::nanoseconds>(pipelineStarted.time_since_epoch()).count(),
+        stutter::now(), int(result));
+  R.pipelineCreateNs += async_pipeline_enabled() ? compileNs :
+      std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-pipelineStarted).count();
   ++R.pipelineCreates;
   for (auto m : modules)
     vkDestroyShaderModule(R.device, m, nullptr);
-  if (result != VK_SUCCESS && result != VK_ERROR_OUT_OF_HOST_MEMORY &&
-      result != VK_ERROR_OUT_OF_DEVICE_MEMORY && result != VK_ERROR_DEVICE_LOST) {
-    // A driver that cannot build one pipeline (Adreno: VK_ERROR_UNKNOWN on the
-    // boat ride after the sword and shield) used to end the game. The pipeline
-    // stays empty, its draws are skipped, and the two shaders go to captures/
-    // (GLSL and SPIR-V) to look at.
+  if (recoverable_pipeline_failure(result)) {
     p.pipeline = VK_NULL_HANDLE;
-    LOG("[vulkan] graphics pipeline failed (Vulkan result %d): vs %016llX ps %016llX; its draws are skipped",
-        int(result), (unsigned long long)vs->key, (unsigned long long)ps->key);
-    std::error_code captureDirError;  // this path must not throw: it replaces a crash
-    std::filesystem::create_directories("captures", captureDirError);
-    for (auto *shader : shaders) {
-      char name[96];
-      snprintf(name, sizeof name, "captures/pipeline-failed-%s-%016llX",
-               shader->vertex ? "vs" : "ps", (unsigned long long)shader->key);
-      if (FILE *f = fopen((std::string(name) + ".glsl").c_str(), "wb")) {
-        fwrite(shader->glsl.data(), 1, shader->glsl.size(), f);
-        fclose(f);
-      }
-      if (FILE *f = fopen((std::string(name) + ".spv").c_str(), "wb")) {
-        fwrite(shader->spirv.data(), 4, shader->spirv.size(), f);
-        fclose(f);
-      }
-    }
-    return remember(pipelines.emplace(key, p).first->second);
+    capture_pipeline_failure(result,vs,ps,recipeSpirv[0],recipeSpirv[1]);
+    return remember(pipelines.emplace(key,p).first->second);
   }
   vk_check(result, "graphics pipeline");
+  if (recordRecipe) {
+    auto recipe = std::make_shared<PipelineRecipe>();
+    recipe->key = std::move(recipeKey); recipe->spirv = std::move(recipeSpirv);
+    recipe->descriptors = std::move(descriptorBindings);
+    recipe->dynamicUniforms = p.dynamicUniforms;
+    recipe->state = std::make_unique<GraphicsPipelineState>(std::move(pipelineState));
+    remember_pipeline_recipe(std::move(recipe));
+  }
   R.pipelineCacheDirty = true;
   R.pipelineCacheChangedFrame = R.frame;
   return remember(pipelines.emplace(key, p).first->second);
@@ -1531,7 +1684,7 @@ VkImageView feedback_view(Surface *source, const uint32_t *textureWords,
   }
   GpuScopeToken feedbackTiming;
   if(R.gpuPassTimestampsEnabled) feedbackTiming=gpu_begin_feedback_scope(*source);
-  vkCmdCopyImage(command_buffer(), source->image,
+  record::vkCmdCopyImage(command_buffer(), source->image,
                  VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, copy->image,
                  VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, regions.size(),
                  regions.data());
@@ -1823,8 +1976,38 @@ UploadSlice vertex_window_smoke_snapshot(uint32_t binding,uint32_t address,
 }
 
 void reset_ao_private_cache() { aoPrivateFrame = ~0ull; aoPrivateSource = 0; }
+void drain_pending_guest_pipelines() {
+  for (auto& [key, value] : pipelines) resolve_pending_pipeline(value);
+}
 void reset_pipeline_lookup_cache() { lastPipelineLookup = {}; pipelineLookaside = {}; samplerMemo = {}; drawBatchState = {}; }
 uint64_t draw_batch_submissions() { return drawBatchSubmissions; }
+// WWHD_VK_TRACE_PASSES=1 (issue #144): log each new render pass shape once, just before the driver
+// sees it, so a crash inside vkCmdBeginRendering names the last pass in the crash report's log lines
+static void trace_pass(const std::array<Surface *, 8> &colors, uint32_t ncolor, const Surface *depth,
+                       uint32_t depthSlice, uint32_t width, uint32_t height) {
+  static const bool on = [] { const char *e = getenv("WWHD_VK_TRACE_PASSES"); return e && *e == '1'; }();
+  if (!on) return;
+  static std::unordered_set<std::string> seen;
+  std::string key = std::to_string(ncolor) + ":";
+  for (uint32_t i = 0; i < ncolor; ++i)
+    key += colors[i] ? std::to_string(colors[i]->fmt.pixel) + "/" + std::to_string(colors[i]->usage) + "," : "-,";
+  if (depth)
+    key += " d" + std::to_string(depth->fmt.pixel) + "/" + std::to_string(depth->usage) + "/" +
+           std::to_string(depth->arrayLayers) + "/" + std::to_string(depth->mips) + "/" +
+           std::to_string(depth->createFlags);
+  if (!seen.insert(key).second) return;
+  std::string text;
+  for (uint32_t i = 0; i < ncolor; ++i)
+    text += colors[i] ? " c" + std::to_string(i) + "=fmt" + std::to_string(colors[i]->fmt.pixel) + "/usage" +
+                            std::to_string(colors[i]->usage)
+                      : " c" + std::to_string(i) + "=none";
+  if (depth)
+    text += " depth=fmt" + std::to_string(depth->fmt.pixel) + "/usage" + std::to_string(depth->usage) +
+            "/layers" + std::to_string(depth->arrayLayers) + "/slice" + std::to_string(depthSlice) + "/mips" +
+            std::to_string(depth->mips) + "/flags" + std::to_string(depth->createFlags) +
+            (depth->fmt.stencil ? "/stencil" : "");
+  LOG("[vulkan pass] %ux%u, %u colour attachment(s)%s", width, height, ncolor, text.c_str());
+}
 void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
           uint32_t indexAddr, uint32_t baseVertex, uint32_t instances) {
   if (!count || !instances || ((prim == 0x13 || prim == 0x14) && count < 4))
@@ -2053,8 +2236,9 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
   rprof::mark(rprof::kTargets);
   auto &p = pipeline(r, vs, ps, fs, topology, colors, depth);
   rprof::mark(rprof::kPipeline);
-  if (!p.pipeline)
-    return;  // the driver could not build it (logged once in pipeline())
+  if (!p.pipeline && !p.pendingCompile) return;
+  if (p.pendingCompile && !begin_exact_preparation()) resolve_pending_pipeline(p);
+  if (!p.pipeline && !p.pendingCompile) return; // terminal driver failure, not pending
   if(feedback_stats_enabled()) report_feedback_stats();
   if(vertex_window_stats_enabled()) report_vertex_window_stats();
   FeedbackStatsProbe feedbackProbe;
@@ -2145,7 +2329,8 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
     ri.pDepthAttachment = depth ? &da : nullptr;
     ri.pStencilAttachment = depth && depth->fmt.stencil ? &da : nullptr;
     if(R.gpuPassTimestampsEnabled) gpu_begin_render_scope(colors,depth,slices,depthSlice,width,height);
-    vkCmdBeginRendering(cmd, &ri);
+    trace_pass(colors, ncolor, depth, depthSlice, width, height);
+    record::vkCmdBeginRendering(cmd, &ri);
     ++R.renderPassCount;
     R.rendering = true;
     R.passTracked = true;
@@ -2157,8 +2342,18 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
     R.passHeight = height;
   }
   rprof::mark(rprof::kPass);
-  if (state.pipeline != p.pipeline) {
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p.pipeline);
+  if (!p.pipeline && !p.pendingCompile) return;
+  const bool deferredPipelineDraw = bool(p.pendingCompile);
+  if (p.pendingCompile) {
+    auto* ownedPipeline = &p;
+    record::emit_owned([ownedPipeline,cmd]() {
+      resolve_pending_pipeline(*ownedPipeline);
+      if(ownedPipeline->pipeline)
+        record::vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, ownedPipeline->pipeline);
+    });
+    state.pipeline = VK_NULL_HANDLE;
+  } else if (state.pipeline != p.pipeline) {
+    record::vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p.pipeline);
     state.pipeline = p.pipeline;
   }
   VkDescriptorSet sets[] = {vres.set, pres.set};
@@ -2185,7 +2380,7 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
     R.cpuPreparation.descriptorSkippedSets+=2-bind.count;
   }
   if(bind.count)
-    vkCmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,p.layout,
+    record::vkCmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,p.layout,
         bind.first,bind.count,sets+bind.first,bind.offsetCount,
         dynamicOffsets.data()+bind.offsetBegin);
   float xs = f32(r[REGADDR::PA_CL_VPORT_XSCALE]),
@@ -2204,7 +2399,7 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
                 zo + zs};
   // Bitwise comparison preserves distinct signed zeros and exact float state.
   if (!state.viewportValid || std::memcmp(&state.viewport, &vp, sizeof(vp))) {
-    vkCmdSetViewport(cmd, 0, 1, &vp);
+    record::vkCmdSetViewport(cmd, 0, 1, &vp);
     state.viewport = vp;
     state.viewportValid = true;
   }
@@ -2229,14 +2424,14 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
       state.scissor.offset.y != sc.offset.y ||
       state.scissor.extent.width != sc.extent.width ||
       state.scissor.extent.height != sc.extent.height) {
-    vkCmdSetScissor(cmd, 0, 1, &sc);
+    record::vkCmdSetScissor(cmd, 0, 1, &sc);
     state.scissor = sc;
     state.scissorValid = true;
   }
   std::array<uint32_t, 4> blendBits;
   std::copy_n(r + REGADDR::CB_BLEND_RED, blendBits.size(), blendBits.begin());
   if (!state.blendValid || state.blend != blendBits) {
-    vkCmdSetBlendConstants(
+    record::vkCmdSetBlendConstants(
         cmd, reinterpret_cast<const float *>(r + REGADDR::CB_BLEND_RED));
     state.blend = blendBits;
     state.blendValid = true;
@@ -2244,9 +2439,9 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
   uint32_t stencilFront = r[REGADDR::DB_STENCILREFMASK] & 255;
   uint32_t stencilBack = r[REGADDR::DB_STENCILREFMASK_BF] & 255;
   if (!state.stencilValid || state.stencilFront != stencilFront)
-    vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_FRONT_BIT, stencilFront);
+    record::vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_FRONT_BIT, stencilFront);
   if (!state.stencilValid || state.stencilBack != stencilBack)
-    vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_BACK_BIT, stencilBack);
+    record::vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_BACK_BIT, stencilBack);
   state.stencilFront = stencilFront;
   state.stencilBack = stencilBack;
   state.stencilValid = true;
@@ -2375,27 +2570,31 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
       R.vertexBindSkips+=skip;
     }
     if(!skip)
-      vkCmdBindVertexBuffers(cmd,g.attributeBufferIndex,1,&b.buffer,&offset);
+      record::vkCmdBindVertexBuffers(cmd,g.attributeBufferIndex,1,&b.buffer,&offset);
   }
   rprof::g_upload_kind = rprof::kUpIndex;
   rprof::mark(rprof::kVertex);
   if (nativeIndices) {
-    vkCmdBindIndexBuffer(cmd, nativeIndexSlice.buffer, nativeIndexSlice.offset,
+    record::vkCmdBindIndexBuffer(cmd, nativeIndexSlice.buffer, nativeIndexSlice.offset,
                          indexType == 0 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
-    vkCmdDrawIndexed(cmd, count, instances, 0, int32_t(baseVertex), 0);
+    if(deferredPipelineDraw) { auto* pipeline=&p; record::emit_owned([=] { if(pipeline->pipeline) gfxvk::vkCmdDrawIndexed(cmd, count, instances, 0, int32_t(baseVertex), 0); }); }
+    else record::vkCmdDrawIndexed(cmd, count, instances, 0, int32_t(baseVertex), 0);
   } else if (convertedEntry) {
     const uint32_t converted = convertedEntry->outSize / 4;
     auto b = buffer_cache_slice(*convertedEntry, convertedEntry->outSize);
     rprof::guest_read(rprof::kUpIndex, indexAddr, guestBytes);
-    vkCmdBindIndexBuffer(cmd, b.buffer, b.offset, VK_INDEX_TYPE_UINT32);
-    vkCmdDrawIndexed(cmd, converted, instances, 0, int32_t(baseVertex), 0);
-  } else if (indices.empty())
-    vkCmdDraw(cmd, count, instances, baseVertex, 0);
-  else {
+    record::vkCmdBindIndexBuffer(cmd, b.buffer, b.offset, VK_INDEX_TYPE_UINT32);
+    if(deferredPipelineDraw) { auto* pipeline=&p; record::emit_owned([=] { if(pipeline->pipeline) gfxvk::vkCmdDrawIndexed(cmd, converted, instances, 0, int32_t(baseVertex), 0); }); }
+    else record::vkCmdDrawIndexed(cmd, converted, instances, 0, int32_t(baseVertex), 0);
+  } else if (indices.empty()) {
+    if(deferredPipelineDraw) { auto* pipeline=&p; record::emit_owned([=] { if(pipeline->pipeline) gfxvk::vkCmdDraw(cmd, count, instances, baseVertex, 0); }); }
+    else record::vkCmdDraw(cmd, count, instances, baseVertex, 0);
+  } else {
     auto b = snapshot(indices.data(), indices.size() * 4, 4);
     if (indexAddr) rprof::guest_read(rprof::kUpIndex, indexAddr, guestBytes);
-    vkCmdBindIndexBuffer(cmd, b.buffer, b.offset, VK_INDEX_TYPE_UINT32);
-    vkCmdDrawIndexed(cmd, indices.size(), instances, 0, int32_t(baseVertex), 0);
+    record::vkCmdBindIndexBuffer(cmd, b.buffer, b.offset, VK_INDEX_TYPE_UINT32);
+    const auto drawCount=indices.size(); if(deferredPipelineDraw) { auto* pipeline=&p; record::emit_owned([=] { if(pipeline->pipeline) gfxvk::vkCmdDrawIndexed(cmd, drawCount, instances, 0, int32_t(baseVertex), 0); }); }
+    else record::vkCmdDrawIndexed(cmd, indices.size(), instances, 0, int32_t(baseVertex), 0);
   }
   if(R.gpuPassTimestampsEnabled) gpu_count_render_draw();
   for (auto *color : colors)

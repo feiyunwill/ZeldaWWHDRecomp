@@ -127,11 +127,16 @@ adb shell dumpsys display
   do not count an expected lack of background restart as ordinary process recovery.
 - [ ] Run sustained setup under normal phone thermal management. Record thermal
   status, battery temperature, battery level and stage times. Current defaults pause
-  at severe thermal status or 42°C battery temperature, and resume at light-or-lower
-  status and at most 39°C. Do not deliberately overheat the phone.
+  at severe thermal status, at 45°C battery temperature, or at 42°C together with
+  moderate-or-higher thermal status, and resume at light-or-lower status and at most
+  41°C. The pause text shows both readings. "Continue anyway" skips heat pauses for
+  the rest of the run (kept across a service restart, cleared when the run completes
+  or fails); critical-or-higher thermal status always pauses. Do not deliberately
+  overheat the phone.
 - [ ] Observe unplugged battery pause at 20% or below and resume at charging or
   30% or above. Check hysteresis, and confirm manual pause stays paused when the
-  phone cools or charging starts. Distinguish simulated thresholds from real readings.
+  phone cools or charging starts. "Continue anyway" also skips battery pauses for
+  the rest of the run. Distinguish simulated thresholds from real readings.
 - [ ] Reboot immediately after the last picker result as well as after a settled
   selection. The emulator has exposed loss of the newest URI grant in the immediate
   case. Before import completes, use Restore access with the original dump and
@@ -267,7 +272,7 @@ baseline limitation separate and do not report the full emulator smoke as passin
 
 1. In a private test APK, use SDL's manifest environment metadata under `<application>`:
    `<meta-data android:name="SDL_ENV.WWHD_VK_NARROW_BARRIERS" android:value="0" />` for the old
-   path, `1` for precise barriers (also the default). Reinstall/restart between variants; keep the native library identical.
+   path (the default), `1` for precise barriers. Reinstall/restart between variants; keep the native library identical.
    Also set `SDL_ENV.WWHD_PROFILE=1`, `SDL_ENV.WWHD_NO_AUDIO=1` and the existing `WWHD_TEST_*`
    scripted input/state-load switches. Use private shader caches, copied saves and a verified state
    load. Do not distribute an APK containing game code.

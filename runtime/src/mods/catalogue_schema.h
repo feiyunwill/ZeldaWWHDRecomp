@@ -35,6 +35,7 @@ struct Step {
 struct Entry {
     std::string id,name,description,version,kind;
     Version minimum,maximum;bool bounded_maximum=false;
+    bool experimental=false; // untested; hidden unless "Show experimental mods" is on, enabling backs up saves
     std::vector<std::string> authors,licences,dependencies,builds;
     std::map<std::string,Download> downloads;
     std::vector<Step> setup;
@@ -142,8 +143,16 @@ inline Index parse(const std::string& source,bool local=false) {
         }
         e.setup=steps(v.get("setup"));
         for(const auto& step:e.setup)require(step.type!="build_guest_mod"||e.kind=="guest","Guest build step needs a guest package");
+        const auto& experimental=v.get("experimental"); // optional; catalogues before manager 1.4 omit it
+        require(experimental.type==json::Value::Null||experimental.type==json::Value::Bool,"Invalid experimental flag");
+        e.experimental=experimental.boolean;
         result.entries.push_back(std::move(e));
     }
     return result;
+}
+// The catalogue list: experimental entries only with the toggle on, except one already installed
+// (shown labelled, so it can still be found, disabled and removed).
+inline bool visible(const Entry& entry,bool show_experimental,bool installed) {
+    return !entry.experimental||show_experimental||installed;
 }
 } // namespace mods::catalogue

@@ -30,6 +30,7 @@
 #include <algorithm>
 
 #include "gfx/renderer.h"
+#include "gfx/shader_prebuild.h"
 #include "overlay/hostui.h"
 #include "mods/cemu_pack.h"
 #include "mods/content.h"
@@ -43,6 +44,7 @@
 #include "input.h"
 #include "mods/manager.h"
 #include "mods/packages.h"
+#include "mods/save_backup.h"
 #include "runtime.h"
 #ifdef __ANDROID__
 #include <SDL3/SDL.h>
@@ -51,9 +53,9 @@ namespace interp { void set_mode(int); }
 #endif
 
 #ifdef WWHD_HAS_VULKAN
-namespace gfxvk { int renderer_smoke_test(); }
+namespace gfxvk { int renderer_smoke_test(); int warm_headstart_shaders(); }
 #ifdef __ANDROID__
-namespace gfxvk { int android_display_smoke_test(); void save_renderer_caches(); }
+namespace gfxvk { int android_display_smoke_test(); void shutdown_renderer_caches(); }
 #endif
 #endif
 #ifdef WWHD_HAS_METAL
@@ -259,7 +261,6 @@ static void apply_portable_mode() {
     set("WWHD_STATE_DIR", u + "/states");
 #ifdef __APPLE__
     set("WWHD_DISPLAY_SETTINGS", u + "/display.plist");
-    set("WWHD_SHADER_CACHE", u + "/shaders.bin");
 #endif
 }
 
@@ -350,6 +351,20 @@ static void start_log_file(bool error = false) {
 extern "C" void synthetic_game_frame(Cpu*, PpcFunc);
 
 int main(int argc, char** argv) {
+    std::string shader_prebuild_root;
+    // Android's isolated preparation activity and normal SDL startup share the
+    // same private user directory and verified native library identity.
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (!strcmp(argv[i], "--user-dir")) {
+#ifdef _WIN32
+            _putenv_s("WWHD_USER_DIR", argv[++i]);
+#else
+            setenv("WWHD_USER_DIR", argv[++i], 1);
+#endif
+        } else if (!strcmp(argv[i], "--shader-prebuild-root")) shader_prebuild_root = argv[++i];
+        else if (!strcmp(argv[i], "--shader-prebuild-result")) shaderprebuild::resultPath = argv[++i];
+        else if (!strcmp(argv[i], "--shader-prebuild-library")) shaderprebuild::runtimeLibrary = argv[++i];
+    }
     mods::code::startup(argc, argv);
     apply_portable_mode();
     default_vulkan_cpu_paths();
@@ -460,7 +475,7 @@ int main(int argc, char** argv) {
 #ifdef __ANDROID__
             if (display_smoke) {
                 result = gfxvk::android_display_smoke_test();
-                gfxvk::save_renderer_caches();
+                gfxvk::shutdown_renderer_caches();
             }
             else
 #endif
@@ -469,6 +484,9 @@ int main(int argc, char** argv) {
         return result;
     }
 #endif
+    // Save backups (Mods tab): a restore chosen there is applied now, before the game reads saves.
+    // A shader warm-up run (setup, Android's preparation activity) never touches saves.
+    mods::saves::startup(config::save_dir, [](const std::string& line) { LOG("%s", line.c_str()); }, !warm_shaders);
     mods::manager::load_saved();  // player choices, before the game starts
     mods::cemu::set_vulkan(render::requested()==render::Api::Vulkan);
     mods::content::set_game_root(config::game_dir);  // loose imports (fan translations) find their game path
@@ -512,16 +530,38 @@ int main(int argc, char** argv) {
     mem::write_cstr(arg0, "cking.rpx", 16);
     st32(argv_arr, arg0);
     // the game runs on its own threads; the process main thread belongs to the window system
+    const std::string shader_renderer = render::requested() == render::Api::Metal ? "metal" : "vulkan";
+    bool pending_shader_warm = false;
+#ifdef __ANDROID__
+    if (warm_shaders && (shader_prebuild_root.empty() || std::filesystem::path(shader_prebuild_root).lexically_normal() == shaderprebuild::root().lexically_normal()))
+        pending_shader_warm = shaderprebuild::activate_pending(config::game_dir, shader_renderer);
+    if (warm_shaders && !shader_prebuild_root.empty() && !pending_shader_warm) {
+        shaderprebuild::finish_pending(false); return 1;
+    }
+#endif
+    if (warm_shaders) shaderprebuild::bind_setup_live_caches();
+    if (!warm_shaders && !pending_shader_warm) shaderprebuild::activate(config::game_dir, shader_renderer);
     render::init();
+    if (warm_shaders && render::active() != render::requested()) {
+        // the requested renderer could not start (e.g. no MoltenVK) and the game fell back:
+        // warming the fallback would claim the wrong renderer's caches as prepared
+        fprintf(stderr, "[shaders] %s renderer unavailable; nothing to prepare for it\n",
+                render::api_name(render::requested()));
+        return 3;  // tools/installer/shader_prebuild.py: RENDERER_UNAVAILABLE
+    }
     mods::cemu::set_vulkan(render::active()==render::Api::Vulkan);
-    if (warm_shaders) {
+    if (warm_shaders || pending_shader_warm) {
+        int warm_result = 1;
         // compile the shader head start once (fills the macOS Metal shader cache), then quit
 #ifdef WWHD_HAS_METAL
-        if (render::active() == render::Api::Metal) return gfx_headstart_warm();
+        if (render::active() == render::Api::Metal) warm_result = gfx_headstart_warm();
 #endif
-        fprintf(stderr, "--warm-shaders fills the Metal shader cache; the %s renderer compiles shaders on first use.\n",
-                render::api_name(render::active()));
-        return 1;
+#ifdef WWHD_HAS_VULKAN
+        if (render::active() == render::Api::Vulkan) warm_result = gfxvk::warm_headstart_shaders();
+#endif
+        if (pending_shader_warm && !shaderprebuild::finish_pending(warm_result == 0)) warm_result = 1;
+        if (warm_shaders) return warm_result;
+        if (warm_result) fprintf(stderr, "[shaders] Preparation incomplete; continuing with exact on-demand compilation.\n");
     }
     static LoadedModule mod = m;
     static uint32_t args = argv_arr;

@@ -84,6 +84,7 @@ bool gx2_ss_check(ss::Reader r, std::string& why);
 void gx2_ss_load(ss::Reader& r);
 namespace interp { void ss_reset(); }
 namespace aspect { void ss_reset(); }
+namespace button_glyphs { void ss_reset(); }
 namespace dispatch { std::vector<std::pair<uint32_t, std::string>> host_functions(); }
 
 namespace interp { uint64_t logic_steps(); }
@@ -592,6 +593,7 @@ bool do_load(const std::shared_ptr<Snapshot>& s) {
     guestmods::state_loaded();
     interp::ss_reset();
     aspect::ss_reset();
+    button_glyphs::ss_reset();
     rumble::reset();     // an effect running before the load is not the restored game's
     r = s->section(kSecThreads);
     threads_ss_load(r);  // last: wakes the parked threads (they continue after the thaw)

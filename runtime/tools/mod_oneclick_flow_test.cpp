@@ -1,4 +1,5 @@
 // Exercise the production overlay setup loop and real workers without a game or window.
+#include <atomic>
 #include "mod_test_host.h"
 #include "overlay/setup_flow.h"
 #include "overlay/setup_test.h"
@@ -39,9 +40,13 @@ int main(int argc,char** argv) {
         assert(pending_setup_runs()==std::vector<std::string>{id});assert(!view(id).enabled);
         assert(unconfirmed_native(id).empty());
     }
-    int builds=0;
+    int builds=0;std::atomic<bool> cancel_released{false};
     set_guest_builder([](const GuestPackage&){return uint32_t(65536);},[&](const GuestPackage&,uint32_t){
         ++builds;std::this_thread::sleep_for(std::chrono::milliseconds(35));
+        // cancel: the build lasts until the cancel has taken effect. ImGui trickles the mouse events
+        // (move, press, release: one per frame), so a fixed frame count let the build finish before
+        // the click landed on slow runners (Windows CI)
+        for(int i=0;mode=="cancel"&&!cancel_released&&i<5000;++i)std::this_thread::sleep_for(std::chrono::milliseconds(2));
         auto module=root/"synthetic.module";std::ofstream(module)<<"synthetic guest cache";return GuestBuilt{module.string(),65536};
     });
     SDL_Surface* surface=SDL_CreateSurface(960,640,SDL_PIXELFORMAT_RGBA32);assert(surface);
@@ -127,6 +132,7 @@ int main(int argc,char** argv) {
             io.AddMouseButtonEvent(0,cancel_frames==1);cancel_clicked=true;
         }
         if(cancel_clicked&&setup_run.id.empty())canceled=true;
+        if(canceled)cancel_released=true;
         ImGui::End();ImGui::Render();SDL_SetRenderDrawColor(renderer,20,23,29,255);SDL_RenderClear(renderer);
         ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(),renderer);SDL_RenderPresent(renderer);
         if(has_dialog&&popup&&!popup->Hidden&&frame>=7&&!dialog_capture){capture("dialog");dialog_capture=true;}

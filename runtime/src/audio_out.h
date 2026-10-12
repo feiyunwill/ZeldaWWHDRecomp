@@ -11,6 +11,12 @@ void init();                                    // opens the default output devi
 int channels();                                // 2 or 6, effective device mode
 bool requested_surround();
 void set_requested_surround(bool enabled);      // save for next start
+// Master volume 0..1 for the game and mod mix (issue #124). Applied live; saved for the next start
+// when `save` is set (the settings slider saves once on release, not on every step).
+// WWHD_AUDIO_VOLUME starts the session at a fixed value whatever was saved, and is not saved.
+float master_volume();
+bool master_volume_from_env();
+void set_master_volume(float gain, bool save = true);
 bool surround_fallback();
 bool output_device_changed();
 void start_speaker_test();

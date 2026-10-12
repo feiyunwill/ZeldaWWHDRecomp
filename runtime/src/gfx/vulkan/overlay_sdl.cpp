@@ -195,6 +195,7 @@ void graphics_changed() {
     put("fpsHighPaced", {"WWHD_INTERP_PACED"}, interp::paced_interpolation_at(120) ? "1" : "0");
     put("scaleFilter", {"WWHD_SCALE_FILTER"}, std::to_string(gfxvk::scale_filter()));
     put("vkPresentMode", {"WWHD_VK_PRESENT_MODE"}, std::to_string(gfxvk::present_mode()));
+    put("vkDevice", {"WWHD_VK_DEVICE"}, gfxvk::device_setting());
     save_locked();
 }
 // start-up (backend.cpp init): the saved graphics options
@@ -359,4 +360,8 @@ void open_folder(const std::string& path) {
 #endif
 
 }  // namespace hostui
+
+namespace gfxvk {
+void load_device_setting() { std::string value; if (hostui::get("vkDevice", value)) set_device_setting(value); }
+}
 #endif  // WWHD_SDL_HOST

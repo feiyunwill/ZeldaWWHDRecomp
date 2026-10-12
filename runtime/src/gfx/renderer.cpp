@@ -248,6 +248,14 @@ void shutdown() {
     g_backend->shutdown();
 }
 
+bool can_restart() {
+#if defined(_WIN32) || defined(__ANDROID__)
+    return false;
+#else
+    return !g_args.empty();
+#endif
+}
+
 bool restart() {
 #ifdef _WIN32
     return false;

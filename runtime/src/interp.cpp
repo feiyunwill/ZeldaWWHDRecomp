@@ -34,6 +34,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "interp_nodraw.h"
 #include "interp_pacing.h"
 #include "mods/fast_forward.h"
 #include "guest_addr.h"
@@ -634,6 +635,7 @@ namespace interp {
 void fx_pass_start();          // interp_fx.cpp: puts back the values drawn blended
 void fx_hold_blend(float t);   // interp_fx.cpp: blended hold pass: logic-time effect blends at t
 void fx_ss_reset();
+void nodraw_reset();          // fopAc_Draw hook: the step's one-shot no-draw requests
 // a save state was loaded: nothing may blend across the jump
 void ss_reset() {
     countdown::reset();
@@ -649,17 +651,18 @@ void ss_reset() {
     g_phase = 0;
     g_step_n = 1;
     fx_ss_reset();
+    nodraw_reset();
     true60::ss_reset();
 }
-// Paced interpolation (WWHD_INTERP_PACED=1, the default on Android and at 120/240 fps): an
-// in-between pass is drawn only when it fits before the next logic step is due (33.3 ms after the
-// last one, measured with the passes' recent durations); otherwise the rest of the step's
+// Paced interpolation (WWHD_INTERP_PACED=1, the default on Android, Windows on ARM64 and at 120/240
+// fps): an in-between pass is drawn only when it fits before the next logic step is due (33.3 ms
+// after the last one, measured with the passes' recent durations); otherwise the rest of the step's
 // in-between passes are dropped and the next step waits for its time. The game then always advances
 // 30 steps a second, and the picture gets 60/120/240 frames a second where the device draws (and
 // the display shows) them fast enough and fewer where it does not. Without pacing, every logic step
 // is followed by all its in-between passes, and a device that draws fewer frames a second runs the
-// whole game slower than real time (at 120/240 fps on a 60 Hz display with vsync: half or a
-// quarter of the speed), which is why pacing is on by default there.
+// whole game slower than real time (at 120/240 fps on a 60 Hz display with vsync: half or a quarter
+// of the speed), which is why pacing is on by default there.
 // At 120/240 fps the logic pass also plans how many in-between frames the step gets (as many as
 // fit at the recent pass duration, at least one) and spaces them evenly over the step
 // (t = k/(n+1)): a 60 Hz display then gets clean 60 fps blending instead of uneven frames and a
@@ -668,8 +671,11 @@ void ss_reset() {
 // for 60 fps and one for 120/240 fps); the variable sets both at start and wins over the saved
 // values.
 static const char* const g_env_paced = getenv("WWHD_INTERP_PACED");
+// Windows on ARM64 (Snapdragon X) draws 60 fps only where the Adreno driver's per-draw CPU cost
+// allows: unpaced, the Outset save-state benchmark ran 16 logic steps a second (half speed, and the
+// audio, which follows the game's speed, crackled)
 static std::atomic<bool> g_paced{[] {
-#ifdef __ANDROID__
+#if defined(__ANDROID__) || (defined(_WIN32) && (defined(_M_ARM64) || defined(__aarch64__)))
     return !g_env_paced || atoi(g_env_paced) != 0;
 #else
     return g_env_paced && atoi(g_env_paced) != 0;
@@ -733,11 +739,24 @@ static void paced_pass_start() {
     g_slept = {};
     if (g_hold_next) return;
     if (g_wait_step && now < g_last_logic + kPacedStep) {
-        threads::park_sleep_until(g_last_logic + kPacedStep);  // the game keeps 30 steps a second
+        const auto due = g_last_logic + kPacedStep;
+        threads::park_sleep_until(due);  // the game keeps 30 steps a second
         g_slept = pace_clock::now() - now;
+        // the step starts at its time, not when the sleep timer woke up (0.2-1 ms later): counted from
+        // the wake-up, every waited step was that much longer than 33.3 ms (at 120 fps, with flips
+        // that do not wait for a missed vsync, 28.9 instead of 30 logic steps a second)
+        g_wait_step = false;
+        g_last_logic = due;
+        return;
     }
+    // 120/240 fps (every step waits for its time): a step that starts late, because its in-between
+    // passes took longer than planned, keeps the schedule if it is less than a step late, so this
+    // step plans fewer in-between frames and the game catches up (counted from its own start, a
+    // late step was lost: 29.4 logic steps a second at 240 fps on a computer that draws ~150 fps)
+    const bool keep = g_wait_step && in_between() > 1 && g_last_logic != pace_clock::time_point{} &&
+                      now - (g_last_logic + kPacedStep) < kPacedStep;
     g_wait_step = false;
-    g_last_logic = pace_clock::now();
+    g_last_logic = keep ? g_last_logic + kPacedStep : pace_clock::now();
 }
 // logic pass: the in-between frames of this step (pacing::plan_in_between: as many as fit at the
 // recent pass duration)
@@ -1145,7 +1164,33 @@ extern "C" void hook_02715310(Cpu* c) {
     else countdown::refresh(c);
 }
 
+// fopAc_Draw(fopAc_ac_c*): one-shot "not drawn this frame" requests (fopAcStts_NODRAW_e) made by
+// the step's logic hold for all passes of the step (interp_nodraw.h; issue #126: in conversations
+// the talk camera hides Link on logic frames only, so he flickered at 60/120/240 fps and true 60).
+// debug: WWHD_INTERP_NODRAW=0 turns this off; WWHD_INTERP_NODRAW_TRACE=n logs n kept requests
+extern "C" void f_025D4654_orig(Cpu* c);
+static interp::OneShotNoDraw g_nodraw;
+extern "C" void hook_025D4654(Cpu* c) {
+    static const bool off = getenv("WWHD_INTERP_NODRAW") && !atoi(getenv("WWHD_INTERP_NODRAW"));
+    if (interp::enabled() && !off) {
+        const uint32_t actor = c->r[3];
+        const uint32_t status = ld32(actor + interp::OneShotNoDraw::kStatus);
+        const uint32_t want = g_nodraw.on_draw(actor, status, interp::g_hold, interp::g_logic_steps);
+        if (want != status) {
+            st32(actor + interp::OneShotNoDraw::kStatus, want);
+            static int trace = getenv("WWHD_INTERP_NODRAW_TRACE") ? atoi(getenv("WWHD_INTERP_NODRAW_TRACE")) : 0;
+            if (trace > 0) {
+                trace--;
+                LOG("[interp] step %llu phase %d: actor %08X kept hidden (requested by the step's logic)",
+                    (unsigned long long)interp::g_logic_steps, interp::g_phase, actor);
+            }
+        }
+    }
+    f_025D4654_orig(c);
+}
+
 namespace interp {
+void nodraw_reset() { g_nodraw.reset(); }
 // The pads are read at the end of every frame. JUTGamePad derives "pressed this frame" from
 // consecutive reads, so a change first seen on the read after a logic pass would be spent on a pass
 // without logic. While interpolating, that read repeats the previous sample (see VPADRead /

@@ -65,9 +65,11 @@ def verified_download(url, archive, expected):
 
 
 def source_files(root, test_fixtures=False):
-    source_paths = [root / "tools/installer/setup.py", root / "tools/android/setup_adapter.py",
+    source_paths = [root / "tools/installer/setup.py",
+                    root / "tools/installer/shader_prebuild.py", root / "tools/shaderprep.py", root / "tools/shaderprep_format.py", root / "tools/android/setup_adapter.py",
                     root / "tools/android/native_process.py",
                     root / "tools/android/ondevice_setup.py",
+                    root / "tools/android/shader_prebuild_android.py",
                     root / "tools/rpx.py"]
     # Newer desktop installers import this production sibling. Older branches
     # do not have it; support both without changing installer behavior.
@@ -80,6 +82,9 @@ def source_files(root, test_fixtures=False):
     if test_fixtures:
         source_paths += [root / "tools/android/debug_fixture_build.py",
                          root / "tools/android/embedding_smoke.py", root / "tools/recomp/android_fixture.py"]
+    template = root / "tools/shadercache/template.bin"
+    if template.is_file():
+        source_paths.append(template)
     return source_paths
 
 

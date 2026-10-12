@@ -1,7 +1,8 @@
 # The Legend of Zelda: The Wind Waker HD — native port (macOS, Linux, Windows, Android)
 
 A static recompilation of the Wii U version (USA or European) that runs natively on **macOS** (Apple Silicon),
-**Linux**, **Windows** and **Android** (arm64; [build it yourself](#android-build-it-yourself)). The
+**Linux**, **Windows** and **Android** (arm64; the setup app builds the game on the phone, see
+[Android](#android-build-it-yourself)). The
 game's PowerPC code is translated to C ahead of time, the Cafe OS libraries the game uses are
 reimplemented natively, and GX2 graphics are implemented directly on Metal (macOS) or Vulkan (all
 platforms), with no Cemu runtime and no GPU command emulation.
@@ -41,8 +42,12 @@ computer (about two minutes); every later start launches the game directly.
    (a games folder, an external drive):
    - **macOS**: Apple Silicon, macOS 14 or newer (Metal renderer; Vulkan through MoltenVK, included, can
      be picked in Graphics > Renderer)
-   - **Windows**: x86-64, Windows 10 or 11, a GPU with Vulkan 1.3 drivers (or Vulkan 1.1 / 1.2 drivers
-     with `VK_KHR_dynamic_rendering`)
+   - **Windows**: x86-64 (`windows-x86_64`, Windows 10 version 1903 or newer, or Windows 11) or arm64 (`windows-arm64`, Windows 11 on
+     ARM, e.g. Snapdragon X), a GPU with Vulkan 1.3 drivers (or Vulkan 1.1 / 1.2 drivers with
+     `VK_KHR_dynamic_rendering`). The arm64 zip runs natively, and only on ARM64 (its setup says so
+     on an x86-64 PC). On ARM, 60 fps keeps the game's speed by default (Graphics > "Keep game
+     speed"), as on Android: where two frames per step do not fit, in-between frames are skipped
+     instead of slowing the whole game down
    - **Linux**: x86-64 (`linux-x86_64`) or arm64 (`linux-aarch64`, e.g. Raspberry Pi 5, Asahi Linux
      on Apple Silicon, other ARM boards and laptops), glibc 2.35 or newer (Ubuntu 22.04+, Debian 12+,
      Fedora 36+, Arch, SteamOS 3, Raspberry Pi OS 12), a GPU with Vulkan 1.3 drivers (or 1.1 / 1.2 with
@@ -125,21 +130,23 @@ code and saves go to `~/.local/share/wwhd` and the settings, controls, save stat
 `~/.config/wwhd` (or `$XDG_DATA_HOME` / `$XDG_CONFIG_HOME`; `--data-dir FOLDER` chooses another place
 for the first, for example an SD card on a Steam Deck). Nothing is written beside the `.AppImage`; the
 menu entry the setup adds starts the same game. To remove everything, delete the file and those two
-folders.
+folders. **Portable use:** create a folder named like the AppImage plus `.data` next to it (for example
+`WindWakerHD-v0.2.13-linux-x86_64.AppImage.data`); the AppImage then keeps the game, its code, saves,
+settings and caches in that folder instead (its `share`, `config` and `cache` subfolders).
 
 The setup also runs in a terminal (the fallback): `tools/Setup in Terminal.command` (macOS),
 `tools/Setup in a console window.bat` (Windows), `tools/setup-in-terminal.sh` (Linux). How it works
 and the interface between the window and `tools/installer/setup.py`:
 [tools/installer/README.md](tools/installer/README.md). Scripted use: `tools/installer/setup.py --help`.
 
-Source builds (below) and the Linux AppImage are not portable: they keep using the per-user folders
+Source builds (below) and the Linux AppImage (without a `.data` folder) are not portable: they keep using the per-user folders
 (`~/Library/Application Support/wwhd`, `%LOCALAPPDATA%\WWHD` for the game and saves,
 `~/.config/wwhd` for the settings on Linux), as before.
 
 ## Requirements (building from source)
 
-- **macOS** on Apple Silicon, **Linux** (x86-64 or arm64, Vulkan) or **Windows** (x86-64, Vulkan); the
-  platform-specific build steps are under "Building" below
+- **macOS** on Apple Silicon, **Linux** (x86-64 or arm64, Vulkan) or **Windows** (x86-64 or arm64,
+  Vulkan); the platform-specific build steps are under "Building" below
 - macOS: Xcode command line tools (`xcode-select --install`)
 - zstd for the extractor's `.wua` support: a system one if installed (`brew install zstd`, `apt install
   libzstd-dev`; found through its CMake package or pkg-config), otherwise CMake downloads the pinned
@@ -204,9 +211,6 @@ cmake -S . -B build/linux -G Ninja -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER
   -DCMAKE_EXE_LINKER_FLAGS="--unwindlib=libgcc"
 ```
 
-Closing the TV window ends the game; closing the GamePad window only hides it. F11 or Alt+Enter toggles
-full screen for the focused window.
-
 On Arch-based systems (Arch, CachyOS, Manjaro):
 
 ```sh
@@ -225,8 +229,10 @@ remembered in `settings.ini` and the next start begins the same way. Clicking/dr
 touch screen. The GamePad screen has the macOS modes (settings overlay, *Display*): a separate
 window, a picture-in-picture overlay in a corner of the TV window (corner, size and opacity
 selectable; click it to touch), the automatic overlay, off, or the GamePad picture alone in the TV
-window (click it to touch); **Ctrl+G** shows/hides it, and the choices are saved in `settings.ini`. The macOS menus (Graphics, Display, Input, Save States) don't exist in these builds
-yet; their settings are available as environment variables (below) and the number-key shortcuts.
+window (click it to touch); **Ctrl+G** shows/hides it, and the choices are saved in `settings.ini`. Closing the TV window ends the
+game; closing the GamePad window only hides it. These builds have no menu bar: the macOS menus'
+options (Graphics, Display, Input, Save States) are in the settings overlay (**F1**, see Playing),
+plus the number-key shortcuts and the environment variables below.
 
 Settings, controls and save states live under `~/.config/wwhd` (or `$XDG_CONFIG_HOME/wwhd`).
 To check the build without the game, `python3 tools/recomp/stubgen.py build/gen-stub` writes
@@ -283,6 +289,20 @@ supported because the recompiled game requires Clang's `musttail` support.
 
 The build fails with a clear message if `build/gen` has not been generated. The runtime checks at
 startup that `game/code/cking.rpx` matches the recompiled code.
+
+#### Windows on ARM64
+
+On an ARM64 PC (e.g. Snapdragon X), the native LLVM method works with the ARM64 LLVM
+(`aarch64-pc-windows-msvc`; the copy in Visual Studio's *C++ Clang tools* component was tested) and
+Visual Studio's ARM64 build tools, from an ARM64 developer prompt (`vcvarsarm64.bat`), plus the
+ARM64 Vulkan SDK. The release is built like the x86-64 one, with the pinned llvm-mingw for ARM64
+hosts (`llvm-mingw-20260922-aarch64` in `tools/installer/toolchains.json`, target
+`aarch64-w64-mingw32`); see the `windows` job of `.github/workflows/release.yml`.
+
+With Visual Studio's bundled clang, add `-DCMAKE_LINKER_TYPE=MSVC`: its `lld-link` is built without
+libxml2 and embeds an application manifest Windows refuses to start ("side-by-side configuration is
+incorrect"); Microsoft's `link.exe` merges it correctly. CMake links clang's compiler-rt builtins on
+the MSVC ABI (128-bit division, `__udivti3`, which no MSVC library provides on ARM64).
 
 ### Android (build it yourself)
 
@@ -355,7 +375,7 @@ GamePad window to use the touch screen. Saves go to `save/`.
 **Settings overlay:** press **F1** in the game window, or **Cmd+,** on macOS (also *Settings…* in the app
 menu; most Mac keyboards send F1 only with **Fn+F1** unless "Use F1, F2, etc. keys as standard
 function keys" is on), or hold Select / Minus for half a second, or press Home, on a controller, for an in-game menu over the picture: save states, graphics, display (full screen, remembered for
-the next start; picture scaling; the GamePad screen),
+the next start; picture scaling; the GamePad screen), audio (a master volume slider and the speaker setup),
 gameplay mods and cheats (Graphics also has the Vulkan presentation mode), controls (the same controller drawing as Input > Controls…: select a
 button or chip and press the key or controller input to use; also on Windows and Linux) and the
 console language (only the languages your game contains can be chosen; the USA game has English,
@@ -472,10 +492,15 @@ plugged in first and follows them, so an Xbox pad plays by label and a Nintendo 
 without touching the setting. The choice rewrites the four face bindings only; keyboard keys
 and the other inputs stay as they are, and a hand-edited face binding shows as *custom* (which also
 leaves Automatic).
+In *by label* (including when *Automatic* resolves to it), in-game dialog icons and HUD face-button
+backgrounds use Xbox-style colours (green A, red B, blue X, yellow Y); changing the setting updates
+cached prompts without a restart. The HUD button cluster also follows the Xbox positions: A bottom,
+B right, X left, Y top. In-game shoulder prompts use R1/R2 for R/ZR and L1/L2 for L/ZL in this mode.
+*By position* and *custom* keep the game's colours and positions. See [in-game glyphs](docs/button-glyphs.md).
 The **Input** menu switches whether keyboard and controllers act as the Wii U GamePad (default)
 or as a Wii U Pro Controller (`WWHD_PRO_CONTROLLER=1` starts in that mode); with the Pro
 Controller, the GamePad window keeps its screen and touch input.
-When the game asks for text (e.g. your name), a macOS text field opens.
+When the game asks for text (e.g. your name), the text window described above opens.
 
 Rumble works too (SDL hosts): what the game asks its controller's motor to do is passed to the
 connected controllers that have one, which includes the Pro Controller's. A host controller has a
@@ -532,7 +557,7 @@ In Gaming Mode the Steam button belongs to Steam and there is no keyboard, so ke
 - Useful environment variables: `WWHD_NO_AUDIO=1`, `WWHD_NO_GAMEPAD=1` (no second window), `WWHD_NO_CONTROLLERS=1` (SDL builds: ignore host game controllers), `WWHD_LANGUAGE=<code>` (console language: 1 English, 2 French, 5 Spanish, … — the USA/Asia disc carries English, French and Spanish; a language the game doesn't contain starts in English; with `WWHD_LANGUAGE_REGION=eu` or `jp` from a language source, docs/language-packs.md), `WWHD_RTL=0` / `1` (right-to-left text for Arabic and Hebrew packs off / forced on, docs/rtl-text.md),
   `WWHD_DRC_MODE=window|pip|auto|off|gamepad`, `WWHD_FULLSCREEN=0|1` (the TV window starts windowed / in
   full screen this time instead of as it was left; that session's full screen is not remembered), `WWHD_ASPECT=16:9|window|16:10|21:9|32:9|<w:h>`,
-  `WWHD_AUDIO_VOLUME=0..1`, `WWHD_AUDIO_OUTPUT=auto|tv|gamepad` (the host plays the TV's sound, plus the GamePad's in Off-TV Play: auto; or only one of them), `WWHD_SHADER_CACHE=<file>|0`, `WWHD_AO_MODE=0..2`, `WWHD_AO_HIRES=0|1`, `WWHD_ANISO=0|1`, `WWHD_RES_SCALE=1|1.5|2|3`,
+  `WWHD_AUDIO_VOLUME=0..1` (the master volume the session starts at, whatever the Audio slider saved), `WWHD_AUDIO_OUTPUT=auto|tv|gamepad` (the host plays the TV's sound, plus the GamePad's in Off-TV Play: auto; or only one of them), `WWHD_SHADER_CACHE=<file>|0`, `WWHD_AO_MODE=0..2`, `WWHD_AO_HIRES=0|1`, `WWHD_ANISO=0|1`, `WWHD_RES_SCALE=1|1.5|2|3`,
   `WWHD_FXAA=0|1`, `WWHD_QUIT_PROMPT=0` (macOS: quit without asking, also during a game), `WWHD_INTERP=1`, `WWHD_INTERP_FPS=60|120|240` (frame interpolation at that rate),
   `WWHD_INTERP_PACED=0|1`, `WWHD_TRUE60=1` (start values for the Graphics menu; they
   override the remembered choices); `WWHD_DISPLAY_HZ=n` replaces the detected display refresh rate
@@ -572,26 +597,36 @@ Tingle Bottle (HD's item in the same slot); Picto Box photos and HD-only statist
 over; Japanese player names become "Link". Details and options: [tools/savegame/README.md](tools/savegame/README.md).
 Tested with 167 GameCube saves across the whole story (100% and Any% routes).
 
-## Optional: shader head start
+## Preparing shaders (automatic)
 
-The first time a shader is needed it is translated and compiled, which can cause short hitches.
-A "head start" pre-translates shaders from the game's own shader archives so later sessions
-start with them. It is built locally from your files and is never distributed; without it the
-game simply translates shaders on first use.
+After building the game, setup offers **Preparing shaders**. It uses your own game files and a
+small state template supplied with the release to compile covered shaders and pipelines for your
+computer before you play. Preparation usually takes tens of seconds on a recent Mac; the time varies
+with your computer and graphics driver. The generated caches stay on your computer.
 
-Building it needs a state template (the GPU register states each shader was used with), which
-is recorded from your own play: play for a while (the further you get, the more it covers),
-then
+On a Mac, where **Graphics → Renderer** lets you choose Metal or Vulkan, setup prepares shaders for
+both, one after the other on the same progress bar, so the game starts prepared with either renderer.
+If Vulkan cannot start on your Mac, Metal is still prepared and Vulkan is skipped with a short
+message. Windows, Linux and Android prepare Vulkan.
 
-```sh
-python3 tools/shaderprep.py template ~/Library/Caches/wwhd/shaders.bin   # -> game/shadercache/template.bin
-python3 tools/shaderprep.py build                                          # -> game/shadercache/headstart.bin
-./build/cmake/wwhd --warm-shaders    # optional: compile everything once to fill the macOS shader cache
-```
+You can uncheck **Prepare shaders now**, or use `--skip-shader-prebuild` with terminal setup.
+On Android, Back skips the preparation screen. If preparation fails or the build has no template,
+setup skips it with a short message and the game compiles shaders as needed during play.
+Skipping is remembered for the same game and template, including after game runtime updates.
 
-`--merge game/shadercache/template.bin` adds a later session to an existing template. The runtime
-picks up `game/shadercache/headstart.bin` automatically (`WWHD_HEADSTART=<file>|0` overrides it).
-See the comment at the top of `tools/shaderprep.py` for the file formats.
+Use **Settings → Graphics → Rebuild shader cache**, then run setup and choose repair/update to
+prepare a fresh cache. Launching the game never starts preparation automatically. Uncovered areas can still
+stutter the first time you visit them. When a shader is unavailable, the renderer waits for its exact
+state and may repeat the last finished picture.
+
+Caches live in the host settings folder's `shader-prebuild` directory, or
+`data/user/shader-prebuild` in a portable installation. Keep generated caches and recordings local.
+
+### Vulkan shader head start on Windows and Linux
+
+Local recording and preparation are available for developers and players who want to cover additional
+scenes. See the [shader-template maintainer guide](tools/shadercache/README.md) for the Windows and
+Linux commands and local template selection.
 
 ## Optional: decompilation tools
 
@@ -617,13 +652,13 @@ README. `build/names.tsv` is derived from the game and stays on your machine.
 
 ## Status
 
-The opening of the game (title, file select, intro, Outset Island) is tested and matches Cemu
-side by side, at a steady 30 fps (the console's frame rate) and at 60 fps with interpolation;
-true 60 is experimental. Known gaps: geometry shaders and rectangle
-primitives are not implemented yet (not encountered so far), shadow edges are harder than on
-the console, startup sometimes sits on a black screen for up to a minute before the logo
-(a timing-dependent wait during audio initialization, under investigation), and later parts of
-the game are untested.
+The game is playable from start to finish (players have completed it) on macOS, Windows, Linux
+and Android, and bugs are fixed as they are reported (see the [changelog](CHANGELOG.md) and the
+[issues](https://github.com/ZeldaWWHDRecomp/ZeldaWWHDRecomp/issues)). Rendering is compared with
+Cemu side by side. It runs at the console's 30 fps or, with frame interpolation, at 60, 120 or
+240 fps (up to the display's refresh rate); true 60 fps is experimental. Known gaps: geometry
+shaders and rectangle primitives are not implemented yet (not encountered in the game so far),
+and the macOS app does not drive controller rumble yet.
 
 ## License
 

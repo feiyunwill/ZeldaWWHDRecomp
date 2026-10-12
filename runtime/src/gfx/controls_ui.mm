@@ -222,6 +222,10 @@ struct UIState {
 @property(strong) NSSegmentedControl* faceLayout;
 @property(strong) NSSlider* deadzone;
 @property(strong) NSTextField* deadzoneValue;
+@property(strong) NSSlider* leftRange;     // issue #40: per-stick range, tag 0 = left, 1 = right
+@property(strong) NSSlider* rightRange;
+@property(strong) NSTextField* leftRangeValue;
+@property(strong) NSTextField* rightRangeValue;
 @property(strong) NSButton* invertY;
 @property(strong) NSTimer* timer;
 - (BOOL)handleKeyEvent:(NSEvent*)e;
@@ -1050,6 +1054,7 @@ static NSTextField* label(NSString* s) {
     NSTextField* dzl = label(@"Stick dead zone:");
     NSSlider* dz = [NSSlider sliderWithValue:0 minValue:0 maxValue:0.5 target:self action:@selector(deadzoneChanged:)];
     dz.continuous = YES;
+    dz.toolTip = @"Default: 15%. Filters resting-stick drift on both sticks.";
     dz.numberOfTickMarks = 11;
     self.deadzone = dz;
     NSTextField* dzv = label(@"0%");
@@ -1057,12 +1062,40 @@ static NSTextField* label(NSString* s) {
     self.deadzoneValue = dzv;
     NSButton* inv = [NSButton checkboxWithTitle:@"Invert camera up/down" target:self action:@selector(invertChanged:)];
     self.invertY = inv;
-    for (NSView* v in @[which, fl, pi, pv, sep, st, reset, dzl, dz, dzv, inv]) {
+    // issue #40: stick range, one slider per stick (worn sticks usually wear one at a time)
+    NSString* rangeTip = @"Default: 100% (no change). Scales the stick after the dead zone so a short stick reaches full deflection.";
+    auto rangeSlider = [&](NSInteger tag) {
+        NSSlider* s = [NSSlider sliderWithValue:kMinStickRange minValue:kMinStickRange maxValue:kMaxStickRange
+                                         target:self action:@selector(rangeChanged:)];
+        s.continuous = YES;
+        s.tag = tag;
+        s.toolTip = rangeTip;
+        s.numberOfTickMarks = 11;
+        return s;
+    };
+    NSTextField* lrl = label(@"Left stick range:");
+    NSSlider* lr = rangeSlider(0);
+    NSTextField* lrv = label(@"100%");
+    lrv.alignment = NSTextAlignmentRight;
+    NSTextField* rrl = label(@"Right stick range:");
+    NSSlider* rr = rangeSlider(1);
+    NSTextField* rrv = label(@"100%");
+    rrv.alignment = NSTextAlignmentRight;
+    self.leftRange = lr;
+    self.rightRange = rr;
+    self.leftRangeValue = lrv;
+    self.rightRangeValue = rrv;
+    NSTextField* rh = label(@"Raise if your stick can't reach full deflection, e.g. the Wind Waker baton's directions don't register.");
+    rh.font = [NSFont systemFontOfSize:11];
+    rh.textColor = NSColor.secondaryLabelColor;
+    rh.lineBreakMode = NSLineBreakByTruncatingTail;
+    [rh setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
+    for (NSView* v in @[which, fl, pi, pv, sep, st, reset, dzl, dz, dzv, inv, lrl, lr, lrv, rrl, rr, rrv, rh]) {
         v.translatesAutoresizingMaskIntoConstraints = NO;
         [root addSubview:v];
     }
 
-    NSDictionary* v = NSDictionaryOfVariableBindings(which, fl, pi, pv, sep, st, reset, dzl, dz, dzv, inv);
+    NSDictionary* v = NSDictionaryOfVariableBindings(which, fl, pi, pv, sep, st, reset, dzl, dz, dzv, inv, lrl, lr, lrv, rrl, rr, rrv, rh);
     auto C = [&](NSString* f, NSLayoutFormatOptions o = 0) {
         [root addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:f options:o metrics:nil views:v]];
     };
@@ -1071,7 +1104,8 @@ static NSTextField* label(NSString* s) {
     C(@"H:|-0-[sep]-0-|");
     C(@"H:|-16-[st]-16-|");
     C(@"H:|-16-[reset]-(>=24)-[dzl]-8-[dz(160)]-6-[dzv(40)]-24-[inv]-16-|", NSLayoutFormatAlignAllCenterY);
-    C(@"V:|-12-[which]-6-[pv(>=400)]-0-[sep]-8-[st]-8-[reset]-14-|");
+    C(@"H:|-16-[rh]-(>=24)-[lrl]-8-[lr(160)]-6-[lrv(40)]-24-[rrl]-8-[rr(160)]-6-[rrv(40)]-16-|", NSLayoutFormatAlignAllCenterY);
+    C(@"V:|-12-[which]-6-[pv(>=400)]-0-[sep]-8-[st]-8-[reset]-10-[lr]-14-|");
     [w center];
     [self syncOptions];
     [self syncWhich];
@@ -1094,6 +1128,10 @@ static NSTextField* label(NSString* s) {
     self.deadzone.doubleValue = _st.m.deadzone;
     self.deadzoneValue.stringValue = [NSString stringWithFormat:@"%.0f%%", _st.m.deadzone * 100];
     self.invertY.state = _st.m.invert_camera_y ? NSControlStateValueOn : NSControlStateValueOff;
+    self.leftRange.doubleValue = _st.m.left_range;
+    self.rightRange.doubleValue = _st.m.right_range;
+    self.leftRangeValue.stringValue = [NSString stringWithFormat:@"%.0f%%", _st.m.left_range * 100];
+    self.rightRangeValue.stringValue = [NSString stringWithFormat:@"%.0f%%", _st.m.right_range * 100];
     // kCustom: no segment chosen (as the overlay's "(custom)"); any segment then applies its preset.
     // Automatic is segment 2 whatever the bindings resolved to (as the overlay's "(-> ...)").
     if (_st.m.face_auto) self.faceLayout.selectedSegment = 2;
@@ -1408,7 +1446,7 @@ static bool modifier_down(uint16_t code, NSEventModifierFlags f, bool* known) {
     [self cancelCapture];
     NSAlert* alert = [[NSAlert alloc] init];
     alert.messageText = @"Reset all controls to their defaults?";
-    alert.informativeText = @"Keyboard keys, controller buttons, the dead zone and camera inversion go back to the built-in layout.";
+    alert.informativeText = @"Keyboard keys, controller buttons, the dead zone, the stick ranges and camera inversion go back to the built-in layout.";
     [alert addButtonWithTitle:@"Reset"];
     [alert addButtonWithTitle:@"Cancel"];
     [alert beginSheetModalForWindow:self.window completionHandler:^(NSModalResponse r) {
@@ -1427,6 +1465,14 @@ static bool modifier_down(uint16_t code, NSEventModifierFlags f, bool* known) {
 - (void)deadzoneChanged:(NSSlider*)s {
     _st.m.deadzone = std::round(s.doubleValue * 100) / 100;
     self.deadzoneValue.stringValue = [NSString stringWithFormat:@"%.0f%%", _st.m.deadzone * 100];
+    set_current(_st.m);
+    _gen = generation();
+}
+
+- (void)rangeChanged:(NSSlider*)s {
+    float r = std::clamp((float)(std::round(s.doubleValue * 100) / 100), kMinStickRange, kMaxStickRange);
+    (s.tag ? _st.m.right_range : _st.m.left_range) = r;
+    (s.tag ? self.rightRangeValue : self.leftRangeValue).stringValue = [NSString stringWithFormat:@"%.0f%%", r * 100];
     set_current(_st.m);
     _gen = generation();
 }
@@ -1583,6 +1629,9 @@ static void self_test() {
     c.invertY.state = NSControlStateValueOn;
     [c invertChanged:c.invertY];
     expect(current().invert_camera_y, "invert camera Y");
+    c.rightRange.doubleValue = 1.111;
+    [c rangeChanged:c.rightRange];
+    expect(current().right_range == 1.11f && current().left_range == 1.0f, "right stick range = 111%");
     // 9. the file on disk follows
     Mapping disk;
     expect(load_file(default_path(), disk) && disk == current(), "controls.json matches the live mapping");

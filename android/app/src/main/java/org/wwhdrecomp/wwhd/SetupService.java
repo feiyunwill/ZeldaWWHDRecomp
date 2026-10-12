@@ -28,6 +28,12 @@ import org.json.JSONObject;
 public class SetupService extends Service {
     public static final String RESUME = "org.wwhdrecomp.wwhd.SETUP_RESUME";
     public static final String PAUSE = "org.wwhdrecomp.wwhd.SETUP_PAUSE";
+    /** "Continue anyway": skip heat (or battery) pauses for the rest of this setup run. */
+    public static final String CONTINUE_HEAT = "org.wwhdrecomp.wwhd.SETUP_CONTINUE_HEAT";
+    public static final String CONTINUE_BATTERY = "org.wwhdrecomp.wwhd.SETUP_CONTINUE_BATTERY";
+    /** Job-dir records of the user's choice; kept across service restarts, cleared when the run ends. */
+    public static final String HEAT_OVERRIDE = "continue-heat.json";
+    public static final String BATTERY_OVERRIDE = "continue-battery.json";
     private static final int NOTIFICATION = 41;
     private static final String CHANNEL = "setup";
     private final Handler main = new Handler(Looper.getMainLooper());
@@ -43,6 +49,7 @@ public class SetupService extends Service {
     private int battery = -1;
     private boolean charging;
     private String reason;
+    private String loggedReason;
     private String lastNotification;
     private long renewed;
 
@@ -97,6 +104,13 @@ public class SetupService extends Service {
             String action = intent == null ? null : intent.getAction();
             if (PAUSE.equals(action)) SetupStore.write(new File(job, "manual-pause.json"), new JSONObject().put("schema", 1));
             if (RESUME.equals(action)) SetupStore.remove(new File(job, "manual-pause.json"));
+            if (CONTINUE_HEAT.equals(action) || CONTINUE_BATTERY.equals(action)) {
+                SetupStore.write(new File(job, CONTINUE_HEAT.equals(action) ? HEAT_OVERRIDE : BATTERY_OVERRIDE),
+                    new JSONObject().put("schema", 1).put("since", System.currentTimeMillis()));
+                Log.i("wwhd-setup", "continue anyway: " + (CONTINUE_HEAT.equals(action) ? "heat" : "battery") +
+                    " pauses skipped for this setup run (" + SetupPolicy.readings(thermal, temperature) +
+                    ", battery " + battery + "%, charging " + charging + ")");
+            }
             main.removeCallbacks(tick);
             tick.run();
             return START_STICKY;
@@ -111,7 +125,16 @@ public class SetupService extends Service {
         @Override public void run() {
             if (destroyed || job == null) return;
             try {
-                reason = policy.update(thermal, temperature, battery, charging, new File(job, "manual-pause.json").exists());
+                boolean heatOverride = new File(job, HEAT_OVERRIDE).exists();
+                boolean batteryOverride = new File(job, BATTERY_OVERRIDE).exists();
+                reason = policy.update(thermal, temperature, battery, charging,
+                    new File(job, "manual-pause.json").exists(), heatOverride, batteryOverride);
+                if (!java.util.Objects.equals(reason, loggedReason)) {
+                    Log.i("wwhd-setup", (reason == null ? "resume" : "pause: " + reason) + " (" +
+                        SetupPolicy.readings(thermal, temperature) + ", battery " + battery + "%, charging " + charging +
+                        ", continue anyway: heat " + heatOverride + ", battery " + batteryOverride + ")");
+                    loggedReason = reason;
+                }
                 File pause = new File(job, "pause.json");
                 if (reason == null) {
                     if (pause.exists()) SetupStore.remove(pause);
@@ -162,7 +185,11 @@ public class SetupService extends Service {
                 String kind = configuration.getJSONObject("input").getString("kind");
                 if (!kind.equals("folder")) configuration.put("extractor", AndroidExtractor.prepare(this));
                 String revision = EmbeddedPython.checksum(this, "python-source.zip", () -> checkPause(active));
-                configuration.put("port_revision", revision).put("jobs", compileJobs());
+                // the APK's native Yaz0 decoder for shader preparation (shaderprep.py; android/build_native.sh)
+                File yaz0 = new File(getApplicationInfo().nativeLibraryDir, "libyaz0.so");
+                if (yaz0.isFile()) configuration.put("yaz0", yaz0.getAbsolutePath());
+                configuration.put("port_revision", revision).put("jobs", compileJobs())
+                    .put("shader_cache_root", AndroidUserDirectories.shaderPrebuild(getExternalFilesDir(null)).getAbsolutePath());
                 SetupStore.write(new File(active, "job.json"), configuration);
                 checkPause(active);
                 host("running", null, null);
@@ -179,7 +206,20 @@ public class SetupService extends Service {
                 host("activating", null, null);
                 checkPause(active);
                 AndroidGame.activate(this, new File(ready.getString("library")), new File(ready.getString("game")));
-                host("complete", null, null);
+                JSONObject shaders = ready.optJSONObject("shader_prebuild");
+                if (shaders != null && shaders.optString("status").equals("warm_pending")) {
+                    File result = new File(active, "shader-warm-result.json");
+                    if (result.isFile() && !result.delete()) throw new IOException("Cannot replace shader preparation result");
+                    host("warming shaders", null, null);
+                    long deadline = android.os.SystemClock.elapsedRealtime() + 300000;
+                    while (!result.isFile() && android.os.SystemClock.elapsedRealtime() < deadline) {
+                        checkPause(active);
+                        Thread.sleep(200);
+                    }
+                    if (!result.isFile() || !SetupStore.read(result).optString("status").equals("ready")) {
+                        host("complete", null, "Shader preparation skipped or failed; shaders will compile during play.");
+                    } else host("complete", null, null);
+                } else host("complete", null, null);
             } catch (Pause requested) { paused = true; }
             catch (Exception failure) {
                 error = failure;
@@ -236,6 +276,9 @@ public class SetupService extends Service {
                 return; // Sensor changes or a notification action can resume.
             }
             if (failure != null) host("failed", null, failure.toString());
+            // The run ended: a later run asks again before skipping heat or battery pauses.
+            SetupStore.remove(new File(job, HEAT_OVERRIDE));
+            SetupStore.remove(new File(job, BATTERY_OVERRIDE));
             main.removeCallbacks(tick);
             updateNotification();
             stopForeground(STOP_FOREGROUND_DETACH);
@@ -259,7 +302,7 @@ public class SetupService extends Service {
         JSONObject status = SetupStore.read(new File(job, "host.json"));
         String state = status.getString("state");
         String text = state;
-        if (reason != null) text = running ? "Pausing at the next safe checkpoint" : SetupPolicy.description(reason);
+        if (reason != null) text = running ? "Pausing at the next safe checkpoint" : SetupPolicy.description(reason, thermal, temperature);
         else if (state.equals("running")) {
             File progress = new File(job, "state.json");
             if (progress.isFile()) {
@@ -284,6 +327,12 @@ public class SetupService extends Service {
             PendingIntent control = PendingIntent.getForegroundService(this, action.equals(PAUSE) ? 1 : 2,
                 new Intent(this, getClass()).setAction(action), PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
             result.addAction(new Notification.Action.Builder(null, action.equals(PAUSE) ? "Pause" : "Resume", control).build());
+            if (!running && SetupPolicy.overridable(reason)) {
+                String skip = reason.equals("heat") ? CONTINUE_HEAT : CONTINUE_BATTERY;
+                PendingIntent anyway = PendingIntent.getForegroundService(this, skip.equals(CONTINUE_HEAT) ? 3 : 4,
+                    new Intent(this, getClass()).setAction(skip), PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+                result.addAction(new Notification.Action.Builder(null, "Continue anyway", anyway).build());
+            }
         }
         return result.build();
     }

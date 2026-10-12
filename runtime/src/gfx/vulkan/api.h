@@ -31,6 +31,7 @@ void request_tv_dump(const std::string& path, int frames_ahead);
 void request_capture();
 void ss_reset_surfaces();
 void save_renderer_caches();
+void shutdown_renderer_caches();
 int renderer_smoke_test();
 std::string device_description();  // "<GPU>, driver <version>, Vulkan <version>" ("" before init)
 namespace vk { void reset_shader_memoization(); }

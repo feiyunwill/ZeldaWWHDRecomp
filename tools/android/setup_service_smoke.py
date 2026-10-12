@@ -126,8 +126,15 @@ def main():
         shell("cmd", "thermalservice", "override-status", "2")
         time.sleep(1.2)
         until("thermal hysteresis", paused("heat"))
-        shell("cmd", "thermalservice", "override-status", "1")
-        until("low battery pause", paused("battery"))
+        shell("cmd", "thermalservice", "override-status", "4")
+        until("critical thermal pause", paused("critical"))
+        control("continue-heat")
+        time.sleep(1.2)
+        until("continue anyway keeps the critical stop", paused("critical"))
+        shell("cmd", "thermalservice", "override-status", "3")
+        until("continue anyway skips the heat pause", paused("battery"))
+        if "continue-heat.json" not in shell("run-as", PACKAGE, "ls", job):
+            raise AssertionError("Continue anyway was not persisted in the job")
         shell("cmd", "battery", "set", "-f", "level", "25")
         time.sleep(1.2)
         until("battery hysteresis", paused("battery"))
@@ -141,6 +148,8 @@ def main():
         no_wake()
         control("resume")
         failure = until("unsupported input error", lambda value: value.get("state") == "failed", 90)
+        if "continue-heat.json" in shell("run-as", PACKAGE, "ls", job):
+            raise AssertionError("Continue anyway outlived the finished setup run")
         if "not a file the port knows" not in failure.get("error", ""):
             raise AssertionError("Unsupported input lost its useful installer error")
         no_wake()

@@ -26,6 +26,7 @@ jobs:
             mingw-w64-clang-x86_64-cmake
             mingw-w64-clang-x86_64-ninja
             mingw-w64-clang-x86_64-python
+            mingw-w64-clang-x86_64-python-pillow
             mingw-w64-clang-x86_64-vulkan-headers
             mingw-w64-clang-x86_64-vulkan-loader
             mingw-w64-clang-x86_64-glslang
@@ -44,3 +45,9 @@ jobs:
 
       - name: Unit tests
         run: ctest --test-dir build/windows --output-on-failure
+
+      # Synthetic fixtures only: no game files, caches or performance runs.
+      - name: Shader preparation and benchmark tooling unit tests
+        run: |
+          python tools/test_shaderprep.py
+          python -m unittest discover -s tools/bench -p "test_*.py"

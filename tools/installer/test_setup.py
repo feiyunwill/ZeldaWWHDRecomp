@@ -14,6 +14,121 @@ import setup  # noqa: E402
 KEY_HEX = "0011223344556677" "8899aabbccddeeff"  # made-up test value
 
 
+class MacSdkFallback(unittest.TestCase):
+    # the linker output from a Mac whose beta SDK is newer than its Command Line Tools' linker
+    MISMATCH = ("linking the game failed (exit code 1):\n"
+                "/Library/Developer/CommandLineTools/SDKs/MacOSX27.0.sdk/usr/lib/libz.1.tbd:4:20: error: unknown architecture\n"
+                "arm64e.x1-macos, arm64e.x1-maccatalyst ]\n"
+                "in '/Library/Developer/CommandLineTools/SDKs/MacOSX27.0.sdk/usr/lib/libz.tbd'; tapi error: malformed file")
+    SDKS = [((27, 0), "/sdk/MacOSX27.0.sdk"), ((26, 1), "/sdk/MacOSX26.1.sdk"),
+            ((15, 5), "/sdk/MacOSX15.5.sdk"), ((13, 3), "/sdk/MacOSX13.3.sdk")]
+
+    def test_mismatch_pattern(self):
+        self.assertTrue(setup.MAC_SDK_MISMATCH.search(self.MISMATCH))
+        self.assertFalse(setup.MAC_SDK_MISMATCH.search("ld: symbol(s) not found for architecture arm64"))
+
+    def test_sdk_versions_and_order(self):
+        self.assertEqual(setup.mac_sdk_version("/x/MacOSX27.0.sdk"), (27, 0))
+        self.assertEqual(setup.mac_sdk_version("/x/MacOSX26.sdk/"), (26, 0))
+        self.assertIsNone(setup.mac_sdk_version("/x/MacOSX.sdk"))
+        # older SDKs only, newest first, never below the game's deployment target (14.0)
+        self.assertEqual(setup.mac_fallback_sdks("/sdk/MacOSX27.0.sdk", self.SDKS),
+                         ["/sdk/MacOSX26.1.sdk", "/sdk/MacOSX15.5.sdk"])
+        # an unversioned current path (Xcode's MacOSX.sdk) gets its version from the list
+        sdks = [((26, 1), "/clt/MacOSX26.1.sdk"), ((26, 0), "/xcode/MacOSX.sdk"), ((15, 4), "/clt/MacOSX15.4.sdk")]
+        self.assertEqual(setup.mac_fallback_sdks("/xcode/MacOSX.sdk", sdks), ["/clt/MacOSX15.4.sdk"])
+
+    def _link(self, works_with, env=None):
+        calls = []
+        def run_logged(cmd, env=None, what=""):
+            sdk = (env or {}).get("SDKROOT")
+            calls.append(sdk)
+            if sdk != works_with:
+                raise setup.SetupError(self.MISMATCH)
+            return ""
+        with mock.patch.object(setup, "IS_MAC", True), \
+             mock.patch.object(setup, "run_logged", side_effect=run_logged), \
+             mock.patch.object(setup, "mac_sdks", return_value=self.SDKS), \
+             mock.patch.object(setup, "mac_current_sdk", return_value="/sdk/MacOSX27.0.sdk"), \
+             mock.patch.object(setup, "say"):
+            setup.link_with_sdk_fallback(["clang++"], env)
+        return calls
+
+    def test_retries_with_an_older_sdk(self):
+        self.assertEqual(self._link("/sdk/MacOSX15.5.sdk", {}), [None, "/sdk/MacOSX26.1.sdk", "/sdk/MacOSX15.5.sdk"])
+
+    def test_clear_message_when_no_sdk_works(self):
+        with self.assertRaises(setup.SetupError) as e:
+            self._link("/none", {})
+        self.assertIn("Update the Command Line Tools", str(e.exception))
+
+    def test_other_errors_and_explicit_sdkroot_are_not_retried(self):
+        with mock.patch.object(setup, "IS_MAC", True), \
+             mock.patch.object(setup, "run_logged", side_effect=setup.SetupError("ld: symbol(s) not found")) as run:
+            with self.assertRaises(setup.SetupError):
+                setup.link_with_sdk_fallback(["clang++"], {})
+            self.assertEqual(run.call_count, 1)
+        with mock.patch.object(setup, "IS_MAC", True), \
+             mock.patch.object(setup, "run_logged", side_effect=setup.SetupError(self.MISMATCH)) as run:
+            with self.assertRaises(setup.SetupError):
+                setup.link_with_sdk_fallback(["clang++"], {"SDKROOT": "/chosen.sdk"})  # the player chose the SDK
+            self.assertEqual(run.call_count, 1)
+class ShaderPreparationBoundary(unittest.TestCase):
+    def test_unexpected_preparation_error_does_not_abort_setup(self):
+        import shader_prebuild
+        with mock.patch.object(shader_prebuild, "prepare", side_effect=RuntimeError("unexpected failure")), \
+                mock.patch.object(setup.LOG, "write") as log:
+            result = setup.prepare_shaders_nonfatal("game", "template", "exe", "cache", "package")
+        self.assertEqual(result, dict(status="failed", message="unexpected failure"))
+        self.assertIn("The game can still run", log.call_args.args[0])
+
+
+class ShaderPreparationProgress(unittest.TestCase):
+    def test_gui_bar_is_indeterminate_until_fractions_then_determinate(self):
+        class Gui:
+            def __init__(self): self.events = []
+            def emit(self, event): self.events.append(event)
+        gui = Gui()
+        with mock.patch.object(setup, "GUI", gui), mock.patch.object(setup.LOG, "write") as log:
+            message = setup.shader_progress_callback(setup.Progress("Preparing shaders"))
+            message("Resolving shaders from your game files")
+            message("Resolving shaders from your game files: 3 of 818 game archives", fraction=0.1)
+            message("Resolving shaders from your game files: 9 of 818 game archives", fraction=0.2)
+            message("Compiling shaders and pipelines for this computer", fraction=0.35)
+        bars = [(e["done"], e["total"], e["detail"]) for e in gui.events if e["event"] == "progress"]
+        self.assertEqual(bars[0], (0, 0, "Resolving shaders from your game files"))
+        self.assertEqual(bars[1], (100, 1000, "Resolving shaders from your game files: 3 of 818 (10%)"))
+        self.assertEqual(bars[-1][2], "Compiling shaders and pipelines for this computer (35%)")
+        self.assertEqual(bars[-1][:2], (350, 1000))
+        self.assertEqual([c.args[0] for c in log.call_args_list],
+                         ["Resolving shaders from your game files", "Compiling shaders and pipelines for this computer"])
+
+    def test_terminal_line_shows_percentage(self):
+        import io
+        out = io.StringIO()
+        with mock.patch.object(setup, "GUI", None), mock.patch.object(setup.LOG, "write"), \
+                mock.patch.object(setup.sys, "stdout", out):
+            message = setup.shader_progress_callback(setup.Progress("Preparing shaders"))
+            message("Resolving shaders from your game files: 400 of 818 game archives", fraction=0.42)
+        self.assertIn("42% Resolving shaders from your game files: 400 of 818 game archives", out.getvalue())
+
+
+class BracketsInInstallFolder(unittest.TestCase):
+    # issue #136: an install folder such as "LoZ - The Wind Waker [WiiU]" made glob treat "[WiiU]" as a
+    # character class, so setup found none of the generated files ("the recompiler wrote no code").
+    def test_recompile_counts_generated_code_in_a_folder_with_brackets(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            gen_dir = os.path.join(temporary, "LoZ - The Wind Waker [WiiU]", "data", "work", "gen")
+
+            def run_logged(cmd, env=None, what=""):
+                os.makedirs(gen_dir, exist_ok=True)
+                for name in ("code_000.c", "code_001.c"):
+                    open(os.path.join(gen_dir, name), "w").close()
+
+            with mock.patch.object(setup, "run_logged", side_effect=run_logged):
+                self.assertEqual(setup.recompile(os.path.join(temporary, "game"), gen_dir), 2)
+
+
 class GuestBuildConfig(unittest.TestCase):
     def test_toolchain_argument_vector(self):
         with tempfile.TemporaryDirectory() as d:
@@ -331,7 +446,7 @@ class ArchiveTitles(unittest.TestCase):
         self.assertEqual(setup.title_desc("0005000E10143400"), "the update for The Wind Waker HD (Japan)")
 
     def test_plan(self):
-        self.assertEqual(setup.plan_steps("archive"), ["archive", "compiler", "extract", "translate", "compile", "app"])
+        self.assertEqual(setup.plan_steps("archive"), ["archive", "compiler", "extract", "translate", "compile", "app", "shaders"])
         self.assertEqual(setup.EXTRACT_ERRORS[10], "wrong_title")
 
 
@@ -482,6 +597,22 @@ class Arch(unittest.TestCase):
         self.assertIn("aarch64", tcs["toolchains"]["zig-0.16.0-aarch64"]["url"])
         self.assertIn("aarch64", tcs["python"]["linux-aarch64"]["url"])
 
+    def test_windows_arm64_pins(self):
+        tcs = setup.load_toolchains()
+        tc = tcs["toolchains"]["llvm-mingw-20260922-aarch64"]
+        self.assertEqual(tc["kind"], "llvm-mingw")
+        self.assertEqual(tc["triple"], "aarch64-w64-mingw32")
+        self.assertIn("ucrt-aarch64", tc["url"])
+        self.assertNotIn("triple", tcs["toolchains"]["llvm-mingw-20260922"])  # x86-64: the default triple
+        self.assertIn("embed-arm64", tcs["python"]["windows-arm64"]["url"])
+        files = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "release", "python-windows-arm64-files.json")
+        with open(files) as f:
+            expected = json.load(f)
+        self.assertEqual(expected["sha256"], tcs["python"]["windows-arm64"]["sha256"])
+        self.assertEqual(expected["url"], tcs["python"]["windows-arm64"]["url"])
+        for name in ("python.exe", "pythonw.exe", "python3.dll", "LICENSE.txt"):
+            self.assertIn(name, expected["files"])
+
 
 class NoScriptHost(unittest.TestCase):
     """Antivirus heuristics read "unsigned program starts PowerShell" as a dropper (issue #58): the Windows setup
@@ -524,6 +655,11 @@ class BundledPython(unittest.TestCase):
         self.assertEqual(self.expected["url"], pin["url"])
         for name in ("python.exe", "pythonw.exe", "python3.dll", "LICENSE.txt"):
             self.assertIn(name, self.expected["files"])
+
+    def test_guard_picks_the_release_python(self):
+        self.assertEqual(self.guard.python_files("dist/WindWakerHD-v1-windows-arm64.zip"), self.guard.PYTHON_FILES_ARM64)
+        self.assertEqual(self.guard.python_files(os.path.join("x", "WindWakerHD-v1-windows-arm64", "")), self.guard.PYTHON_FILES_ARM64)
+        self.assertEqual(self.guard.python_files("dist/WindWakerHD-v1-windows-x86_64.zip"), self.guard.PYTHON_FILES)
 
     def test_guard_rejects_other_files(self):
         with tempfile.TemporaryDirectory() as d:
@@ -824,6 +960,13 @@ class CodeModsBuild(unittest.TestCase):
                         import subprocess
                         subprocess.run([package_test,
                                         "--setup-code-mods", str(data)], check=True, env=host_env)
+
+                import shader_prebuild
+                with mock.patch.object(shader_prebuild, "prepare", side_effect=PermissionError("late scan failure")):
+                    state = setup.install(ctx, ("installed", str(game)))
+                self.assertEqual(state["shader_prebuild"]["status"], "failed")
+                self.assertTrue(Path(state["exe"]).is_file())
+                self.assertEqual(setup.read_state(str(data))["shader_prebuild"]["status"], "failed")
 
 
     def test_fingerprint_tracks_build_inputs_and_mode(self):

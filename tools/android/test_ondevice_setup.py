@@ -32,7 +32,8 @@ class SetupJobTests(unittest.TestCase):
             destination = "sdk/include" if name == "runtime/include" else name
             shutil.copytree(ROOT / name, self.package / destination)
         (self.package / "tools/installer").mkdir()
-        shutil.copyfile(ROOT / "tools/installer/setup.py", self.package / "tools/installer/setup.py")
+        for sibling in ("setup.py", "code_mods.py", "shader_prebuild.py"):
+            shutil.copyfile(ROOT / "tools/installer" / sibling, self.package / "tools/installer" / sibling)
         shutil.copyfile(ROOT / "tools/rpx.py", self.package / "tools/rpx.py")
         link = (["-shared", "-Wl,-all_load", "{gamecode}", "-o", "{out}"] if sys.platform == "darwin" else
                 ["-shared", "-Wl,--whole-archive", "{gamecode}", "-Wl,--no-whole-archive", "-o", "{out}"])
@@ -87,6 +88,41 @@ class SetupJobTests(unittest.TestCase):
                                 state["resources_before"]["reaped_children_cpu_seconds"])
         def unexpected(*args, **kwargs): self.fail("Completed job invoked a compiler")
         self.assertEqual(first, self.execute(unexpected))
+
+    def test_shader_assembly_uses_apk_decoder_path_and_two_threads(self):
+        import os
+        from unittest.mock import patch
+        sys.path.insert(0, str(ROOT / "tools"))
+        import shaderprep
+        import test_shaderprep
+        for name in ("shaderprep.py", "shaderprep_format.py"):
+            shutil.copyfile(ROOT / "tools" / name, self.package / "tools" / name)
+        program = b"synthetic vertex program".ljust(32, b".")
+        (self.game / "content/synthetic.sharcfb").write_bytes(test_shaderprep.sharcfb([(shaderprep.VS, program)]))
+        record = self.root / "record"
+        with record.open("wb") as stream:
+            shaderprep.write_record(stream, 1, shaderprep.shader_record(
+                1, program, test_shaderprep.compact([(160, 0, 0, 0)]), [(0xa21a, 7)]))
+        (self.package / "tools/shadercache").mkdir()
+        shaderprep.cmd_template(record, self.package / "tools/shadercache/template.bin")
+        self.value["yaz0"] = str(self.root / "nativeLibraryDir/libyaz0.so")
+        builds = []
+        real_module_from_spec = importlib.util.module_from_spec
+        def module_from_spec(found):
+            # the job loads shaderprep from the package: record how it calls the build
+            module = real_module_from_spec(found)
+            if found.name == "wwhd_shaderprep":
+                found.loader.exec_module(module)
+                original = module.cmd_build
+                module.cmd_build = lambda *a, **k: (builds.append(k), original(*a, **k))[1]
+                found.loader = type("Loaded", (), {"exec_module": staticmethod(lambda m: None)})()
+            return module
+        with patch.dict(os.environ, {}), patch("importlib.util.module_from_spec", module_from_spec):
+            result = self.execute()
+            self.assertEqual(os.environ.get("WWHD_YAZ0_LIB"), self.value["yaz0"])
+        self.assertEqual(result["shader_prebuild"]["status"], "warm_pending")
+        self.assertEqual(builds[-1]["jobs"], 2)
+        self.assertTrue(builds[-1]["threads"])
 
     def test_pause_and_failed_update_preserve_last_ready_candidate(self):
         first = self.execute()

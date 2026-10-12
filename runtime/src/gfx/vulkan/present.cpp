@@ -1,12 +1,15 @@
+#include "deferred_dispatch.h"
 // Shader presentation matches Metal's source-grid FXAA and scaling filters.
 #include "../../exception_report.h"
 #include "present.h"
 #include "../headless_compose.h"
 #include "imgui.h"
 #include "backend.h"
+#include "pipeline_trace.h"
 #include "shaders.h"
 #include "settings.h"
 #include "mods/climb.h"
+#include "mods/mods.h"  // MoveHud: the run/swim boost's bar (draw_mod_overlay)
 #include "overlay/guest_hud.h"
 #include "gfx/display_modes.h"
 #include "platform/dual_display.h"
@@ -81,7 +84,7 @@ layout(location=0) out vec4 result;
 layout(push_constant) uniform Params { vec4 color; } params;
 void main() { result=params.color; }
 )glsl";
-// stamina wheel of the "climb any wall" mod (as mods/climb_hud.mm), premultiplied
+// stamina wheel of the "climb any wall" mod (as mods/mod_hud.mm), premultiplied
 const char* hudSource = R"glsl(#version 450
 layout(location=0) in vec2 uv;
 layout(location=0) out vec4 result;
@@ -105,6 +108,32 @@ void main() {
  result=vec4(col*fa,a)*u.alpha;
 }
 )glsl";
+// the run/swim boost's ring (runtime/src/mods/mods.cpp move_hud), BotW style like the climb wheel,
+// premultiplied
+const char* moveHudSource = R"glsl(#version 450
+layout(location=0) in vec2 uv;
+layout(location=0) out vec4 result;
+layout(push_constant) uniform Params { float stamina; float alpha; float state; float pad; } u;
+void main() {
+ vec2 p=vec2(uv.x*2.0-1.0,1.0-uv.y*2.0);
+ float r=length(p);
+ float aa=max(fwidth(r),1e-4);
+ float ring=smoothstep(0.58-aa,0.58+aa,r)*(1.0-smoothstep(0.92-aa,0.92+aa,r));
+ float outline=smoothstep(0.50-aa,0.50+aa,r)*(1.0-smoothstep(1.0-2.0*aa,1.0,r));
+ float ang=atan(p.x,p.y);
+ float frac=(ang<0.0?ang+6.28318530718:ang)/6.28318530718;
+ float filled=1.0-smoothstep(u.stamina-0.004,u.stamina+0.004,frac);
+ // 0 running (green), 1 swimming (blue), 2 recharging (amber); the colour runs to red when low
+ vec3 green=vec3(0.32,0.88,0.38),blue=vec3(0.30,0.62,0.95),amber=vec3(0.95,0.62,0.18);
+ vec3 full=mix(vec3(0.95,0.20,0.15),u.state>1.5?amber:u.state>0.5?blue:green,min(1.0,u.stamina/0.3));
+ vec3 empty=u.state>1.5?vec3(0.38,0.24,0.07):vec3(0.10,0.10,0.10);
+ vec3 col=mix(empty,full,filled);
+ float fa=ring*mix(0.45,0.95,filled);
+ float oa=outline*0.45;
+ float a=fa+oa*(1.0-fa);
+ result=vec4(col*fa,a)*u.alpha;
+}
+)glsl";
 struct PresentRect { float x,y,width,height,scale; };
 using PresentParams=PresentImageParams;
 static_assert(sizeof(PresentParams)==32);
@@ -119,7 +148,7 @@ PresentParams present_params(bool aa,int filter,float scale,bool sourceLinear,bo
   filter==0||scale<=1?1:filter==1?scale:1e4f,scale<1?1/scale:1};
 }
 // pipeline kinds: the scaled picture (opaque / with opacity), a filled rectangle, the mod HUD
-enum Kind : uint32_t { kImage, kImageBlend, kSolid, kHud };
+enum Kind : uint32_t { kImage, kImageBlend, kSolid, kHud, kMoveHud };
 struct ScreenResources { bool drawable=false,captureTransfer=false; std::vector<VkImageView> views; };
 struct PresentCapture {
  std::string path;
@@ -220,7 +249,7 @@ VkPipeline pipeline(PresentResources& resources,VkFormat format,Kind kind=kImage
  if(auto it=resources.pipelines.find(key);it!=resources.pipelines.end())return it->second;
  VkShaderModule vs=VK_NULL_HANDLE,fs=VK_NULL_HANDLE;VkPipeline result=VK_NULL_HANDLE;
  try {
-  vs=module(resources,vertexSource,true);fs=module(resources,kind==kSolid?solidSource:kind==kHud?hudSource:fragmentSource,false);
+  vs=module(resources,vertexSource,true);fs=module(resources,kind==kSolid?solidSource:kind==kHud?hudSource:kind==kMoveHud?moveHudSource:fragmentSource,false);
   VkPipelineShaderStageCreateInfo stages[2]{};
   for(int i=0;i<2;++i){stages[i].sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;stages[i].stage=i?VK_SHADER_STAGE_FRAGMENT_BIT:VK_SHADER_STAGE_VERTEX_BIT;stages[i].module=i?fs:vs;stages[i].pName="main";}
   VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
@@ -234,7 +263,7 @@ VkPipeline pipeline(PresentResources& resources,VkFormat format,Kind kind=kImage
    blend.blendEnable=VK_TRUE;blend.colorBlendOp=blend.alphaBlendOp=VK_BLEND_OP_ADD;
    blend.srcColorBlendFactor=blend.srcAlphaBlendFactor=VK_BLEND_FACTOR_SRC_ALPHA;
    blend.dstColorBlendFactor=blend.dstAlphaBlendFactor=VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
-  } else if(kind==kHud) {
+  } else if(kind==kHud||kind==kMoveHud) {
    // premultiplied colour; the image keeps its alpha
    blend.blendEnable=VK_TRUE;blend.colorBlendOp=blend.alphaBlendOp=VK_BLEND_OP_ADD;
    blend.srcColorBlendFactor=VK_BLEND_FACTOR_ONE;blend.dstColorBlendFactor=VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
@@ -245,7 +274,10 @@ VkPipeline pipeline(PresentResources& resources,VkFormat format,Kind kind=kImage
   VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};rendering.colorAttachmentCount=1;rendering.pColorAttachmentFormats=&format;
   VkGraphicsPipelineCreateInfo ci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};ci.pNext=&rendering;ci.stageCount=2;ci.pStages=stages;ci.pVertexInputState=&vi;ci.pInputAssemblyState=&ia;ci.pViewportState=&vp;ci.pRasterizationState=&rs;ci.pMultisampleState=&ms;ci.pColorBlendState=&bs;ci.pDynamicState=&ds;ci.layout=resources.layout;
   const auto started=std::chrono::steady_clock::now();
-  vk_check(resources.api.vkCreateGraphicsPipelines(resources.device,resources.device==R.device?R.pipelineCache:VK_NULL_HANDLE,1,&ci,nullptr,&result),"presentation pipeline");
+  const VkResult compiled=resources.device==R.device ?
+      stutter::create_graphics(R.frame,"present_pipeline",resources.device,R.pipelineCache,1,&ci,nullptr,&result) :
+      resources.api.vkCreateGraphicsPipelines(resources.device,VK_NULL_HANDLE,1,&ci,nullptr,&result);
+  vk_check(compiled,"presentation pipeline");
   if(resources.device==R.device) R.pipelineCreateNs+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-started).count();
   resources.pipelines.emplace(key,result);
   if(resources.device==R.device) { ++R.pipelineCreates;R.pipelineCacheDirty=true;R.pipelineCacheChangedFrame=R.frame; }
@@ -328,43 +360,43 @@ void compose(VkImage image,VkImageView view,VkImageLayout& layout,VkExtent2D ext
  auto cmd=command_buffer();VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};barrier.oldLayout=layout;barrier.newLayout=VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
  barrier.srcQueueFamilyIndex=barrier.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;barrier.image=image;barrier.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
  barrier.srcAccessMask=narrow_barriers()?dependency.sourceAccess:VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
- vkCmdPipelineBarrier(cmd,narrow_barriers()?dependency.source:VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,0,0,nullptr,0,nullptr,1,&barrier);
+ record::vkCmdPipelineBarrier(cmd,narrow_barriers()?dependency.source:VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,0,0,nullptr,0,nullptr,1,&barrier);
  VkRenderingAttachmentInfo attachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};attachment.imageView=view;attachment.imageLayout=VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;attachment.loadOp=VK_ATTACHMENT_LOAD_OP_CLEAR;attachment.storeOp=VK_ATTACHMENT_STORE_OP_STORE;
  attachment.clearValue.color.float32[3]=1;
  VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};rendering.renderArea.extent=extent;rendering.layerCount=1;rendering.colorAttachmentCount=1;rendering.pColorAttachments=&attachment;
- vkCmdBeginRendering(cmd,&rendering);R.rendering=true;R.passTracked=false;
- VkRect2D scissor{{0,0},extent};vkCmdSetScissor(cmd,0,1,&scissor);
+ record::vkCmdBeginRendering(cmd,&rendering);R.rendering=true;R.passTracked=false;
+ VkRect2D scissor{{0,0},extent};record::vkCmdSetScissor(cmd,0,1,&scissor);
  const bool targetLinear=srgb_format(format);
  for(auto& q:quads) {
   if(q.box.w<=0||q.box.h<=0)continue;
-  VkViewport viewport{q.box.x,q.box.y,q.box.w,q.box.h,0,1};vkCmdSetViewport(cmd,0,1,&viewport);
+  VkViewport viewport{q.box.x,q.box.y,q.box.w,q.box.h,0,1};record::vkCmdSetViewport(cmd,0,1,&viewport);
   if(q.solid) {
-   vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,pipeline(format,kSolid));
+   record::vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,pipeline(format,kSolid));
    PresentParams params{};memcpy(&params,q.color,16);
-   vkCmdPushConstants(cmd,resources.layout,VK_SHADER_STAGE_FRAGMENT_BIT,0,sizeof(params),&params);vkCmdDraw(cmd,3,1,0,0);
+   record::vkCmdPushConstants(cmd,resources.layout,VK_SHADER_STAGE_FRAGMENT_BIT,0,sizeof(params),&params);record::vkCmdDraw(cmd,3,1,0,0);
    continue;
   }
   if(!q.image||!q.image->view)continue;
   const bool blend=q.alpha<0.999f;
-  vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,pipeline(format,blend?kImageBlend:kImage));
+  record::vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,pipeline(format,blend?kImageBlend:kImage));
   VkDescriptorSet set;VkDescriptorSetAllocateInfo allocation{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};allocation.descriptorPool=R.descriptorPool;allocation.descriptorSetCount=1;allocation.pSetLayouts=&resources.descriptors;
   vk_check(vkAllocateDescriptorSets(R.device,&allocation,&set),"presentation descriptor set");
   const bool linear=linear_filtering(q.image->fmt.pixel);
   VkDescriptorImageInfo info{linear?resources.linear:resources.nearest,q.image->view,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};write.dstSet=set;write.dstBinding=0;write.descriptorCount=1;write.descriptorType=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;write.pImageInfo=&info;
-  vkUpdateDescriptorSets(R.device,1,&write,0,nullptr);vkCmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,resources.layout,0,1,&set,0,nullptr);
+  vkUpdateDescriptorSets(R.device,1,&write,0,nullptr);record::vkCmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,resources.layout,0,1,&set,0,nullptr);
   // target pixels per source texel, as the Metal composition (display.mm draw_image)
   const float scale=std::min(q.box.w/q.image->extent.width,q.box.h/q.image->extent.height);
   // sRGB texture views decode on sampling; the scan flag also identifies linear
   // scan values held in a UNORM image. sRGB targets encode shader linear output.
   const bool sourceLinear=q.sourceLinear||srgb_format(q.image->fmt.pixel);
   auto params=present_params(fxaa&&linear,filter,scale,sourceLinear,targetLinear);params.alpha=q.alpha;
-  vkCmdPushConstants(cmd,resources.layout,VK_SHADER_STAGE_FRAGMENT_BIT,0,sizeof(params),&params);vkCmdDraw(cmd,3,1,0,0);
+  record::vkCmdPushConstants(cmd,resources.layout,VK_SHADER_STAGE_FRAGMENT_BIT,0,sizeof(params),&params);record::vkCmdDraw(cmd,3,1,0,0);
  }
  if(gamepadOverlay)overlay_draw(gamepadOverlay,cmd,format,extent,targetLinear);
  if(overlay)overlay_draw(overlay,cmd,format,extent,targetLinear);  // settings overlay on top
- vkCmdEndRendering(cmd);
+ record::vkCmdEndRendering(cmd);
  barrier.oldLayout=VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;barrier.newLayout=finalLayout;barrier.srcAccessMask=VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;barrier.dstAccessMask=0;
- vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,0,0,nullptr,0,nullptr,1,&barrier);layout=finalLayout;
+ record::vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,0,0,nullptr,0,nullptr,1,&barrier);layout=finalLayout;
  R.rendering=false;R.passTracked=false;
 }
 }  // namespace
@@ -390,7 +422,7 @@ std::vector<ComposeQuad> screen_quads(Screen& screen,VkExtent2D target,int& filt
  if(!source.scan||!source.scan->image)return quads;
 #ifdef __ANDROID__
  if(gfx::g_has_drc_window) {
-  ComposeQuad q;q.image=source.scan.get();q.sourceLinear=source.srgb.load();
+  ComposeQuad q;q.image=source.scan.get();q.sourceLinear=source.scanSrgb;
   q.box=gfx::display_layout(float(target.width),float(target.height),float(q.image->extent.width),float(q.image->extent.height));
   quads.push_back(q);return quads;
  }
@@ -399,7 +431,7 @@ std::vector<ComposeQuad> screen_quads(Screen& screen,VkExtent2D target,int& filt
   // both window hosts (gfx/display_modes.cpp): the same layout as the Metal renderer
   filter=currentPlan->filter;
   if(&screen==&R.drc) {
-   ComposeQuad q;q.image=R.drc.scan.get();q.sourceLinear=R.drc.srgb.load();
+   ComposeQuad q;q.image=R.drc.scan.get();q.sourceLinear=R.drc.scanSrgb;
    q.box=gfx::display_layout(float(target.width),float(target.height),float(q.image->extent.width),float(q.image->extent.height));
    quads.push_back(q);return quads;
   }
@@ -408,12 +440,12 @@ std::vector<ComposeQuad> screen_quads(Screen& screen,VkExtent2D target,int& filt
   if(p.dw!=float(target.width)||p.dh!=float(target.height))
    p=gfx::display_plan_for(p,float(target.width),float(target.height),float(screen.scan->extent.width),float(screen.scan->extent.height),
                           drc?float(drc->extent.width):0,drc?float(drc->extent.height):0);
-  ComposeQuad tv;tv.image=screen.scan.get();tv.sourceLinear=screen.srgb.load();tv.box=p.tv;quads.push_back(tv);
+  ComposeQuad tv;tv.image=screen.scan.get();tv.sourceLinear=screen.scanSrgb;tv.box=p.tv;quads.push_back(tv);
   if(p.pip_on&&drc) {
    const float op=p.pip_opacity,bw=std::max(1.0f,std::round(p.pip.w/200.0f));
    ComposeQuad frame;frame.solid=true;frame.color[3]=0.6f*op;
    frame.box={p.pip.x-bw,p.pip.y-bw,p.pip.w+2*bw,p.pip.h+2*bw};quads.push_back(frame);
-   ComposeQuad pip;pip.image=drc;pip.sourceLinear=R.drc.srgb.load();pip.box=p.pip;pip.alpha=op;quads.push_back(pip);
+   ComposeQuad pip;pip.image=drc;pip.sourceLinear=R.drc.scanSrgb;pip.box=p.pip;pip.alpha=op;quads.push_back(pip);
   }
   if(p.button.w>0) {
    // touch screens' view button (display_modes.h): a dark square with two light "screens" (rhemfur's
@@ -434,7 +466,7 @@ std::vector<ComposeQuad> screen_quads(Screen& screen,VkExtent2D target,int& filt
  }
  // no plan (outside swap): the picture scaled to fit (Codex's presentation)
  const auto rect=present_rect(screen.scan->extent,target,filter);
- ComposeQuad q;q.image=screen.scan.get();q.sourceLinear=screen.srgb.load();q.box={rect.x,rect.y,rect.width,rect.height};quads.push_back(q);
+ ComposeQuad q;q.image=screen.scan.get();q.sourceLinear=screen.scanSrgb;q.box={rect.x,rect.y,rect.width,rect.height};quads.push_back(q);
  return quads;
 }
 
@@ -478,7 +510,7 @@ void compose_headless_diagnostic(Screen& screen) {
  ensure_resources();
  auto& target=resources.diagnosticTarget;auto& counter=resources.diagnosticCounter;
  counter.require_capacity(diagnostic);
- const uint32_t format=screen.srgb.load()?0x41a:0x1a;
+ const uint32_t format=screen.scanSrgb?0x41a:0x1a;
  if(target.image&&target.format!=format)destroy_surface_image(&target);
  if(!target.image) {
   target.width=gfx::headless_compose::width;target.height=gfx::headless_compose::height;
@@ -614,7 +646,7 @@ bool record_screenshot(Screen& screen,Buffer& buffer,uint32_t& width,uint32_t& h
  if(!screen.scan||!screen.scan->image||!sampleable(*screen.scan))return false;
  width=screen.scan->extent.width;height=screen.scan->extent.height;
  if(!width||!height)return false;
- const bool srgb=screen.srgb.load();
+ const bool srgb=screen.scanSrgb;
  Surface target;target.width=width;target.height=height;target.format=srgb?0x41a:0x1a;target.fmt=format_info(target.format,false);
  // the TV window's format for both pictures: its pipeline exists (the GamePad window may have none)
  const VkFormat sf=R.tv.swapchain?R.tv.swapFormat:VK_FORMAT_UNDEFINED;
@@ -623,14 +655,14 @@ bool record_screenshot(Screen& screen,Buffer& buffer,uint32_t& width,uint32_t& h
  bgra=target.fmt.pixel==VK_FORMAT_B8G8R8A8_UNORM||target.fmt.pixel==VK_FORMAT_B8G8R8A8_SRGB;
  create_surface_image(&target,true,VkExtent3D{width,height,1});
  try {
-  ComposeQuad q;q.image=screen.scan.get();q.sourceLinear=screen.srgb.load();q.box={0,0,float(width),float(height)};
+  ComposeQuad q;q.image=screen.scan.get();q.sourceLinear=screen.scanSrgb;q.box={0,0,float(width),float(height)};
   compose(target.image,target.view,target.layout,VkExtent2D{width,height},target.fmt.pixel,{q},
           VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,0,fxaa_enabled(),nullptr,&target.use);
   buffer=create_readback_buffer(VkDeviceSize(width)*height*4);
   transition_image(&target,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_READ_BIT);
   auto cmd=command_buffer();
   VkBufferImageCopy region{};region.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};region.imageExtent={width,height,1};
-  vkCmdCopyImageToBuffer(cmd,target.image,target.layout,buffer.buffer,1,&region);
+  record::vkCmdCopyImageToBuffer(cmd,target.image,target.layout,buffer.buffer,1,&region);
   derive_dependency(buffer.use,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_WRITE_BIT);
   transition_buffer(buffer,VK_PIPELINE_STAGE_HOST_BIT,VK_ACCESS_HOST_READ_BIT);
  }catch(...){destroy_surface_image(&target);if(buffer.buffer){defer_buffer(buffer);buffer={};}throw;}
@@ -638,11 +670,14 @@ bool record_screenshot(Screen& screen,Buffer& buffer,uint32_t& width,uint32_t& h
  return true;
 }
 
-// ---------------------------------------------------------------- the climb mod's stamina wheel
+// ---------------------------------------------------------------- gameplay mod HUDs
+// The climb mod's stamina wheel and the run/swim boost's bar, drawn into the TV scan image (the same
+// two the Metal renderer draws in mods/mod_hud.mm).
 void draw_mod_overlay(Surface& scan) {
- if(!mods::climb_enabled()||!scan.image||!scan.view||!(scan.usage&VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))return;
- const mods::ClimbHud hud=mods::climb_hud();
- if(hud.alpha<=0.0f)return;
+ const mods::ClimbHud climb=mods::climb_hud();
+ const mods::MoveHud move=mods::move_hud();
+ const bool wheel=mods::climb_enabled()&&climb.alpha>0.0f, bar=move.alpha>0.0f;
+ if((!wheel&&!bar)||!scan.image||!scan.view||!(scan.usage&VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))return;
  transition_image(&scan,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                   VK_ACCESS_COLOR_ATTACHMENT_READ_BIT|VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
  auto cmd=command_buffer();
@@ -650,15 +685,28 @@ void draw_mod_overlay(Surface& scan) {
  attachment.loadOp=VK_ATTACHMENT_LOAD_OP_LOAD;attachment.storeOp=VK_ATTACHMENT_STORE_OP_STORE;
  const VkExtent2D extent{scan.extent.width,scan.extent.height};
  VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};rendering.renderArea.extent=extent;rendering.layerCount=1;rendering.colorAttachmentCount=1;rendering.pColorAttachments=&attachment;
- vkCmdBeginRendering(cmd,&rendering);R.rendering=true;R.passTracked=false;
- // upper right of the screen centre, where the follow camera keeps Link (climb_hud.mm)
- const float w=float(extent.width),h=float(extent.height),cx=0.60f*w,cy=0.38f*h,rad=0.05f*h;
- VkViewport viewport{cx-rad,cy-rad,2*rad,2*rad,0,1};VkRect2D scissor{{0,0},extent};
- vkCmdSetViewport(cmd,0,1,&viewport);vkCmdSetScissor(cmd,0,1,&scissor);
- vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,pipeline(scan.fmt.pixel,kHud));
- PresentParams params{};const float u[4]={hud.stamina,hud.alpha,hud.exhausted?1.0f:0.0f,0};memcpy(&params,u,16);
- vkCmdPushConstants(cmd,resources.layout,VK_SHADER_STAGE_FRAGMENT_BIT,0,sizeof(params),&params);vkCmdDraw(cmd,3,1,0,0);
- vkCmdEndRendering(cmd);R.rendering=false;R.passTracked=false;
+ record::vkCmdBeginRendering(cmd,&rendering);R.rendering=true;R.passTracked=false;
+ const float w=float(extent.width),h=float(extent.height);
+ VkRect2D scissor{{0,0},extent};
+ if(wheel) {
+  // upper right of the screen centre, where the follow camera keeps Link (mod_hud.mm)
+  const float cx=0.60f*w,cy=0.38f*h,rad=0.05f*h;
+  VkViewport viewport{cx-rad,cy-rad,2*rad,2*rad,0,1};
+  record::vkCmdSetViewport(cmd,0,1,&viewport);record::vkCmdSetScissor(cmd,0,1,&scissor);
+  record::vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,pipeline(scan.fmt.pixel,kHud));
+  PresentParams params{};const float u[4]={climb.stamina,climb.alpha,climb.exhausted?1.0f:0.0f,0};memcpy(&params,u,16);
+  record::vkCmdPushConstants(cmd,resources.layout,VK_SHADER_STAGE_FRAGMENT_BIT,0,sizeof(params),&params);record::vkCmdDraw(cmd,3,1,0,0);
+ }
+ if(bar) {
+  // a ring under the wheel's spot, same shape; 0 running, 1 swimming, 2 recharging
+  const float cx=0.60f*w,cy=0.49f*h,rad=0.042f*h;
+  VkViewport viewport{cx-rad,cy-rad,2*rad,2*rad,0,1};
+  record::vkCmdSetViewport(cmd,0,1,&viewport);record::vkCmdSetScissor(cmd,0,1,&scissor);
+  record::vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,pipeline(scan.fmt.pixel,kMoveHud));
+  PresentParams params{};const float u[4]={move.stamina,move.alpha,move.exhausted?2.0f:move.swimming?1.0f:0.0f,0};memcpy(&params,u,16);
+  record::vkCmdPushConstants(cmd,resources.layout,VK_SHADER_STAGE_FRAGMENT_BIT,0,sizeof(params),&params);record::vkCmdDraw(cmd,3,1,0,0);
+ }
+ record::vkCmdEndRendering(cmd);R.rendering=false;R.passTracked=false;
 }
 
 // ---------------------------------------------------------------- automatic overlay signatures
@@ -681,7 +729,7 @@ void make_image(VkImage& image,VkDeviceMemory& memory,uint32_t w,uint32_t h,uint
 void level_barrier(VkCommandBuffer cmd,VkImage image,uint32_t level,VkImageLayout from,VkImageLayout to,VkAccessFlags src,VkAccessFlags dst) {
  VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};b.oldLayout=from;b.newLayout=to;b.srcQueueFamilyIndex=b.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;
  b.image=image;b.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,level,1,0,1};b.srcAccessMask=src;b.dstAccessMask=dst;
- vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT|VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,0,nullptr,0,nullptr,1,&b);
+ record::vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT|VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,0,nullptr,0,nullptr,1,&b);
 }
 }  // namespace
 
@@ -705,23 +753,23 @@ bool record_signature(int slot,Surface& source,bool sourceLinear) {
  level_barrier(cmd,g.mip,0,VK_IMAGE_LAYOUT_UNDEFINED,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,0,W);
  VkImageBlit blit{};blit.srcSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};blit.dstSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};
  blit.srcOffsets[1]={int(w),int(h),1};blit.dstOffsets[1]={int(w),int(h),1};
- vkCmdBlitImage(cmd,source.image,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,g.mip,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&blit,VK_FILTER_NEAREST);
+ record::vkCmdBlitImage(cmd,source.image,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,g.mip,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&blit,VK_FILTER_NEAREST);
  for(uint32_t l=1;l<g.levels;l++) {
   level_barrier(cmd,g.mip,l-1,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,W,Rd);
   level_barrier(cmd,g.mip,l,VK_IMAGE_LAYOUT_UNDEFINED,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,0,W);
   VkImageBlit b{};b.srcSubresource={VK_IMAGE_ASPECT_COLOR_BIT,l-1,0,1};b.dstSubresource={VK_IMAGE_ASPECT_COLOR_BIT,l,0,1};
   b.srcOffsets[1]={int(std::max(w>>(l-1),1u)),int(std::max(h>>(l-1),1u)),1};b.dstOffsets[1]={int(std::max(w>>l,1u)),int(std::max(h>>l,1u)),1};
-  vkCmdBlitImage(cmd,g.mip,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,g.mip,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&b,VK_FILTER_LINEAR);
+  record::vkCmdBlitImage(cmd,g.mip,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,g.mip,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&b,VK_FILTER_LINEAR);
  }
  const uint32_t last=g.levels-1;
  level_barrier(cmd,g.mip,last,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,W,Rd);
  level_barrier(cmd,g.signatureImage,0,VK_IMAGE_LAYOUT_UNDEFINED,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,0,W);
  VkImageBlit b{};b.srcSubresource={VK_IMAGE_ASPECT_COLOR_BIT,last,0,1};b.dstSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};
  b.srcOffsets[1]={int(std::max(w>>last,1u)),int(std::max(h>>last,1u)),1};b.dstOffsets[1]={int(gfx::kSignatureW),int(gfx::kSignatureH),1};
- vkCmdBlitImage(cmd,g.mip,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,g.signatureImage,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&b,VK_FILTER_LINEAR);
+ record::vkCmdBlitImage(cmd,g.mip,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,g.signatureImage,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&b,VK_FILTER_LINEAR);
  level_barrier(cmd,g.signatureImage,0,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,W,Rd);
  VkBufferImageCopy copy{};copy.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};copy.imageExtent={gfx::kSignatureW,gfx::kSignatureH,1};
- vkCmdCopyImageToBuffer(cmd,g.signatureImage,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,g.buffer.buffer,1,&copy);
+ record::vkCmdCopyImageToBuffer(cmd,g.signatureImage,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,g.buffer.buffer,1,&copy);
  derive_dependency(g.buffer.use,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_WRITE_BIT);
  transition_buffer(g.buffer,VK_PIPELINE_STAGE_HOST_BIT,VK_ACCESS_HOST_READ_BIT);
  // the blits decode sRGB images to linear values: encode them like the Metal path does
@@ -777,14 +825,14 @@ void record_present_capture(Screen& screen,uint32_t imageIndex) {
   image.image=screen.images.at(imageIndex);image.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
   auto dependency=derive_dependency(screen.imageUses.at(imageIndex),VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_READ_BIT,true);
   image.srcAccessMask=narrow_barriers()?dependency.sourceAccess:VK_ACCESS_MEMORY_WRITE_BIT;image.dstAccessMask=VK_ACCESS_TRANSFER_READ_BIT;
-  vkCmdPipelineBarrier(cmd,narrow_barriers()?dependency.source:VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,0,nullptr,0,nullptr,1,&image);
+  record::vkCmdPipelineBarrier(cmd,narrow_barriers()?dependency.source:VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,0,nullptr,0,nullptr,1,&image);
   VkBufferImageCopy copy{};copy.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};copy.imageExtent={uint32_t(width),uint32_t(height),1};
-  vkCmdCopyImageToBuffer(cmd,image.image,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,capture.buffer.buffer,1,&copy);
+  record::vkCmdCopyImageToBuffer(cmd,image.image,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,capture.buffer.buffer,1,&copy);
   derive_dependency(capture.buffer.use,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_WRITE_BIT);
   transition_buffer(capture.buffer,VK_PIPELINE_STAGE_HOST_BIT,VK_ACCESS_HOST_READ_BIT);
   image.oldLayout=VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;image.newLayout=VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
   image.srcAccessMask=VK_ACCESS_TRANSFER_READ_BIT;image.dstAccessMask=0;
-  vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,0,0,nullptr,0,nullptr,1,&image);
+  record::vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,0,0,nullptr,0,nullptr,1,&image);
   screen.layouts[imageIndex]=image.newLayout;
  }catch(const std::exception& error) {
   if(capture.buffer.buffer){defer_buffer(capture.buffer);capture.buffer={};}

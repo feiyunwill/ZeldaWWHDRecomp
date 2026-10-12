@@ -1,4 +1,5 @@
 #include "../mods/manager.h"
+#include "shader_prebuild.h"
 // Menu bar: app menu (Quit, which asks first while a game is in progress: quit_prompt.mm), a Window
 // menu (Close Window on the TV window quits the same way) and a Graphics menu to switch fixes and
 // enhancements while playing. Each option also has a single-key shortcut in the game window.
@@ -88,6 +89,14 @@ static void set_pref(NSString* key, id value) {
         [NSUserDefaults.standardUserDefaults setObject:value forKey:key];
     }
 }
+#ifdef WWHD_HAS_VULKAN
+namespace gfxvk {
+void load_device_setting() {
+    if (g_prefs) if (id value = pref(@"vkDevice"))
+        if ([value isKindOfClass:[NSString class]]) set_device_setting([value UTF8String]);
+}
+}
+#endif
 static void load_prefs() {
     g_prefs_loaded = true;
     if (!g_prefs) return;
@@ -123,6 +132,7 @@ static void save_prefs() {
         set_pref(@"fpsHighPaced", @(interp::paced_interpolation_at(120)));
     }
 #ifdef WWHD_HAS_VULKAN
+    if (!env_set({"WWHD_VK_DEVICE"})) set_pref(@"vkDevice", [NSString stringWithUTF8String:gfxvk::device_setting().c_str()]);
     if (!env_set({"WWHD_VK_PRESENT_MODE"})) set_pref(@"vkPresentMode", @(gfxvk::present_mode()));
 #endif
     if (NSString* p = portable_prefs_path()) [g_portable_prefs writeToFile:p atomically:YES];
@@ -251,6 +261,12 @@ static WWStateMenu* g_state_menu;
 @end
 
 @implementation WWGraphicsMenu
+- (void)rebuildShaders:(NSMenuItem*)item {
+    NSAlert* alert = [NSAlert new];
+    alert.messageText = shaderprebuild::request_rebuild() ? @"Shader cache rebuild requested" : @"Could not save the rebuild request";
+    alert.informativeText = @"Run setup and choose repair/update to prepare shaders and pipelines from your game files. The game will compile shaders as needed until then.";
+    [alert runModal];
+}
 - (void)setBloom:(NSMenuItem*)item { render::set_bloom_strength(item.tag / 100.0f); update_title(); }
 - (void)setAO:(NSMenuItem*)item { render::set_ao_mode((int)item.tag); update_title(); }
 - (void)toggleAniso:(NSMenuItem*)item { render::set_aniso(!render::aniso()); update_title(); }
@@ -403,6 +419,7 @@ void install_menu(NSWindow* tv) {
 
     NSMenuItem* gfxItem = [bar addItemWithTitle:@"Graphics" action:nil keyEquivalent:@""];
     NSMenu* g = [[NSMenu alloc] initWithTitle:@"Graphics"];
+    add(g, @"Rebuild shader cache", @selector(rebuildShaders:), @"", 0);
     if (render::can_choose()) {
         // both renderers are built in: the choice is saved and used from the next start
         [g addItemWithTitle:@"Renderer (takes effect after a restart)" action:nil keyEquivalent:@""].enabled = NO;

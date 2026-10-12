@@ -834,7 +834,8 @@ def get_toolchain(name, data_dir, ui):
             f.write(tc["sha256"] + "\n")
     if kind == "llvm-mingw":
         b = os.path.join(tdir, "bin")
-        return Toolchain([os.path.join(b, "x86_64-w64-mingw32-clang.exe")], [os.path.join(b, "x86_64-w64-mingw32-clang++.exe")],
+        triple = tc.get("triple", "x86_64-w64-mingw32")  # aarch64-w64-mingw32: the Windows on ARM64 release
+        return Toolchain([os.path.join(b, triple + "-clang.exe")], [os.path.join(b, triple + "-clang++.exe")],
                          [os.path.join(b, "llvm-ar.exe")], rsp=True, desc="llvm-mingw " + tc["dir"])
     if kind == "zig":
         z = os.path.join(tdir, "zig")
@@ -1429,7 +1430,7 @@ def recompile(game_dir, gen_dir, hooks=False):
     rpx = os.path.join(game_dir, "code", "cking.rpx")
     out = run_logged([sys.executable, os.path.join(PKG, "tools", "recomp", "recomp.py"), rpx, gen_dir] + (["--mod-hooks"] if hooks else []),
                      env=dict(os.environ, WWHD_RECOMP_MOD_HOOKS="0"), what="translating the game code")
-    n = len(glob.glob(os.path.join(gen_dir, "code_*.c")))
+    n = len(glob.glob(os.path.join(glob.escape(gen_dir), "code_*.c")))
     if n == 0:
         raise SetupError("the recompiler wrote no code")
     return n
@@ -1473,7 +1474,7 @@ def fwd(p):
 
 def compile_gamecode(tc, manifest, gen_dir, obj_dir, jobs, cancel=None, progress=None):
     os.makedirs(obj_dir, exist_ok=True)
-    srcs = sorted(glob.glob(os.path.join(gen_dir, "code_*.c")))
+    srcs = sorted(glob.glob(os.path.join(glob.escape(gen_dir), "code_*.c")))
     srcs += [os.path.join(gen_dir, f) for f in ("table.c", "imports.c")]
     srcs.sort(key=lambda s: -os.path.getsize(s))  # big files first: better use of the cores
     m = {"sdk": fwd(os.path.join(PKG, "sdk")), "gen": fwd(gen_dir)}
@@ -1514,6 +1515,76 @@ def compile_gamecode(tc, manifest, gen_dir, obj_dir, jobs, cancel=None, progress
     return sorted(objs)
 
 
+# A macOS SDK newer than the Command Line Tools' linker (e.g. a beta SDK installed by a partial update):
+# its .tbd stubs name architectures the linker doesn't know ("unknown architecture arm64e.x1-macos",
+# "tapi error: malformed file"), so every system library fails to link.
+MAC_SDK_MISMATCH = re.compile(r"tapi error: malformed file|\.tbd:\d+:\d+: error: unknown architecture")
+
+
+def mac_sdk_version(path):
+    m = re.search(r"MacOSX(\d+)(?:\.(\d+))?\.sdk$", os.path.basename(os.path.normpath(path)))
+    return (int(m.group(1)), int(m.group(2) or 0)) if m else None
+
+
+def mac_sdks():
+    """The installed macOS SDKs (Command Line Tools and Xcode), newest first, as (version, real path)."""
+    found = {}
+    for pattern in ("/Library/Developer/CommandLineTools/SDKs/MacOSX*.sdk",
+                    "/Applications/Xcode*.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX*.sdk"):
+        for path in glob.glob(pattern):
+            real = os.path.realpath(path)
+            version = mac_sdk_version(real) or mac_sdk_version(path)
+            if version and os.path.isdir(real):
+                found.setdefault(real, version)
+    return sorted(((v, p) for p, v in found.items()), reverse=True)
+
+
+def mac_current_sdk():
+    try:
+        out = subprocess.run(["xcrun", "--sdk", "macosx", "--show-sdk-path"], stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL).stdout.decode("utf-8", "replace").strip()
+    except OSError:
+        return None
+    return os.path.realpath(out) if out else None
+
+
+def mac_fallback_sdks(current, sdks, minimum=(14, 0)):
+    """SDKs to retry the link with when `current` doesn't match the linker: older ones first by version
+    (newest of them first), never below the game's deployment target."""
+    # the current SDK's real path can be unversioned (Xcode's MacOSX.sdk): take its version from the list,
+    # where the versioned name pointing at it was found
+    cur = next((v for v, p in sdks if p == current), None) or (mac_sdk_version(current) if current else None)
+    return [p for v, p in sdks if p != current and v >= minimum and (cur is None or v < cur)]
+
+
+def link_with_sdk_fallback(cmd, env):
+    """Links; on macOS, a linker that rejects the SDK's library stubs is retried with an older installed SDK."""
+    try:
+        run_logged(cmd, env=env, what="linking the game")
+        return
+    except SetupError as e:
+        if not (IS_MAC and MAC_SDK_MISMATCH.search(str(e))) or (env or os.environ).get("SDKROOT"):
+            raise
+        failed = e
+    current = mac_current_sdk()
+    say("  The macOS SDK (%s) is newer than the linker of the Command Line Tools; trying an older installed SDK."
+        % os.path.basename(current or "?"))
+    for sdk in mac_fallback_sdks(current, mac_sdks()):
+        say("  Linking with %s" % os.path.basename(sdk))
+        try:
+            run_logged(cmd, env=dict(env or os.environ, SDKROOT=sdk), what="linking the game")
+            say("  Linked with %s. Updating the Command Line Tools (Software Update) fixes the mismatch for good."
+                % os.path.basename(sdk))
+            return
+        except SetupError as e:
+            if not MAC_SDK_MISMATCH.search(str(e)):
+                raise
+    raise SetupError("linking the game failed: the installed macOS SDK (%s) doesn't match the linker of the "
+                     "Command Line Tools, and no older SDK works. Update the Command Line Tools (System Settings "
+                     "> General > Software Update, or run: xcode-select --install), then run setup again.\n\n%s"
+                     % (os.path.basename(current or "?"), failed))
+
+
 def link_game(tc, manifest, objs, work, out_exe):
     lib = os.path.join(work, "libgamecode.a")
     if os.path.exists(lib):
@@ -1540,7 +1611,7 @@ def link_game(tc, manifest, objs, work, out_exe):
         cmd = tc.cxx + ["@" + fwd(rsp)]
     else:
         cmd = tc.cxx + args
-    run_logged(cmd, env=tc.env, what="linking the game")
+    link_with_sdk_fallback(cmd, tc.env)
     if not os.path.isfile(out_exe):
         raise SetupError("the linker produced no executable")
 
@@ -1934,6 +2005,10 @@ def load_manifest():
     if IS_LINUX and arch and normalize_arch(arch) != host_arch():
         raise SetupError("this release is for %s, but this computer is %s: download the %s release instead"
                          % (m["platform"], host_arch(), "linux-" + host_arch()))
+    # Windows: the x86-64 release also runs on ARM64 (emulated); the ARM64 one runs only there
+    if plat == "windows" and arch and normalize_arch(arch) == "aarch64" and host_arch() != "aarch64":
+        raise SetupError("this release is for Windows on ARM64, but this computer is %s: download the "
+                         "windows-x86_64 release instead" % host_arch())
     return m
 
 
@@ -2024,15 +2099,17 @@ STEP_TITLES = {
     "translate": "Translating the game code to C",
     "compile": "Compiling the game code (the longest step: several minutes)",
     "app": "Building the game",
+    "shaders": "Preparing shaders",
 }
 
 
 def plan_steps(kind):
-    return {"image": ["keys", "compiler", "extract", "translate", "compile", "app"],
+    result = {"image": ["keys", "compiler", "extract", "translate", "compile", "app"],
             "archive": ["archive", "compiler", "extract", "translate", "compile", "app"],
             "folder": ["folder", "compiler"] + ([] if PORTABLE else ["copy"]) + ["translate", "compile", "app"],
             "installed": ["compiler", "translate", "compile", "app"],
             "gen": ["compiler", "compile", "app"]}[kind]
+    return result + ([] if kind == "gen" else ["shaders"])
 
 
 CODE_MODS_TEXT = (
@@ -2079,6 +2156,45 @@ def write_code_mods_setting(data_dir, hooks):
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_bytes(payload)
     os.replace(tmp, path)
+
+
+def shader_progress_callback(progress):
+    """progress(text[, fraction]) for shader_prebuild.prepare, shown on a Progress line.
+
+    fraction covers the whole preparation (0..1); None until the helpers report one, so the bar
+    is indeterminate until then. The log gets each phase once, not every update."""
+    last = {"phase": None}
+    def message(text, fraction=None):
+        if fraction is None:
+            progress.update(0, 0, text, force=True)
+        else:
+            done = int(round(1000 * fraction))
+            if GUI:
+                # the bar shows this text instead of its percentage; keep it short enough for
+                # the bar: "<phase>: 1,234 of 5,678 (42%)" (the terminal line keeps the units)
+                counted = re.match(r"(.*?: [\d,]+ of [\d,]+)( |$)", text)
+                progress.update(done, 1000, "%s (%d%%)" % (counted.group(1) if counted else text, done // 10))
+            else:
+                progress.update(done, 1000, text)
+        phase = text.split(":", 1)[0]
+        if phase != last["phase"]:
+            last["phase"] = phase
+            LOG.write(text)
+    return message
+
+
+def prepare_shaders_nonfatal(*args, **kwargs):
+    """Shader preparation is optional, including unexpected helper failures."""
+    try:
+        import shader_prebuild
+        return shader_prebuild.prepare(*args, **kwargs)
+    except Exception as error:
+        message = "Shader preparation unavailable: %s. The game can still run." % error
+        try:
+            LOG.write(message)
+        except Exception:
+            pass  # A broken log must not turn optional preparation into setup failure.
+        return dict(status="failed", message=str(error))
 
 
 def install(ctx, source, keys=None, info=None, ui=None, check_keys=None):
@@ -2238,6 +2354,34 @@ def install(ctx, source, keys=None, info=None, ui=None, check_keys=None):
             # Never leave an older variant selected after a successful setup build.
             Path(data_dir, "code-mods-active.json").unlink(missing_ok=True)
         write_code_mods_setting(data_dir, state["code_mods"])
+    if kind != "gen":
+        begin("shaders")
+        import shader_prebuild
+        shader_template = Path(getattr(args, "shader_template", None) or os.environ.get("WWHD_SHADER_TEMPLATE") or Path(PKG) / "tools/shadercache/template.bin").expanduser().resolve()
+        shader_root = shader_prebuild.default_cache_root(data_dir, PORTABLE)
+        try:
+            shader_root.mkdir(parents=True, exist_ok=True)
+            shader_prebuild.atomic_json(shader_root / "launcher.json", {
+                "schema": 1, "python": sys.executable, "package": str(PKG),
+                "helper": str(Path(PKG) / "tools/installer/shader_prebuild.py"),
+                "template": str(shader_template)})
+        except OSError as error:
+            say("Shader preparation launcher unavailable: %s" % error)
+        shader_progress = Progress("Preparing shaders")
+        state["shader_prebuild"] = prepare_shaders_nonfatal(
+            ctx.game_dir, shader_template, state["exe"],
+            shader_root, PKG,
+            renderer="metal" if IS_MAC else "vulkan", progress=shader_progress_callback(shader_progress), log=LOG.write,
+            # macOS: the player chooses Metal or Vulkan (MoltenVK) in Graphics > Renderer: prepare both
+            renderers=["metal", "vulkan"] if IS_MAC else ["vulkan"],
+            skip=bool(getattr(args, "skip_shader_prebuild", False)),
+            cancel=lambda: bool(getattr(args, "shader_prebuild_cancel", None) and
+                                Path(args.shader_prebuild_cancel).exists()))
+        prepared = state["shader_prebuild"]
+        states = prepared.get("renderers") or {}
+        ready = [name.capitalize() for name, value in sorted(states.items()) if value == "ready"]
+        # macOS: "ready (Metal, Vulkan)", or "ready (Metal)" when MoltenVK is unavailable
+        shader_progress.done(prepared["status"] + (" (%s)" % ", ".join(ready) if len(states) > 1 and ready else ""))
     if not args.keep_work:
         shutil.rmtree(work, ignore_errors=True)
     if kind != "gen":
@@ -2281,6 +2425,9 @@ def main():
     ap.add_argument("--code-mods-status", help="atomic rebuild progress/result JSON")
     ap.add_argument("--code-mods-cancel", help="cancel rebuild when this file exists")
     ap.add_argument("--repair-guest-python", action="store_true", help="upgrade local mod setup Python without rebuilding game code")
+    ap.add_argument("--shader-template", help="local shader template (or WWHD_SHADER_TEMPLATE); optional")
+    ap.add_argument("--skip-shader-prebuild", action="store_true", help="skip optional shader preparation; compile during play")
+    ap.add_argument("--shader-prebuild-cancel", help="skip shader preparation when this file exists")
     ap.add_argument("--repair", action="store_true", help="rebuild the game code from the installed game files")
     ap.add_argument("--jobs", type=int, help="parallel compiler processes")
     ap.add_argument("--yes", action="store_true", help="non-interactive (also WWHD_SETUP_NONINTERACTIVE=1)")
@@ -2664,6 +2811,12 @@ def gui_main(args):
             if not isinstance(req["code_mods"], bool):
                 return fail(req, "bad_request", "code_mods must be a boolean")
             ctx.args.code_mods = "1" if req["code_mods"] else "0"
+        if "skip_shader_prebuild" in req:
+            ctx.args.skip_shader_prebuild = bool(req["skip_shader_prebuild"])
+        if req.get("shader_prebuild_cancel"):
+            # GUI marker is confined to this installation, not an arbitrary path.
+            ctx.args.shader_prebuild_cancel = str(Path(ctx.data_dir) / "shader-prebuild-cancel")
+            Path(ctx.args.shader_prebuild_cancel).unlink(missing_ok=True)
         if req.get("jobs"):
             ctx.args.jobs = int(req["jobs"])
         if kind == "image":

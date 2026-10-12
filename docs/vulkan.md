@@ -53,7 +53,7 @@ filter), and `gfx/vulkan/present.cpp` draws it. The TV window title starts with 
 | Frame dumps `WWHD_DUMP_FRAMES`, `WWHD_DUMP_PRESENT` | yes | yes |
 | Capture frame (P) | pictures + draw log | pictures only (no draw log) |
 | Screenshot key (F10, `runtime/src/screenshot.h`) | yes | yes (read back at the submission's fence, no wait) |
-| Shader head start (`--warm-shaders`) | yes | no (Vulkan keeps its own SPIR-V / pipeline caches) |
+| Shader head start (`--warm-shaders`) | yes | offline GX2 shader replay and compatible local pipeline warming |
 
 Other builds: `-DWWHD_RENDERER=METAL` (Metal only, no Vulkan dependencies) and
 `-DWWHD_RENDERER=VULKAN` (Vulkan only with the portable SDL3 host: SDL windows, input and audio;
@@ -78,6 +78,67 @@ barrier modes and retain the load/capture logs. Paused menus freeze the game cou
 With `tools/bench/run_bench.py`, use `--origin-load-steps n` to align both inputs and the
 interpolation mode switch to that restored clock; an absolute startup mode switch can change
 random-seed evolution when a load completes one step later.
+
+Trace CSVs include optional `cpu_ns` samples for shader and pipeline compiler calls
+and the startup worker's lifetime. `-1` means unavailable. CPU time is measured on
+the calling thread only and excludes driver/helper threads. The summary separates
+CPU samples from elapsed time and reports sample coverage. Startup lifetime includes
+recipe loading, waits and cleanup, overlaps individual compilation samples, and is
+not an additional CPU cost to sum with them. Its completion records published-ready
+and failure counts; cancellation counts remain in the runtime log. Queue completion
+does not prove that every pipeline for a later scene is ready.
+
+## Separate cold and warm benchmark caches
+
+For cross-build comparisons, pass `--variant-caches` to `tools/bench/run_bench.py`
+with named `--variant` and `--variant-binary` options. Each variant then uses a
+separate application-cache directory. For a warm comparison, also pass `--warmup`:
+each variant gets a discarded route with its own executable before measured runs
+start. A failed warm-up stops the comparison. Use a fresh output/cache directory
+when the binaries or route change.
+
+For a cold comparison, use `--cold-caches` with a separate output directory and
+omit `--warmup`. Every run and retry receives new application caches. Driver
+caches remain uncontrolled; describe that limitation in results. Use the same
+load-relative route and presentation settings for both comparisons. Host-load
+and exclusivity gates can reject disturbed samples, but do not establish that
+the machine was otherwise idle.
+
+## Repeatable picture comparisons
+
+Use a clean baseline build and the changed build with the same local state and
+input preset. The preset name selects the input sequence; verify the actual
+scene in your state. `tools/bench/run_picture_check.py` captures each build twice,
+using fresh save copies, settings and application caches. Inputs and captures
+are tied to post-load logic steps; interpolation is disabled (30 FPS). It checks
+that the selected full-pass checkpoint and scenario endpoint completed before
+accepting a capture. This is a correctness check, with no performance summary.
+
+The comparison scripts require Pillow (`python3 -m pip install Pillow`). For example:
+
+```sh
+python3 tools/bench/run_picture_check.py \
+  --baseline /absolute/path/to/baseline/wwhd --baseline-revision BASELINE_COMMIT \
+  --candidate build/cmake/wwhd --candidate-revision CHANGED_COMMIT \
+  --game game --save save --state-dir /absolute/path/to/local/states \
+  --scene outset --origin-load-steps 180 --capture-load-step 200 --seconds 2 \
+  --out build/bench/picture-check
+```
+
+Add `--validation` when Khronos layers are installed and discoverable. Each run
+retains its exact command/environment, executable/state hashes, logs and captures.
+`pictures.json` compares baseline repeats, candidate repeats and baseline/candidate
+pairs for TV, GamePad and composed-window pictures. Missing captures also fail
+the check. The default tolerance is zero RGB and alpha differences; nonzero variation
+is reported and exits unsuccessfully, rather than assumed harmless. Amplified
+RGB difference PNGs are for inspection. The separate `compare_pictures.py` accepts
+an explicit channel tolerance for investigations; justify any tolerance using
+baseline repeatability before treating it as a pass. This single checkpoint does
+not prove other scenes, transitions or pending-frame correctness.
+
+Keep all output under ignored `build/` or another local evidence directory.
+Captures and diffs contain game imagery and must not enter commits, releases or
+CI artifacts. No runtime frame-time claims should be made from these capture runs.
 
 ## Build
 
@@ -157,14 +218,80 @@ macOS menu; other Metal-specific menus remain unported. SDL mouse capture and ca
 input are supported. MoltenVK devices without sampler LOD bias use zero bias,
 matching the existing Metal backend; native Vulkan devices retain the bias. Shader warmup/cache behavior differs from Metal.
 
-Vulkan keeps a persistent device pipeline cache under the host configuration
-directory's `shadercache` folder. `WWHD_VK_PIPELINE_CACHE=/path/cache.bin` selects
-an isolated cache file; `WWHD_VK_PIPELINE_CACHE=0` disables persistence. Setting
-`WWHD_SHADER_CACHE=0` also disables persistence unless an explicit Vulkan cache
-path is supplied. Caches are matched to the device and pipeline-cache UUID;
+Vulkan keeps persistent device pipeline caches under the host configuration
+directory's `shader-prebuild/live` folder. Each GPU and driver cache UUID has its
+own filename. On the first launch after updating, existing default caches from
+`shadercache` are copied into this folder without overwriting current caches.
+`WWHD_VK_PIPELINE_CACHE=/path/cache.bin` selects
+an isolated cache file; `WWHD_VK_PIPELINE_CACHE_DIR=/path/caches` selects a folder
+with separate files per device. The explicit file override takes precedence.
+`WWHD_VK_PIPELINE_CACHE=0` disables persistence. Setting
+`WWHD_SHADER_CACHE=0` also disables persistence unless a Vulkan cache file or directory
+is selected. Caches are matched to the device and pipeline-cache UUID;
 incompatible, truncated, or checksum-invalid files fall back to an empty cache. New data is saved
 atomically after 120 frames without new pipelines. First-time shader translation
 and pipeline creation can still cause stalls.
+
+Successful guest pipelines also retain local, pointer-free recipes in
+`<pipeline-cache-file>.recipes`, bounded to 16,384 entries / 256 MiB. A background writer saves
+an atomic snapshot every two minutes while entries change, and a final checkpoint saves the latest
+entries at orderly shutdown or the scripted test endpoint. A crash can lose entries added since the
+last completed snapshot; the previous complete file remains usable. On the next start, a
+worker reads compatible recipes and compiles them while the title screen runs.
+It owns separate modules, descriptor layouts and a pipeline cache; the render
+thread takes a ready pipeline only after the exact key, both SPIR-V programs and
+descriptor layouts match. `WWHD_VK_PIPELINE_WARMUP=0` disables this recording and
+replay. Missing or unfinished pipelines use a separate demand compiler with an
+owned state snapshot and independent native cache. Exact guest draws remain at
+the head of the ordered command stream until ready; the renderer can repeat the
+last complete scan image while waiting. It never substitutes state or drops that
+draw. This still delays new guest frames and input response. Presentation/overlay
+pipeline misses currently wait without repeat pumping; this is a remaining
+limitation. BC texture decoding still creates its compute pipeline synchronously;
+its cost is recorded as `bc_decode_compute_pipeline` when tracing is enabled.
+`WWHD_VK_ASYNC_PIPELINES=0` selects diagnostic synchronous graphics creation.
+Recipe files contain game-derived shader code and must stay local.
+
+Every demanded draw remains Exact. While a pipeline is pending, owned native
+commands can be prepared ahead of it. Ordered emission waits for the exact
+pipeline and emits every command. Boundaries such as readback, presentation and
+resource retirement drain the retained commands first. This overlap can shorten
+some waits; it does not guarantee removal of cold shader stutter.
+
+Cemu informed the worker, cache and startup precompile design; no implementation
+code was copied. Cemu can skip pending draws using renderer heuristics. This
+renderer always waits for demanded state and draws every object. Cemu shader and
+pipeline cache files are never inputs to this workflow.
+
+## Preparing shaders
+
+Setup's **Preparing shaders** step uses your own game archives and the release's state template to
+compile covered shaders and compatible pipelines before play. Allow roughly tens of seconds on a
+recent Mac; slower computers and different drivers can take longer. Generated shader and driver
+caches stay local.
+
+On macOS, where **Graphics → Renderer** offers Metal and Vulkan (MoltenVK), setup prepares both from
+one shared head start: first for Metal, then for Vulkan, on one progress bar. The preparation manifest
+records each renderer's result, and the game uses the prepared caches only for a renderer that is ready.
+If Vulkan cannot start on the Mac, Metal is still prepared and Vulkan is skipped with a short message.
+A setup that finds an earlier preparation for one renderer prepares only the missing one. Windows,
+Linux and Android prepare Vulkan only.
+
+Uncheck **Prepare shaders now** in setup, use `--skip-shader-prebuild` in terminal setup, or press Back
+on Android's preparation screen to skip. A missing template or a preparation failure does not prevent
+playing: shaders compile on demand. Skipping is remembered for the same game and template, including across runtime updates.
+
+Choose **Settings → Graphics → Rebuild shader cache**, then run setup repair/update to prepare again
+(on macOS for both renderers; a renderer that failed or was unavailable is retried only then).
+Ordinary game launches never start preparation. Setup repair/update checks whether preparation needs
+refreshing. Player caches persist in `shader-prebuild/live` across preparation generations. The active generation
+lives under the host configuration directory's `shader-prebuild` folder; portable installations use their
+user directory. Cache overrides take precedence over this selection.
+
+The template covers recorded states rather than every possible scene. Uncovered shaders and pipelines
+can still cause a first-use hitch. Pending draws wait for their exact state; the renderer can repeat the
+last complete picture during that wait. For local template selection and recording commands, see the
+[maintainer guide](../tools/shadercache/README.md).
 
 Vulkan also persists compiled SPIR-V in the host configuration directory's
 `shadercache/vulkan-shaders/spirv.bin`. `WWHD_VK_SHADER_CACHE=/directory` selects
@@ -190,7 +317,11 @@ the mask of those inputs and their default values (`ps_link`). A declared input 
 writes made the Adreno driver refuse the pipeline (PR #30, the boat ride after the sword and shield).
 Render-target formats, samplers, buffer addresses and units the program does not sample
 are not in the key. Keys that still translate to an identical shader (GLSL, resource
-mapping, uniform offsets, descriptor ranks) share one shader and its pipelines.
+mapping, uniform offsets, descriptor ranks) share one shader and its pipelines. Pipeline
+identity is fixed from that exact translation key before SPIR-V publication and
+stays the same on cold and warm cache paths. Distinct translations are no longer
+merged solely because their final SPIR-V and mappings happen to match; this can
+increase native pipeline creation calls.
 `WWHD_VK_SHADER_KEY_VERIFY=1` also computes the previous, wider key on every lookup and,
 once per distinct wider key, translates again under the current registers and compares
 the result with the shader the narrow key returned; any difference is logged as
@@ -680,9 +811,10 @@ CPU paths not set to `1` and lazy DrawDone / async present when turned off. The 
 
 ## Resource dependencies
 
-Precise barriers are **on by default on Android** and **opt-in on desktop**
-(`WWHD_VK_NARROW_BARRIERS=1`) until they have been checked on native Windows/Linux drivers; on MoltenVK
-they measured neutral (7 interleaved pairs). The precise path records each image's last write scope
+Precise barriers are **opt-in on every platform** (`WWHD_VK_NARROW_BARRIERS=1`). On MoltenVK they
+measured neutral (7 interleaved pairs); on an OnePlus 8 Pro (Adreno 650, Mesa Turnip) they gave no
+speed difference but caused device-lost in 4 of 10 runs (0 of 18 with them off or with Turnip's
+sysmem rendering), so Android no longer enables them by default (issue #104). The precise path records each image's last write scope
 and accumulated reader stages, including attachments, feedback copies, mip chains, composition
 and readbacks. Texture bindings name the shader stage that actually reads them. Barrier elision
 preserves the conservative dynamic-rendering pass boundaries. Source access masks contain writes only; a write waits for all pending readers.
@@ -759,3 +891,24 @@ The PARK experiment separately passed the native build, four CTest regressions, 
 The strict opt-in `WWHD_VK_VERTEX_COPY_WINDOW=1` instead fuses minimum and maximum index reduction, retains the original physical allocation and draw addressing, and copies/compares only the proven fetch window. Unsupported bounds/rates/layouts keep the original full-prefix path. A separate cache includes reservation, window offset/length, device and submission generation; fresh guest data is always compared. Device smoke tests passed full/window pixel equivalence with poisoned leading bytes, signed base vertex, restart, vertex-index checks, mutations and submission-ring retirement. Actual saved-scene validation and matched FPS acceptance are still required before adoption.
 
 Small register updates (at most 16 words) use the fused Vulkan path by default. Set `WWHD_VK_FUSE_SMALL_REGS=0` to disable it. Matched scene tests suggest roughly 2% less renderer CPU time; FPS benefit remains modest and subject to run drift.
+
+## Choosing the GPU
+
+In Settings → Graphics → GPU (Vulkan), choose Automatic or a graphics card. The choice applies after restarting. Automatic keeps the driver's order, preferring cards with Vulkan 1.3. Unavailable cards show the reason; if a saved card is missing or unusable, the game uses Automatic and shows a notice.
+
+On hybrid laptops, choose the discrete NVIDIA or AMD GPU to use it instead of integrated graphics. For a single start, `WWHD_VK_DEVICE` overrides the saved choice: use a zero-based index from the startup GPU list, or a case-insensitive part of the GPU name (for example `WWHD_VK_DEVICE=NVIDIA`). The first matching name is used. This setting is available with Vulkan on desktop platforms.
+
+For a one-shot correctness check during a real demand-compilation repeat, set
+`WWHD_VK_PENDING_CAPTURE_DIR` to a fresh local directory. Both published TV and
+GamePad scans must exist. The first eligible pending presentation writes
+`tv-before.png`, `tv-after.png`, `gamepad-before.png`, `gamepad-after.png` and
+`proof.json`. Set `WWHD_VK_PENDING_CAPTURE_AFTER_LOAD=1` to wait until a full-state
+load has completed. Metadata records the renderer frame, load/logic steps,
+whether presentation succeeded, and exact scan equality. A proof requires
+`presented`, `guest_frame_and_scans_unchanged`, `tv_exact` and `gamepad_exact` all
+to be true. This captures published scan pixels only: it excludes composed-window
+layout and overlays, and does not replace baseline comparisons after resumption.
+Readbacks deliberately stall submissions and may allow the compiler to finish
+during capture, so this diagnostic must be disabled for performance measurements.
+No artificial compilation delay is introduced. The diagnostic attempts at most
+once per process and bounds each scan to 16 megapixels; keep its output local.

@@ -20,7 +20,7 @@ root = os.path.normpath(os.path.join(here, "..", ".."))
 
 def hook_lists():
     hooks, sites = set(), set()
-    for hp in [os.path.join(here, "hooks.txt")] + sorted(glob.glob(os.path.join(here, "hooks_*.txt"))):
+    for hp in [os.path.join(here, "hooks.txt")] + sorted(glob.glob(os.path.join(glob.escape(here), "hooks_*.txt"))):
         for line in open(hp):
             line = line.split("#")[0].strip()
             if line.startswith("@"):
@@ -34,7 +34,7 @@ def runtime_refs():
     funcs = set()
     pat = re.compile(r"\bf_([0-9A-F]{8})(?:_orig)?\b")
     for ext in ("c", "cpp", "h", "mm"):
-        for p in glob.glob(os.path.join(root, "runtime", "src", "**", "*." + ext), recursive=True):
+        for p in glob.glob(os.path.join(glob.escape(root), "runtime", "src", "**", "*." + ext), recursive=True):
             with open(p, errors="replace") as f:
                 funcs.update(int(m, 16) for m in pat.findall(f.read()))
     return funcs

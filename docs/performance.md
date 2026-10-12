@@ -99,6 +99,41 @@ directory) to check that the run still renders correctly. The "Sort by top of st
 `sample.txt` shows where the CPU time goes. `run.log` prints the shader and pipeline counts every
 few seconds.
 
+### Windows on ARM64: sampling the frame threads
+
+macOS `sample` has no counterpart on Windows that works without administrator rights (ETW / WPR
+need them). `WWHD_SAMPLE_THREADS=<prefix>` turns on a sampling profiler inside the game
+(`runtime/src/platform/thread_sampler.cpp`, Windows on ARM64 only): about 1000 times a second the
+render thread and the game's main thread are suspended, their stacks are copied (unwound with
+`RtlVirtualUnwind`, then the frame-pointer chain) and they are resumed. `WWHD_SAMPLE_AFTER=<s>`
+delays the start (skip boot and loading), `WWHD_SAMPLE_SECONDS=<s>` limits it. It writes
+`<prefix>.samples` and `<prefix>.modules`; `tools/bench/thread_profile.py` reports the time by module
+and function, and for time spent in the Vulkan driver or the kernel the game executable's call site
+that led there:
+
+```sh
+tools/bench/run_bench.py --binary build/prof/wwhd.exe --state-dir my_states --scene outset --fps 60 \
+    --runs 1 --out build/bench/prof --variant "prof:WWHD_SAMPLE_THREADS=prof,WWHD_SAMPLE_AFTER=35,WWHD_SAMPLE_SECONDS=40"
+tools/bench/thread_profile.py build/bench/prof/prof_01/prof --exe build/prof/wwhd.exe --thread render
+```
+
+Build with debug information (`-DCMAKE_BUILD_TYPE=RelWithDebInfo`) so the executable's functions and
+lines can be named (`llvm-symbolizer`, e.g. from llvm-mingw); functions of system and driver DLLs are
+named after their nearest export, which names entry points but not internal functions. On a
+Snapdragon X, return addresses saved on the stack carry a pointer-authentication code in their upper
+bits; the sampler and the script strip it (user addresses fit in 48 bits).
+
+First results (Snapdragon X Elite, Adreno X1-85 driver 31.0.152.1, `devel` of 2026-10-11, 60 fps,
+llvm-mingw build): a hilltop view of Outset's village (about 3,970 draws/frame) ran 59.7 fps with
+29.86 logic steps/s (116 fps uncapped); the render thread was idle about 20% of the time and spent
+about 22% inside the Vulkan driver, spread over many calls: `vkCmdDrawIndexed` about 7-8%,
+`vkCmdBeginRendering` about 3-4% (about 49 passes/frame), descriptor set allocation and updates
+about 3%, the submission path about 4% (the driver destroys a kernel synchronization object in
+`vkResetFences` and creates one in `vkQueueSubmit`, about 0.5% of the thread together). On this
+scene, interleaved uncapped A/B runs (3 each) of `WWHD_VK_DRAW_BATCH=4096`, `WWHD_VK_DRAW_BATCH=0` and
+`WWHD_VK_NARROW_BARRIERS=1` stayed within the runs' spread (+2.2%, +2.7%, -3.4% in median fps), so the
+defaults are unchanged.
+
 ### Fixed-scene benchmark
 
 `tools/bench/run_bench.py` runs the game headless (or with `--visible` windows, which presentation
@@ -159,6 +194,51 @@ in-between frames drawn (paced), frames per step is interpolation's own count.
   devel; later frames differ from devel by as much as two devel runs differ from each other.
 - Before the per-kind averages and the spike limit, one 76 ms in-between pass kept all in-between
   frames off for 10 s at 120 fps (28.8 logic steps/s and 1% in-between frames in that window).
+
+## Frames that miss their vsync (issue #125, 2026-10-11)
+
+A computer that draws a little under 60 frames a second (Uncapped ~60) got about 30 at 60 fps and
+40–50 at 120/240 fps. The cause was the virtual vsync (`gx2_core.cpp`): a flip executed only on a
+tick of a fixed 59.94 Hz grid (2/4 times as fast at 120/240 fps), and the game waits for its flip
+before it goes on. A frame ready 1 ms after its tick waited for the next one, so every frame took
+two vsyncs (33.4 ms, double-buffered vsync). Now (`gx2/vsync_pacing.h`) a frame that is late flips
+as soon as it is ready (GX2WaitForVsync waits for that frame in 0.25 ms steps instead of sleeping
+to the next tick); lateness under one 59.94 Hz vsync keeps the grid, more moves the grid to the
+flip. Frames that are on time flip exactly on the grid, as before. Two pacing changes in
+`interp.cpp` go with it: a logic step that waited for its time starts at that time, not when the
+sleep timer woke up (0.2–1 ms later every step), and at 120/240 fps a step that starts late keeps
+the schedule (less than a step late), so the game catches up with fewer in-between frames.
+
+Measurement aids (test only): `WWHD_TEST_RENDER_LOAD_MS=x` busy-waits x ms on the render thread per
+frame, `WWHD_TEST_GAME_LOAD_MS=x` on the game thread at each swap; `WWHD_LOG_FLIP_PACING=1` logs the
+flip intervals (p50/p95/p99/max, count over 25 and 34 ms) every 300 flips.
+
+Apple M3 Max, Windfall (slot 2, walking), `tools/bench/run_bench.py`, hidden windows (nothing is
+presented, so these are the game's own flips; the display's vsync and the Vulkan present modes are
+not involved), 25 s per run, old and new interleaved in one binary, render thread +15 ms per frame
+(17.7 ms in all, Uncapped 56 fps). fps = flips (swaps) per second; 120/240 fps uncapped by the display
+(`--display-hz 0`):
+
+| Limit | Renderer | old fps / logic steps/s | new fps / logic steps/s |
+|---|---|---|---|
+| 60 | Vulkan | 30.2 / 15.1 | 56.3 / 28.2 |
+| 60 | Metal | 30.3 / 15.2 | 54.7 / 27.3 |
+| 60, game thread +15 ms instead | Vulkan | 30.4 / 15.2 | 56.7 / 28.3 |
+| 60, paced | Vulkan | 30.4 / 15.2 | 56.4 / 28.2 |
+| 120 (paced) | Vulkan | 40.3 / 20.2 | 56.6 / 30.0 |
+| 240 (paced) | Vulkan | 48.2 / 24.1 | 56.7 / 30.0 |
+| 120 (paced) | Metal | 40.2 / 20.1 | 54.5 / 30.0 |
+| 240 (paced) | Metal | 48.1 / 24.1 | 54.6 / 30.0 |
+| true 60 | Vulkan | 30.3 / 15.1 | 56.2 / 28.1 |
+| Uncapped | Vulkan | 56.0 / 28.0 | 55.7 / 27.9 |
+| 30 | Vulkan | 30.0 / 30.0 | 30.0 / 30.0 |
+
+At 60 fps with the load, the flip intervals were 33.4 ms (p50 and p95) before and 18.1 ms (p95)
+after, with none over 34 ms. Without the load the rates are unchanged (60 fps: 59.9 flips/s, 30.0
+logic steps/s, p95 16.7 ms on both renderers; Vulkan 120/240 fps 119.8/238.9; true 60 59.9), and the
+worst flip interval at 60 fps fell from 33.4 to 17.7 ms. Metal at 240 fps without a display cap
+(this computer draws ~150) now draws 149 instead of 119 frames a second at 30.0 instead of 29.8
+logic steps/s.
 
 ## Desktop CPU/GPU overlap and CPU path defaults (2026-10-07)
 

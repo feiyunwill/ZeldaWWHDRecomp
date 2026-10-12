@@ -11,6 +11,7 @@
 #include "guest_hud.h"
 #include "content.h"
 #include "cemu_pack.h"
+#include "save_backup.h"
 #include "../platform/host.h"
 #include "wwhd_mod.h"
 #include <algorithm>
@@ -20,6 +21,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -46,6 +48,7 @@ struct Manifest {
     uint32_t heap_size=256*1024;
     std::vector<catalogue::Step> setup;
     std::vector<std::string> setup_tools;
+    bool experimental=false;
 };
 struct Record {Manifest manifest;fs::path path;bool active=false,loading=false;std::string status,error;Value startup_config;};
 std::mutex mutex;
@@ -99,6 +102,8 @@ Manifest manifest(const fs::path& path){
     m.version=string_field(v,"version",false,64);version(m.version);
     m.author=string_field(v,"author",true,256);m.description=string_field(v,"description",true);
     m.kind=string_field(v,"kind",false,32);require(m.kind=="native"||m.kind=="guest"||m.kind=="settings"||m.kind=="content"||m.kind=="cemu","Unsupported mod kind");
+    const auto& experimental=v.get("experimental");require(experimental.type==Value::Null||experimental.type==Value::Bool,"Invalid experimental flag");
+    m.experimental=experimental.boolean;
     if(string_field(v,"game_id",false,64)!=kGameId)m.problem="This package targets another game";
     auto minimum=string_field(v,"minimum_manager_version",true,64);
     if(!minimum.empty()&&version(minimum)>version(kManagerVersion))m.problem="Requires mod manager "+minimum;
@@ -207,6 +212,31 @@ bool test_trusted(const std::string& id){
 // Settings presets never ask; native code runs only after the player confirmed this exact library.
 const std::string& trust_fingerprint(const Manifest& m){return m.trust_fingerprint.empty()?m.fingerprint:m.trust_fingerprint;}
 bool confirmed(const Record& r){const auto& m=r.manifest;const auto& fingerprint=trust_fingerprint(m);return (m.kind!="native"&&m.kind!="guest"&&m.setup_tools.empty())||test_trusted(m.id)||(!fingerprint.empty()&&database.get("native_trust").get(m.id).string()==fingerprint);}
+// Experimental: the package's manifest says so, or the catalogue entry it was installed from did.
+bool experimental(const Record& r){const auto& flag=database.get("catalogue_experimental").get(r.manifest.id);return r.manifest.experimental||(flag.type==Value::Bool&&flag.boolean);}
+// Enabling an experimental package needs the player's confirmation, which backs up the saves first
+// (acknowledge_experimental). The record is used up by the enable it was made for; an old one
+// (a cancelled setup, say) asks again.
+constexpr double kExperimentalAckSeconds=3600;
+bool experimental_acknowledged(const std::string& id){
+    const auto& ack=database.get("experimental_ack").get(id).get("time");
+    auto now=double(std::time(nullptr));
+    return ack.type==Value::Number&&ack.number<=now+60&&now-ack.number<=kExperimentalAckSeconds;
+}
+// Packages that enabling `id` newly turns on (itself, disabled dependencies) that are experimental.
+std::vector<std::string> newly_experimental(const std::string& id){
+    std::vector<std::string> result;std::set<std::string> seen;
+    std::function<void(const std::string&)> visit=[&](const std::string& current){
+        auto it=records.find(current);if(it==records.end()||wanted(current)||!seen.insert(current).second)return;
+        for(const auto& d:it->second.manifest.dependencies)if(!d.id.starts_with("builtin:"))visit(d.id);
+        if(experimental(it->second))result.push_back(current);
+    };
+    visit(id);return result;
+}
+void require_experimental_ack(const std::string& id){
+    for(const auto& current:newly_experimental(id))
+        require(experimental_acknowledged(current),records.at(current).manifest.name+" is experimental: confirm the warning first (it backs up your saves)");
+}
 std::string setup_identity_unlocked(const std::string& id) {
     Value snapshot;std::set<std::string> seen;
     std::function<void(const std::string&)> visit=[&](const auto& current) {
@@ -238,7 +268,40 @@ void load_fast_forward_options(const Value& options) {
     const auto& mute = options.get("fast-forward.mute");
     if (!std::getenv("WWHD_MOD_FF_MUTE")) set_fast_forward_mute(mute.type == Value::Bool ? mute.boolean : mute.type == Value::Number ? mute.number != 0 : true);
 }
-void defaults(){database=Value{};database["format_version"]=1;database["active"]="Default";auto& p=profile();save_fast_forward_options(p["builtin_options"]);p["enabled"].type=Value::Object;for(const auto& e:manager::entries())p["builtins"][e.id]=e.enabled();p["builtin_options"]["move-speed.factor"]=double(move_speed_factor());p["builtin_options"]["move-speed.button"]=double(move_speed_button());p["builtin_options"]["direct-camera.speed"]=double(camera_speed());p["builtin_options"]["mouse-camera.sensitivity"]=double(mouse_sensitivity());}
+void save_move_speed_options(Value& options) {
+    options["move-speed.land"] = double(move_speed_land_factor());
+    options["move-speed.swim"] = double(move_speed_swim_factor());
+    options["move-speed.stamina"] = double(move_speed_stamina_seconds());
+    options["move-speed.cooldown"] = double(move_speed_cooldown_seconds());
+    options["move-speed.mode"] = double((int)move_speed_mode());
+    options["move-speed.anim"] = std::string(move_anim_label(move_speed_anim()));
+    options["move-speed.button"] = double(move_speed_button());
+}
+void load_move_speed_options(const Value& options, bool startup = false) {
+    auto number = [&](const char* key, const char* env, double lo, double hi, float fallback, void (*apply)(float)) {
+        if (std::getenv(env)) return;
+        const auto& v = options.get(key);
+        apply(v.type == Value::Number && v.number >= lo && v.number <= hi ? float(v.number) : fallback);
+    };
+    // a profiles.json from before the split stored one factor, which applied to both states
+    const auto& old = options.get("move-speed.factor");
+    const bool legacy = old.type == Value::Number && old.number >= 1.0 && old.number <= 4.0;
+    number("move-speed.land", "WWHD_MOD_MOVE_FACTOR", 1.0, 4.0, legacy ? float(old.number) : kDefaultLandFactor, set_move_speed_land_factor);
+    number("move-speed.swim", "WWHD_MOD_MOVE_SWIM", 1.0, 4.0, legacy ? float(old.number) : kDefaultSwimFactor, set_move_speed_swim_factor);
+    number("move-speed.stamina", "WWHD_MOD_MOVE_STAMINA", 0.0, 60.0, kDefaultStaminaSeconds, set_move_speed_stamina_seconds);
+    number("move-speed.cooldown", "WWHD_MOD_MOVE_COOLDOWN", 0.0, 60.0, kDefaultCooldownSeconds, set_move_speed_cooldown_seconds);
+    const auto& mode = options.get("move-speed.mode");
+    set_move_speed_mode(mode.type == Value::Number && mode.number != 0 ? MoveMode::kToggle : MoveMode::kHold);
+    const auto& anim = options.get("move-speed.anim");
+    // Before the animation UI updated profiles, only settings.ini held this choice. On startup an
+    // old profile with no animation key inherits that loaded setting; profile switches use defaults.
+    if (!std::getenv("WWHD_MOD_MOVE_ANIM") && !(startup && anim.type == Value::Null))
+        set_move_speed_anim(move_anim_from_id(anim.string("native")));
+    const auto& button = options.get("move-speed.button");
+    if (button.type == Value::Number && button.number >= 0 && button.number <= UINT32_MAX && std::floor(button.number) == button.number)
+        set_move_speed_button(uint32_t(button.number));
+}
+void defaults(){database=Value{};database["format_version"]=1;database["active"]="Default";auto& p=profile();save_fast_forward_options(p["builtin_options"]);save_move_speed_options(p["builtin_options"]);p["enabled"].type=Value::Object;for(const auto& e:manager::entries())p["builtins"][e.id]=e.enabled();p["builtin_options"]["direct-camera.speed"]=double(camera_speed());p["builtin_options"]["mouse-camera.sensitivity"]=double(mouse_sensitivity());}
 void scan(){records.clear();if(!ready)return;fs::create_directories(root/"Mods");for(const auto& e:fs::directory_iterator(root/"Mods")){if(!e.is_directory()||e.is_symlink()||!id_ok(e.path().filename().string()))continue;Record r;r.path=e.path();try{r.manifest=manifest(e.path());require(r.manifest.id==e.path().filename(),"Folder and manifest IDs differ");}catch(const std::exception& ex){r.manifest.id=e.path().filename().string();r.manifest.name=r.manifest.id;r.manifest.problem=ex.what();}auto id=r.manifest.id;records.emplace(id,std::move(r));}}
 std::string source_warning(const std::vector<catalogue::Step>& steps) {
     catalogue::Sources sources(database.get("game_sources"));
@@ -391,7 +454,7 @@ void initialize(){
     try{fs::create_directories(root);if(fs::exists(root/"profiles.json")){auto saved=json::parse(read_text(root/"profiles.json"));require(saved.get("format_version").type==Value::Number&&saved.get("format_version").number==1,"Unsupported profile format");require(saved.get("profiles").type==Value::Object&&!saved.get("profiles").object.empty(),"Invalid profiles");require(saved.get("active").type==Value::String&&saved.get("profiles").object.contains(saved.get("active").text),"Invalid active profile");database=std::move(saved);}scan();
         {auto messages=repair_graphics();if(!messages.empty()){save();notices.insert(notices.end(),messages.begin(),messages.end());}}
         for(const auto& e:manager::entries()){const auto& v=profile().get("builtins").get(e.id);if(!std::getenv(e.startup_env)&&v.type==Value::Bool)e.apply(v.boolean);}
-        const auto& options=profile().get("builtin_options");load_fast_forward_options(options);auto move=options.get("move-speed.factor"),button=options.get("move-speed.button");if(!std::getenv("WWHD_MOD_MOVE_FACTOR")&&move.type==Value::Number)set_move_speed_factor(move.number);if(button.type==Value::Number&&button.number>=0&&button.number<=UINT32_MAX&&std::floor(button.number)==button.number)set_move_speed_button(uint32_t(button.number));auto speed=options.get("direct-camera.speed"),sens=options.get("mouse-camera.sensitivity");if(!std::getenv("WWHD_MOD_CAMERA_SPEED")&&speed.type==Value::Number&&speed.number>=.5&&speed.number<=2)set_camera_speed(speed.number);if(!std::getenv("WWHD_MOD_MOUSE_SENS")&&sens.type==Value::Number&&sens.number>=.08&&sens.number<=.3)set_mouse_sensitivity(sens.number);
+        const auto& options=profile().get("builtin_options");load_fast_forward_options(options);load_move_speed_options(options,true);auto speed=options.get("direct-camera.speed"),sens=options.get("mouse-camera.sensitivity");if(!std::getenv("WWHD_MOD_CAMERA_SPEED")&&speed.type==Value::Number&&speed.number>=.5&&speed.number<=2)set_camera_speed(speed.number);if(!std::getenv("WWHD_MOD_MOUSE_SENS")&&sens.type==Value::Number&&sens.number>=.08&&sens.number<=.3)set_mouse_sensitivity(sens.number);
         // A rebuild offer queues an enable for this profile. Apply it only in a
         // new process whose generated code registered the actual hook marker.
         if(code_mod_support&&!profile().get("code_mod_pending").object.empty()) {
@@ -412,7 +475,7 @@ void initialize(){
                 }
                 order(enabled);validate_conflicts(enabled,&planned);
                 profile()["builtins"]=planned;
-                for(const auto& id:enabled)profile()["enabled"][id]=true;
+                for(const auto& id:enabled){profile()["enabled"][id]=true;database["experimental_ack"].object.erase(id);}
                 profile()["code_mod_pending"].object.clear();save();
                 for(const auto& entry:manager::entries())if(planned.get(entry.id).type==Value::Bool)entry.apply(planned.get(entry.id).boolean);
             }catch(const std::exception& e){
@@ -492,7 +555,7 @@ bool begin_setup_run(const std::string& id,const std::string& identity,
             if(m.kind=="native"||m.kind=="guest"||!m.setup_tools.empty())
                 require(package_fingerprint(r.path)==trust_fingerprint(m),"Package changed; refresh it and confirm again");
             for(const auto& dep:m.dependencies)if(!dep.id.starts_with("builtin:"))check(dep.id);
-        };check(id);
+        };check(id);require_experimental_ack(id);
         auto previous=database;
         try {
             auto& m=records.at(id).manifest;auto cfg=config(m);
@@ -602,6 +665,10 @@ bool run_setup_tool(const std::string& id,const std::string& step_id,std::string
                 const char* config=std::getenv("WWHD_GUEST_BUILD_CONFIG");
                 auto bridge=guestmods::BuildBridge::read(config?config:"guest-sdk.json",(root/"GuestBuild").string());
                 command.insert(command.begin(),bridge.python.begin(),bridge.python.end());
+                // -B: Python must not write __pycache__ into the package; it is fingerprinted, and new
+                // .pyc files made every later step report "Package changed" (gc-minimap's prepare tool
+                // imports its own modules)
+                command.insert(command.begin()+std::ptrdiff_t(bridge.python.size()),"-B");
             }
             // A failed rerun must not reuse an earlier success and leftover outputs.
             auto previous=database;database["setup_receipts"][id].object.erase(step_id);
@@ -626,7 +693,7 @@ bool run_setup_tool(const std::string& id,const std::string& step_id,std::string
         return false;
     }
 }
-std::vector<View> list(){std::lock_guard guard(mutex);std::vector<View> out;for(const auto& [id,r]:records){const auto& m=r.manifest;View v;v.id=id;v.name=m.name;v.version=m.version;v.author=m.author;v.description=m.description;v.kind=m.kind;v.restart_required=m.kind=="content"||m.kind=="cemu"||m.kind=="guest";v.enabled=wanted(id);v.active=r.active;v.compatible=m.problem.empty();v.native_confirmed=confirmed(r);v.reason=m.problem.empty()?r.error:m.problem;v.status=r.status;v.game_source_warning=source_warning(m);if(m.graphics){auto diagnostics=cemu::runtime_status(id);if(!diagnostics.empty())v.status+=". "+diagnostics;}if(m.kind=="guest"){auto hud_error=guestmods::hud::store().error(id);if(!hud_error.empty())v.status+=". "+hud_error;}v.options=m.options;v.setup_tools=m.setup_tools;v.content_hashes=m.content_hashes;auto cfg=config(m);v.pending_restart=v.restart_required&&(v.enabled!=v.active||((m.graphics||m.kind=="guest")&&v.active&&!(r.startup_config==cfg)));if(m.graphics&&!m.graphics->shaders.empty()&&!cemu::vulkan()){v.active=false;v.compatible=false;v.reason="GLSL shader packs require Vulkan; choose it in Graphics and restart";}for(auto& o:v.options)o.value=cfg.get(o.id);for(const auto& dep:m.dependencies)v.dependencies.push_back(dep.id+">="+dep.version);v.conflicts=m.conflicts;if(m.graphics)for(const auto& other:enabled_set())if(other!=id){try{auto reason=graphics_conflict(id,other);if(!reason.empty())v.graphics_conflicts.push_back({other,records.at(other).manifest.name,reason});}catch(const std::exception& e){v.reason=e.what();}}out.push_back(std::move(v));}return out;}
+std::vector<View> list(){std::lock_guard guard(mutex);std::vector<View> out;for(const auto& [id,r]:records){const auto& m=r.manifest;View v;v.id=id;v.name=m.name;v.version=m.version;v.author=m.author;v.description=m.description;v.kind=m.kind;v.restart_required=m.kind=="content"||m.kind=="cemu"||m.kind=="guest";v.enabled=wanted(id);v.active=r.active;v.compatible=m.problem.empty();v.native_confirmed=confirmed(r);v.experimental=experimental(r);v.reason=m.problem.empty()?r.error:m.problem;v.status=r.status;v.game_source_warning=source_warning(m);if(m.graphics){auto diagnostics=cemu::runtime_status(id);if(!diagnostics.empty())v.status+=". "+diagnostics;}if(m.kind=="guest"){auto hud_error=guestmods::hud::store().error(id);if(!hud_error.empty())v.status+=". "+hud_error;}v.options=m.options;v.setup_tools=m.setup_tools;v.content_hashes=m.content_hashes;auto cfg=config(m);v.pending_restart=v.restart_required&&(v.enabled!=v.active||((m.graphics||m.kind=="guest")&&v.active&&!(r.startup_config==cfg)));if(m.graphics&&!m.graphics->shaders.empty()&&!cemu::vulkan()){v.active=false;v.compatible=false;v.reason="GLSL shader packs require Vulkan; choose it in Graphics and restart";}for(auto& o:v.options)o.value=cfg.get(o.id);for(const auto& dep:m.dependencies)v.dependencies.push_back(dep.id+">="+dep.version);v.conflicts=m.conflicts;if(m.graphics)for(const auto& other:enabled_set())if(other!=id){try{auto reason=graphics_conflict(id,other);if(!reason.empty())v.graphics_conflicts.push_back({other,records.at(other).manifest.name,reason});}catch(const std::exception& e){v.reason=e.what();}}out.push_back(std::move(v));}return out;}
 static bool content_name(std::string n){for(char& c:n)if(c>='A'&&c<='Z')c+='a'-'A';return n=="content";}
 bool install(const std::string& source,std::string& error,std::string* installed_id_out){return operation(error,[&]{
     auto nonce=std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());auto stage=root/(".stage-"+nonce),backup=root/(".backup-"+nonce);fs::path target;bool backed=false,moved=false;
@@ -646,7 +713,7 @@ bool install(const std::string& source,std::string& error,std::string* installed
     }auto m=manifest(stage);require(m.problem.empty()||m.problem.starts_with("No binary for")||m.problem.starts_with("GLSL shader packs require Vulkan"),m.problem);target=root/"Mods"/m.id;auto it=records.find(m.id);require(it==records.end()||(!wanted(m.id)&&!it->second.active&&!it->second.loading),it!=records.end()&&(it->second.manifest.kind=="content"||it->second.manifest.kind=="cemu"||it->second.manifest.kind=="guest")?"Disable this content mod and restart before updating":"Disable this mod and wait for it to unload before updating");fs::create_directories(target.parent_path());if(fs::exists(target)){fs::rename(target,backup);backed=true;}fs::rename(stage,target);moved=true;m=manifest(target);Record r;r.path=target;r.manifest=std::move(m);auto installed_id=r.manifest.id;records[installed_id]=std::move(r);if(installed_id_out)*installed_id_out=installed_id;if(backed){std::error_code cleanup;fs::remove_all(backup,cleanup);}dirty=true;
     }catch(...){if(moved)fs::remove_all(target);if(backed)fs::rename(backup,target);if(fs::exists(stage))fs::remove_all(stage);throw;}
 });}
-bool remove(const std::string& id,std::string& error){return operation(error,[&]{auto it=records.find(id);require(it!=records.end(),"Mod not found");require(!wanted(id)&&!it->second.active&&!it->second.loading,(it->second.manifest.kind=="content"||it->second.manifest.kind=="cemu"||it->second.manifest.kind=="guest")?"Disable this content mod and restart before removing":"Disable this mod and wait for it to unload before removing");for(const auto& [other,r]:records)if(wanted(other))for(const auto& d:r.manifest.dependencies)require(d.id!=id,r.manifest.name+" depends on this mod");auto previous=database;for(auto& [name,p]:database["profiles"].object){p["enabled"].object.erase(id);p["config"].object.erase(id);p["setup_pending"].object.erase(id);}database["native_trust"].object.erase(id);database["guest_regions"].object.erase(id);database["guest_prepared"].object.erase(id);database["setup_receipts"].object.erase(id);try{save();}catch(...){database=previous;throw;}fs::remove_all(it->second.path);records.erase(it);dirty=true;});}
+bool remove(const std::string& id,std::string& error){return operation(error,[&]{auto it=records.find(id);require(it!=records.end(),"Mod not found");require(!wanted(id)&&!it->second.active&&!it->second.loading,(it->second.manifest.kind=="content"||it->second.manifest.kind=="cemu"||it->second.manifest.kind=="guest")?"Disable this content mod and restart before removing":"Disable this mod and wait for it to unload before removing");for(const auto& [other,r]:records)if(wanted(other))for(const auto& d:r.manifest.dependencies)require(d.id!=id,r.manifest.name+" depends on this mod");auto previous=database;for(auto& [name,p]:database["profiles"].object){p["enabled"].object.erase(id);p["config"].object.erase(id);p["setup_pending"].object.erase(id);}database["native_trust"].object.erase(id);database["experimental_ack"].object.erase(id);database["catalogue_experimental"].object.erase(id);database["guest_regions"].object.erase(id);database["guest_prepared"].object.erase(id);database["setup_receipts"].object.erase(id);try{save();}catch(...){database=previous;throw;}fs::remove_all(it->second.path);records.erase(it);dirty=true;});}
 void set_code_mod_support(bool built){std::lock_guard guard(mutex);code_mod_support=built;}
 bool needs_code_mod_support(const std::string& id){
     std::lock_guard guard(mutex);std::set<std::string> seen;
@@ -663,17 +730,46 @@ bool enable_after_code_rebuild(const std::string& id,std::string& error){return 
         require(records.contains(current),"Missing dependency: "+current);if(!seen.insert(current).second)return;
         const auto& r=records.at(current);require_source(r.manifest);require(confirmed(r),r.manifest.name+" contains native code that has not been confirmed");
         for(const auto& dep:r.manifest.dependencies)if(!dep.id.starts_with("builtin:"))check(dep.id);
-    };check(id);
+    };check(id);require_experimental_ack(id);
     auto previous=database;profile()["code_mod_pending"][id]=records.at(id).manifest.trust_fingerprint;
     try{save();}catch(...){database=previous;throw;}
 });}
-bool enable(const std::string& id,bool on,std::string& error,bool switch_conflicts){std::vector<std::string> builtin_dependencies;bool ok=operation(error,[&]{require(records.contains(id),"Mod not found");require(!records.at(id).loading,"Wait for this mod's current operation to finish");auto enabled=enabled_set();if(on){
+bool enable(const std::string& id,bool on,std::string& error,bool switch_conflicts){std::vector<std::string> builtin_dependencies,experimental_ids;bool ok=operation(error,[&]{require(records.contains(id),"Mod not found");require(!records.at(id).loading,"Wait for this mod's current operation to finish");auto enabled=enabled_set();if(on){
     std::set<std::string> visiting;
     std::function<void(const std::string&)> add=[&](const std::string& current){require(!visiting.contains(current),"Dependency cycle at "+current);require(records.contains(current),"Missing dependency: "+current);require(!records.at(current).loading,"Wait for mod preparation to finish: "+current);require(records.at(current).manifest.kind!="guest"||code_mod_support,"This mod needs code-mod support. Enable code mods in Settings > Mods, rebuild and restart first");const auto& graphics=records.at(current).manifest.graphics;if(graphics&&!graphics->shaders.empty())require(cemu::vulkan(),"GLSL shader packs require Vulkan; choose it in Graphics and restart");if(enabled.contains(current))return;visiting.insert(current);for(const auto& d:records.at(current).manifest.dependencies){if(d.id.starts_with("builtin:"))builtin_dependencies.push_back(d.id.substr(8));else add(d.id);}visiting.erase(current);require(confirmed(records.at(current)),records.at(current).manifest.name+" contains native code that has not been confirmed");enabled.insert(current);};add(id);
+    require_experimental_ack(id);experimental_ids=newly_experimental(id);
     if(switch_conflicts)for(auto it=enabled.begin();it!=enabled.end();){if(*it!=id&&!graphics_conflict(id,*it).empty())it=enabled.erase(it);else ++it;}
     }else enabled.erase(id);order(enabled,on);auto planned=profile().get("builtins");for(const auto& entry:manager::entries())planned[entry.id]=entry.enabled();for(const auto& dependency:builtin_dependencies)planned[dependency]=true;validate_conflicts(enabled,&planned);auto previous=database;profile()["builtins"]=planned;
     double serial=profile().get("enable_serial").number;
-    for(const auto& [key,r]:records){if(enabled.contains(key)&&!wanted(key))profile()["enabled_since"][key]=++serial;profile()["enabled"][key]=enabled.contains(key);}profile()["enable_serial"]=serial;try{save();}catch(...){database=previous;throw;}for(const auto& key:enabled)records.at(key).error.clear();dirty=true;});if(ok)for(const auto& key:builtin_dependencies)manager::set_enabled(key,true);return ok;}
+    for(const auto& [key,r]:records){if(enabled.contains(key)&&!wanted(key))profile()["enabled_since"][key]=++serial;profile()["enabled"][key]=enabled.contains(key);}profile()["enable_serial"]=serial;
+    for(const auto& key:experimental_ids)database["experimental_ack"].object.erase(key); // the confirmation is used up
+    try{save();}catch(...){database=previous;throw;}for(const auto& key:enabled)records.at(key).error.clear();dirty=true;});if(ok)for(const auto& key:builtin_dependencies)manager::set_enabled(key,true);return ok;}
+std::vector<std::pair<std::string,std::string>> unacknowledged_experimental(const std::string& id){
+    std::lock_guard guard(mutex);std::vector<std::pair<std::string,std::string>> result;if(!ready)return result;
+    for(const auto& current:newly_experimental(id))if(!experimental_acknowledged(current))result.emplace_back(current,records.at(current).manifest.name);
+    return result;
+}
+bool acknowledge_experimental(const std::string& id,std::string& error){return operation(error,[&]{
+    require(records.contains(id),"Mod not found");
+    auto ids=newly_experimental(id);require(!ids.empty(),"This mod is not experimental or is already enabled");
+    // One backup for the whole set, made now: before any of them can become active.
+    saves::Result backup;
+    {
+        std::lock_guard saves_guard(saves::mutex());
+        backup=saves::store().create("before-mod",id,records.at(id).manifest.name);
+    }
+    require(backup.ok,backup.error+". "+records.at(id).manifest.name+" was not turned on.");
+    auto previous=database;
+    for(const auto& current:ids){auto& ack=database["experimental_ack"][current];ack["time"]=double(std::time(nullptr));ack["backup"]=backup.name;}
+    try{save();}catch(...){database=previous;throw;}
+    fprintf(stderr,"[mod-manager] experimental %s confirmed; %s\n",id.c_str(),backup.created?("saves backed up to "+backup.name).c_str():"no save data to back up yet");
+});}
+void mark_experimental(const std::string& id,bool on){std::string ignored;operation(ignored,[&]{
+    require(records.contains(id),"Mod not found");
+    auto previous=database;
+    if(on)database["catalogue_experimental"][id]=true;else database["catalogue_experimental"].object.erase(id);
+    try{save();}catch(...){database=previous;throw;}
+});}
 std::vector<std::pair<std::string,std::string>> unconfirmed_native(const std::string& id){
     std::lock_guard guard(mutex);std::vector<std::pair<std::string,std::string>> result;if(!ready)return result;
     auto enabled=enabled_set();std::set<std::string> seen;
@@ -687,11 +783,12 @@ std::vector<std::string> take_notices(){std::lock_guard guard(mutex);auto result
 void disable_all(){std::string ignored;operation(ignored,[&]{auto previous=database;for(const auto& [id,r]:records)profile()["enabled"][id]=false;profile()["setup_pending"].object.clear();try{save();}catch(...){database=previous;throw;}dirty=true;});manager::disable_all();}
 std::vector<std::string> profiles(){std::lock_guard guard(mutex);std::vector<std::string> result;if(ready)for(const auto& [name,p]:database.get("profiles").object)result.push_back(name);return result;}
 std::string current_profile(){std::lock_guard guard(mutex);return ready?database.get("active").string():"Default";}
-bool create_profile(const std::string& name,std::string& error){return operation(error,[&]{require(!name.empty()&&name.size()<=64&&name.find('\0')==std::string::npos,"Invalid profile name");require(database.get("profiles").object.size()<64,"Profile limit reached");require(!database.get("profiles").object.contains(name),"Profile already exists");auto previous=database;Value copy=profile();copy["setup_pending"].object.clear();save_fast_forward_options(copy["builtin_options"]);for(const auto& e:manager::entries())copy["builtins"][e.id]=e.enabled();copy["builtin_options"]["move-speed.factor"]=double(move_speed_factor());copy["builtin_options"]["move-speed.button"]=double(move_speed_button());copy["builtin_options"]["direct-camera.speed"]=double(camera_speed());copy["builtin_options"]["mouse-camera.sensitivity"]=double(mouse_sensitivity());database["profiles"][name]=std::move(copy);try{save();}catch(...){database=previous;throw;}});}
-bool select_profile(const std::string& name,std::string& error){Value chosen;bool ok=operation(error,[&]{for(const auto& [id,r]:records)require(!r.loading,"Wait for mod preparation to finish before changing profiles");require(database.get("profiles").object.contains(name),"Profile not found");auto previous=database;database["active"]=name;try{auto messages=repair_graphics();order(enabled_set());validate_conflicts(enabled_set(),&profile().get("builtins"));save();notices.insert(notices.end(),messages.begin(),messages.end());}catch(...){database=previous;throw;}chosen=profile();profile_changed=true;dirty=true;});if(ok){for(const auto& e:manager::entries()){const auto& v=chosen.get("builtins").get(e.id);manager::set_enabled(e.id,v.type==Value::Bool&&v.boolean);}load_fast_forward_options(chosen.get("builtin_options"));auto move=chosen.get("builtin_options").get("move-speed.factor"),button=chosen.get("builtin_options").get("move-speed.button");set_move_speed_factor(move.type==Value::Number?move.number:1.5f);set_move_speed_button(button.type==Value::Number&&button.number>=0&&button.number<=UINT32_MAX&&std::floor(button.number)==button.number?uint32_t(button.number):0x40000u);auto speed=chosen.get("builtin_options").get("direct-camera.speed"),sens=chosen.get("builtin_options").get("mouse-camera.sensitivity");if(speed.type==Value::Number&&speed.number>=.5&&speed.number<=2)set_camera_speed(speed.number);if(sens.type==Value::Number&&sens.number>=.08&&sens.number<=.3)set_mouse_sensitivity(sens.number);}return ok;}
+bool create_profile(const std::string& name,std::string& error){return operation(error,[&]{require(!name.empty()&&name.size()<=64&&name.find('\0')==std::string::npos,"Invalid profile name");require(database.get("profiles").object.size()<64,"Profile limit reached");require(!database.get("profiles").object.contains(name),"Profile already exists");auto previous=database;Value copy=profile();copy["setup_pending"].object.clear();save_fast_forward_options(copy["builtin_options"]);save_move_speed_options(copy["builtin_options"]);for(const auto& e:manager::entries())copy["builtins"][e.id]=e.enabled();copy["builtin_options"]["direct-camera.speed"]=double(camera_speed());copy["builtin_options"]["mouse-camera.sensitivity"]=double(mouse_sensitivity());database["profiles"][name]=std::move(copy);try{save();}catch(...){database=previous;throw;}});}
+bool select_profile(const std::string& name,std::string& error){Value chosen;bool ok=operation(error,[&]{for(const auto& [id,r]:records)require(!r.loading,"Wait for mod preparation to finish before changing profiles");require(database.get("profiles").object.contains(name),"Profile not found");auto previous=database;database["active"]=name;try{auto messages=repair_graphics();order(enabled_set());validate_conflicts(enabled_set(),&profile().get("builtins"));save();notices.insert(notices.end(),messages.begin(),messages.end());}catch(...){database=previous;throw;}chosen=profile();profile_changed=true;dirty=true;});if(ok){for(const auto& e:manager::entries()){const auto& v=chosen.get("builtins").get(e.id);manager::set_enabled(e.id,v.type==Value::Bool&&v.boolean);}load_fast_forward_options(chosen.get("builtin_options"));load_move_speed_options(chosen.get("builtin_options"));auto speed=chosen.get("builtin_options").get("direct-camera.speed"),sens=chosen.get("builtin_options").get("mouse-camera.sensitivity");if(speed.type==Value::Number&&speed.number>=.5&&speed.number<=2)set_camera_speed(speed.number);if(sens.type==Value::Number&&sens.number>=.08&&sens.number<=.3)set_mouse_sensitivity(sens.number);}return ok;}
 bool delete_profile(const std::string& name,std::string& error){return operation(error,[&]{require(name!=database.get("active").string(),"Switch profiles before deleting the active one");require(database.get("profiles").object.contains(name),"Profile not found");auto previous=database;database["profiles"].object.erase(name);try{save();}catch(...){database=previous;throw;}});}
 void remember_builtin(const std::string& id,bool on){std::string error;operation(error,[&]{profile()["builtins"][id]=on;save();dirty=true;});}
 void remember_option(const std::string& id,double value){std::string error;operation(error,[&]{profile()["builtin_options"][id]=value;save();});}
+void remember_option(const std::string& id,const std::string& value){std::string error;operation(error,[&]{profile()["builtin_options"][id]=value;save();});}
 bool refresh(std::string& error){return operation(error,[&]{for(const auto& [id,r]:records)require(!r.active&&!r.loading&&!wanted(id),(r.manifest.kind=="content"||r.manifest.kind=="cemu"||r.manifest.kind=="guest")?"Disable content mods and restart before rescanning":"Disable installed mods before rescanning");scan();dirty=true;});}
 void set_guest_builder(GuestInspect inspect,GuestBuild build,GuestCacheCheck check) {
     Value requests;requests.type=Value::Array;

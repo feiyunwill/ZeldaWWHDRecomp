@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <string>
 #include "input.h"
+#include "gfx/renderer.h"
 #include "input_map.h"
 #include "rumble.h"
 #include "platform/input_sdl.h"
@@ -15,7 +16,8 @@ namespace audio {void flush(){++audioResets;}}
 static int savedSlot=0, loadedSlot=0, saveRequests=0, loadRequests=0;
 namespace ss { void request_save(int slot){savedSlot=slot;++saveRequests;} void request_load(int slot){loadedSlot=slot;++loadRequests;} }
 static int graphicsRequests=0; static char graphicsKey=0;
-namespace render { uint64_t frame_count(){return 0;} }
+namespace render { uint64_t frame_count(){return 0;} Api active(){return Api::Vulkan;} }
+namespace gx2 { void checkpoint_vulkan_caches(){} }
 namespace gfxvk { bool graphics_hotkey(char key,bool activate){if(activate){++graphicsRequests;graphicsKey=key;}return true;} }
 namespace gfx { int plusPresses=0; void display_plus_pressed(){++plusPresses;} }  // display_modes.cpp: GamePad screen while paused
 namespace mods { double game_time(){return 0;} void filter_pad(input::PadState&){} bool mouse_camera(){return false;} bool first_person_wheel(){return false;} void mouse_button(int,bool){} void mouse_add(float,float){} void mouse_wheel(float){} }

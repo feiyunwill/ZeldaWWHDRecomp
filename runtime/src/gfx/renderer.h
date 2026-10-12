@@ -97,6 +97,9 @@ void set_preferred(Api a);        // save the setting (Graphics > Renderer)
 bool restart_pending();           // the setting was changed this session to another renderer than the active one
 // relaunch the game with the saved choice (Graphics > Renderer > Restart now); returns on failure
 bool restart();
+// restart() can relaunch on this platform (not on Windows, which has no exec, nor on Android,
+// where the app process cannot re-exec itself)
+bool can_restart();
 
 // ---- dispatch
 inline void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexType, uint32_t indexAddr,

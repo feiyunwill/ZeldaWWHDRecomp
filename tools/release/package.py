@@ -38,11 +38,15 @@ LIB_EXT = (".a", ".lib", ".tbd", ".dylib", ".so")
 # files shipped from the source tree (relative to ROOT -> relative to the package)
 TOOL_FILES = [
     "tools/rpx.py",
+    "tools/shaderprep.py",
+    "tools/shaderprep_format.py",
     "tools/wudextract.py",
     "tools/recomp/recomp.py",
     "tools/recomp/analyze.py",
     "tools/recomp/ppc2c.py",
     "tools/recomp/builds.py",
+    "tools/recomp/crlive.py",
+    "tools/recomp/leaflocal.py",
     "tools/guestmod/build_guest_mod.py",
     "tools/guestmod/guestmod.py",
     "tools/savegame/gc2hd.py",
@@ -52,6 +56,7 @@ TOOL_FILES = [
 INSTALLER_FILES = [
     "tools/installer/setup.py",
     "tools/installer/code_mods.py",
+    "tools/installer/shader_prebuild.py",
     "tools/installer/toolchains.json",
     "tools/installer/README.md",
 ]
@@ -275,19 +280,21 @@ def build_link_recipe(build, pkg, linkonly):
     return args[0], recipe, objs, libs
 
 
-def add_windows_python(pkg, zip_path):
+def add_windows_python(pkg, zip_path, platform="windows-x86_64"):
     """The official embeddable Python, unpacked unmodified into tools/python (its exe and DLLs keep the PSF
-    signature). Checked against the pin in toolchains.json and every file against python-windows-files.json,
-    which tools/release/guard.py uses too."""
+    signature). Checked against the pin in toolchains.json and every file against python-windows-files.json
+    (python-windows-arm64-files.json and the python.windows-arm64 pin for windows-arm64), which
+    tools/release/guard.py uses too."""
+    arm64 = platform == "windows-arm64"
     with open(os.path.join(ROOT, "tools", "installer", "toolchains.json")) as f:
-        pin = json.load(f)["python"]["windows"]
-    with open(os.path.join(ROOT, "tools", "release", "python-windows-files.json")) as f:
+        pin = json.load(f)["python"]["windows-arm64" if arm64 else "windows"]
+    with open(os.path.join(ROOT, "tools", "release", "python-windows-arm64-files.json" if arm64 else "python-windows-files.json")) as f:
         expected = json.load(f)
     with open(zip_path, "rb") as f:
         data = f.read()
     if hashlib.sha256(data).hexdigest() != pin["sha256"] or expected["sha256"] != pin["sha256"]:
-        sys.exit("%s is not the pinned embeddable Python (SHA-256 mismatch with toolchains.json / "
-                 "python-windows-files.json)" % zip_path)
+        sys.exit("%s is not the pinned embeddable Python for %s (SHA-256 mismatch with toolchains.json / "
+                 "python-windows*-files.json)" % (zip_path, platform))
     dest = os.path.join(pkg, "tools", "python")
     names = set()
     with zipfile.ZipFile(zip_path) as z:
@@ -327,6 +334,17 @@ def make_zip(src_dir, zip_path):
                     z.writestr(info, f.read(), compresslevel=9)
 
 
+def copy_shader_template(source, destination):
+    """Optional private payload: forks remain installable without it."""
+    relative = "tools/shadercache/template.bin"
+    path = os.path.join(source, relative)
+    if os.path.isfile(path):
+        copy(path, os.path.join(destination, relative))
+        return True
+    print("Shader template unavailable; shader preparation will be skipped")
+    return False
+
+
 def copy_sdk_headers(pkg):
     """Shared by every platform: public declarations use wwhd/, never a game/ tree."""
     shutil.copytree(os.path.join(ROOT, "runtime", "include"), os.path.join(pkg, "sdk", "include"))
@@ -337,7 +355,7 @@ def copy_sdk_headers(pkg):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--build", required=True)
-    ap.add_argument("--platform", required=True, help="macos-arm64, linux-x86_64, linux-aarch64 or windows-x86_64")
+    ap.add_argument("--platform", required=True, help="macos-arm64, linux-x86_64, linux-aarch64, windows-x86_64 or windows-arm64")
     ap.add_argument("--version", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--toolchain", required=True, help="toolchain id from tools/installer/toolchains.json")
@@ -345,7 +363,7 @@ def main():
     ap.add_argument("--runtime-file", action="append", default=[], help="file to install next to the executable")
     ap.add_argument("--linkonly-lib", action="append", default=[], help="system library to ship for linking only")
     ap.add_argument("--setup-gui", help="the built graphical installer (wwhd-setup) to include")
-    ap.add_argument("--windows-python", help="windows: the pinned embeddable Python zip (toolchains.json python.windows), "
+    ap.add_argument("--windows-python", help="windows: the pinned embeddable Python zip (toolchains.json python.windows, or python.windows-arm64), "
                     "shipped unmodified as tools/python")
     ap.add_argument("--no-zip", action="store_true")
     a = ap.parse_args()
@@ -385,6 +403,7 @@ def main():
 
     for rel in TOOL_FILES + INSTALLER_FILES:
         copy(os.path.join(ROOT, rel), os.path.join(pkg, rel))
+    copy_shader_template(ROOT, pkg)
     for hp in sorted(os.listdir(os.path.join(ROOT, "tools", "recomp"))):
         if re.match(r"hooks.*\.txt$", hp):
             copy(os.path.join(ROOT, "tools", "recomp", hp), os.path.join(pkg, "tools", "recomp", hp))
@@ -403,6 +422,12 @@ def main():
         sys.exit("wwhd-extract in %s uses a system zstd; configure release builds with -DWWHD_BUNDLED_ZSTD=ON "
                  "(on by default with -DWWHD_BUNDLED_DEPS=ON)" % build)
     copy(os.path.join(build, "wwhd-extract" + exe_suffix), os.path.join(pkg, "tools", "bin", "wwhd-extract" + exe_suffix))
+    # the native Yaz0 decoder for tools/shaderprep.py (CMake target wwhd_yaz0); without it, preparing
+    # shaders falls back to a pure-Python decoder that takes minutes
+    yaz0_name = "libyaz0" + (".dll" if a.platform.startswith("windows") else ".dylib" if a.platform.startswith("macos") else ".so")
+    if not os.path.isfile(os.path.join(build, yaz0_name)):
+        sys.exit("%s missing in %s (CMake target wwhd_yaz0)" % (yaz0_name, build))
+    copy(os.path.join(build, yaz0_name), os.path.join(pkg, "tools", "lib", yaz0_name))
 
     # the setup in a terminal (the fallback for the program above), in tools/
     inst = os.path.join(ROOT, "tools", "installer")
@@ -414,7 +439,7 @@ def main():
             sys.exit("windows: --setup-gui is required (tools/Setup in a console window.bat runs Wind Waker HD.exe)")
         if not a.windows_python:
             sys.exit("windows: --windows-python is required (the setup runs with the bundled Python)")
-        add_windows_python(pkg, a.windows_python)
+        add_windows_python(pkg, a.windows_python, a.platform)
         copy(os.path.join(inst, "install-windows.bat"), os.path.join(pkg, "tools", "Setup in a console window.bat"))
     else:
         copy(os.path.join(inst, "install-linux.sh"), os.path.join(pkg, "tools", "setup-in-terminal.sh"))

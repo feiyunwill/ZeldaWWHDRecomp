@@ -4,10 +4,7 @@
 package org.wwhdrecomp.wwhd;
 
 final class PerformanceThermals {
-    static String statusName(int status) {
-        String[] names = {"none", "light", "moderate", "severe", "critical", "emergency", "shutdown"};
-        return status >= 0 && status < names.length ? names[status] : "n/a";
-    }
+    static String statusName(int status) { return SetupPolicy.thermalName(status); }
     static String batteryTemperature(int tenths) {
         return tenths == Integer.MIN_VALUE ? "n/a" : String.format(java.util.Locale.ROOT, "%.1f C", tenths / 10f);
     }

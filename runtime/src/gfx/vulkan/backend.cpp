@@ -1,3 +1,4 @@
+#include "atomic_temporary.h"
 #include "../../audio_out.h"
 #ifndef VK_ENABLE_BETA_EXTENSIONS
 #define VK_ENABLE_BETA_EXTENSIONS
@@ -17,8 +18,16 @@
 #include <jni.h>
 #endif
 #include "backend.h"
+#include "attachment_view_usage.h"
+#include "../../build_info.h"
+#include "deferred_commands.h"
+#include "deferred_dispatch.h"
+#include "pipeline_cache_path.h"
 #include "bc_decode.h"
 #include "android_driver.h"
+#include "stutter_trace.h"
+#include "pipeline_worker.h"
+#include "pipeline_demand.h"
 #include "buffer_cache.h"
 #include "render_prof.h"
 #include "perf_metrics.h"
@@ -76,7 +85,7 @@
 #endif
 #include <vulkan/vulkan_beta.h>
 
-namespace gx2 { uint64_t flips_presented(); void checkpoint_vulkan_caches(); }
+namespace gx2 { uint64_t flips_presented(); void checkpoint_vulkan_caches(); void shutdown_vulkan_caches(); }
 #include "../../interp.h"
 
 namespace gfxvk {
@@ -160,7 +169,10 @@ bool unpack_pipeline_cache(std::vector<uint8_t>& file) {
   return compatible_pipeline_cache(file);
 }
 void init_pipeline_cache() try {
-  if (const char* explicitPath=std::getenv("WWHD_VK_PIPELINE_CACHE")) {
+  const auto explicitStorage=path_environment_utf8("WWHD_VK_PIPELINE_CACHE");
+  const auto shaderStorage=path_environment_utf8("WWHD_SHADER_CACHE");
+  const auto directoryStorage=path_environment_utf8("WWHD_VK_PIPELINE_CACHE_DIR");
+  if (const char* explicitPath=explicitStorage ? explicitStorage->c_str() : nullptr) {
     if (std::strcmp(explicitPath,"0")) {
       pipelineCachePath=explicitPath;
 #ifdef __ANDROID__
@@ -171,7 +183,12 @@ void init_pipeline_cache() try {
       pipelineCachePath = drivers::pipeline_directory()+"/"+key;
 #endif
     }
-  } else if (const char* shaderPath=std::getenv("WWHD_SHADER_CACHE");
+  } else if (directoryStorage) {
+    std::array<uint8_t,16> uuid{};
+    std::copy(std::begin(R.properties.pipelineCacheUUID),std::end(R.properties.pipelineCacheUUID),uuid.begin());
+    pipelineCachePath=*pipeline_cache_override(std::nullopt,directoryStorage,
+        R.properties.vendorID,R.properties.deviceID,uuid);
+  } else if (const char* shaderPath=shaderStorage ? shaderStorage->c_str() : nullptr;
              !shaderPath || std::strcmp(shaderPath,"0")) {
     char ids[32];
     std::snprintf(ids,sizeof ids,"vulkan-%08x-%08x-",R.properties.vendorID,R.properties.deviceID);
@@ -200,11 +217,11 @@ void init_pipeline_cache() try {
   std::vector<uint8_t> bytes;
   if (!pipelineCachePath.empty()) {
     std::error_code ec;
-    uintmax_t size=std::filesystem::file_size(pipelineCachePath,ec);
+    uintmax_t size=std::filesystem::file_size(std::filesystem::u8path(pipelineCachePath),ec);
     if (!ec && size>=pipelineCacheWrapperSize+16+VK_UUID_SIZE &&
         size<=maxPipelineCacheBytes+pipelineCacheWrapperSize) {
       bytes.resize(size);
-      FILE* file=std::fopen(pipelineCachePath.c_str(),"rb");
+      FILE* file=open_utf8_file(pipelineCachePath,"rb");
       if (file) {
         if (std::fread(bytes.data(),1,bytes.size(),file)!=bytes.size() ||
             std::fgetc(file)!=EOF || std::ferror(file)) bytes.clear();
@@ -228,11 +245,43 @@ void init_pipeline_cache() try {
     LOG("[vulkan cache] loaded %zu bytes; persistence %s",bytes.size(),
         pipelineCachePath.empty()?"disabled":pipelineCachePath.c_str());
   }
+  if (async_pipeline_enabled()) start_pipeline_demand(R.device, bytes);
+  if (!pipelineCachePath.empty()) {
+    PipelineRecipeFingerprint fingerprint{};
+    auto put = [&](size_t at, uint32_t value) {
+      for (int i = 0; i < 4; ++i) fingerprint[at + i] = uint8_t(value >> (i * 8));
+    };
+    put(0, R.properties.vendorID); put(4, R.properties.deviceID);
+    put(8, R.properties.driverVersion);
+    std::memcpy(fingerprint.data() + 12, R.properties.pipelineCacheUUID, VK_UUID_SIZE);
+    uint64_t features = pipeline_cache_checksum(reinterpret_cast<const uint8_t*>(&R.enabledFeatures), sizeof R.enabledFeatures);
+    // Local recipes are runtime-build-specific as well as device-specific.
+    // The full current fixed state is independently checked at handoff.
+    for (const char* tag : {build::commit(), build::version(), WWHD_PIPELINE_RUNTIME_ID}) {
+      for (const unsigned char* c = reinterpret_cast<const unsigned char*>(tag); *c; ++c)
+        features = (features ^ *c) * 1099511628211ull;
+      features = (features ^ 0xffu) * 1099511628211ull;
+    }
+    for (int i = 0; i < 8; ++i) fingerprint[28 + i] = uint8_t(features >> (8 * i));
+    put(36, R.properties.limits.maxDescriptorSetUniformBuffersDynamic);
+    put(40, 3); // Runtime-build identity, portable content IDs, exact descriptors and fixed-state recipe schema.
+    put(44, (R.portabilitySubset ? 1u : 0u) | (R.separateStencilMaskRef ? 2u : 0u) |
+        (R.constantAlphaColorBlendFactors ? 4u : 0u) | (R.vertexAttributeAccessBeyondStride ? 8u : 0u));
+    const char* warmup = std::getenv("WWHD_VK_PIPELINE_WARMUP");
+    if (!warmup || std::strcmp(warmup, "0")) try {
+      const auto headstart=path_environment_utf8("WWHD_HEADSTART");
+      start_pipeline_worker(R.device, fingerprint, pipelineCachePath + ".recipes", bytes,
+          headstart ? *headstart : config::game_dir + "/shadercache/headstart.bin");
+    } catch (const std::exception& error) {
+      LOG("[vulkan warmup] could not start worker: %s", error.what());
+    }
+  }
 } catch (const std::exception& error) {
   pipelineCachePath.clear();
   VkPipelineCacheCreateInfo ci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
-  if (vkCreatePipelineCache(R.device,&ci,nullptr,&R.pipelineCache)!=VK_SUCCESS)
+  if (!R.pipelineCache && vkCreatePipelineCache(R.device,&ci,nullptr,&R.pipelineCache)!=VK_SUCCESS)
     R.pipelineCache=VK_NULL_HANDLE;
+  if (async_pipeline_enabled()) start_pipeline_demand(R.device, {});
   LOG("[vulkan cache] load disabled after error: %s",error.what());
 }
 // profWait: also report the wait to the render-thread profiler (render_prof.h)
@@ -272,11 +321,10 @@ PipelineCacheWriteResult write_pipeline_cache(std::vector<uint8_t> bytes,
     result.checksumMs=std::chrono::duration<double,std::milli>(
         std::chrono::steady_clock::now()-start).count();
     std::error_code ec;
-    auto parent=std::filesystem::path(path).parent_path();
+    auto parent=std::filesystem::u8path(path).parent_path();
     if (!parent.empty()) std::filesystem::create_directories(parent,ec);
     if (ec) exception_report::raise(ec.message());
-    temporary=path+".tmp-"+std::to_string(start.time_since_epoch().count());
-    FILE* file=std::fopen(temporary.c_str(),"wb");
+    FILE* file=open_atomic_temporary(path,temporary);
     if (file) {
       bool written=std::fwrite(wrapper.data(),1,wrapper.size(),file)==wrapper.size();
       if (written) written=std::fwrite(bytes.data(),1,bytes.size(),file)==bytes.size();
@@ -284,13 +332,13 @@ PipelineCacheWriteResult write_pipeline_cache(std::vector<uint8_t> bytes,
       if (written) result.written=host::replace_file(temporary,path);
     }
     if (!result.written) {
-      std::filesystem::remove(temporary,ec);
+      std::filesystem::remove(std::filesystem::u8path(temporary),ec);
       result.error="file write or replacement failed";
     }
   } catch (const std::exception& error) {
     result.error=error.what();
     if (!temporary.empty()) {
-      std::error_code ec;std::filesystem::remove(temporary,ec);
+      std::error_code ec;std::filesystem::remove(std::filesystem::u8path(temporary),ec);
     }
   }
   result.elapsedMs=std::chrono::duration<double,std::milli>(
@@ -338,9 +386,14 @@ void checkpoint_pipeline_cache() try {
   LOG("[vulkan cache] checkpoint skipped after error: %s",error.what());
 }
 } // namespace
-void save_pipeline_cache() try {
+void save_pipeline_cache(bool shutdown) try {
   // Explicit shutdown/checkpoint waits before _Exit, then persists any newer
   // revision created while the periodic job was running.
+  drain_pending_guest_pipelines();
+  if(shutdown) save_pipeline_recipes();
+  else checkpoint_pipeline_recipes();
+  if (finish_pipeline_demand(R.pipelineCache)) R.pipelineCacheDirty = true;
+  if (merge_pipeline_worker_cache(R.pipelineCache)) R.pipelineCacheDirty = true;
   poll_pipeline_cache_write(true);
   start_pipeline_cache_write();
   poll_pipeline_cache_write(true);
@@ -576,8 +629,8 @@ static void begin_overlay_gpu_queries(VkCommandBuffer cmd, Renderer::Submission&
     }
     q.frame = R.frame; q.token = token; q.pending = true;
     submission.perfQuery = i;
-    vkCmdResetQueryPool(cmd, q.pool, 0, 2);
-    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, q.pool, 0);
+    record::vkCmdResetQueryPool(cmd, q.pool, 0, 2);
+    record::vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, q.pool, 0);
     perf::timestamp_write();
     return;
   }
@@ -729,9 +782,9 @@ VkCommandBuffer command_buffer() {
     begin_overlay_gpu_queries(R.cmd, R.submissions[R.activeSubmission]);
     if (R.gpuTimestampsEnabled) {
       auto& slot = R.submissions[R.activeSubmission];
-      vkCmdResetQueryPool(R.cmd, slot.timestampQueries, 0,
+      record::vkCmdResetQueryPool(R.cmd, slot.timestampQueries, 0,
           R.gpuPassTimestampsEnabled ? 2 + 2 * Renderer::Submission::maxGpuScopes : 2);
-      vkCmdWriteTimestamp(R.cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, slot.timestampQueries, 0);
+      record::vkCmdWriteTimestamp(R.cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, slot.timestampQueries, 0);
       slot.timestampRecorded = true;
       slot.timestampFrame = R.frame;
     }
@@ -746,7 +799,7 @@ static GpuScopeToken begin_gpu_scope(const GpuScopeMetadata& metadata) {
   if(slot.gpuScopeCount==Renderer::Submission::maxGpuScopes) { ++gpuScopeTotals.dropped;return {}; }
   const uint32_t index=slot.gpuScopeCount++;
   slot.gpuScopes[index]={metadata,0,R.submissionGeneration,false};
-  vkCmdWriteTimestamp(cmd,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,slot.timestampQueries,2+2*index);
+  record::vkCmdWriteTimestamp(cmd,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,slot.timestampQueries,2+2*index);
   return {R.submissionGeneration,index};
 }
 static void end_gpu_scope(GpuScopeToken token) {
@@ -755,7 +808,7 @@ static void end_gpu_scope(GpuScopeToken token) {
   if(token.index>=slot.gpuScopeCount || slot.gpuScopes[token.index].ended ||
       slot.gpuScopes[token.index].generation!=token.generation) return;
   if(R.rendering) { ++gpuScopeTotals.dropped;return; }
-  vkCmdWriteTimestamp(R.cmd,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,slot.timestampQueries,3+2*token.index);
+  record::vkCmdWriteTimestamp(R.cmd,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,slot.timestampQueries,3+2*token.index);
   slot.gpuScopes[token.index].ended=true;
 }
 void gpu_begin_render_scope(const std::array<Surface*,8>& colors,Surface* depth,
@@ -791,7 +844,7 @@ GpuScopeToken gpu_begin_feedback_scope(const Surface& source) {
 void gpu_end_feedback_scope(GpuScopeToken token) { end_gpu_scope(token); }
 void end_encoder() {
   if (R.rendering) {
-    vkCmdEndRendering(R.cmd);
+    record::vkCmdEndRendering(R.cmd);
     R.rendering = false;
     R.passTracked = false;
     if(R.gpuPassTimestampsEnabled) {
@@ -804,15 +857,12 @@ void end_encoder() {
 bool narrow_barriers() {
   static const bool enabled = [] {
     const char* e = std::getenv("WWHD_VK_NARROW_BARRIERS");
-    // Precise resource dependencies: on by default on Android (tile-based GPUs, where the gain is
-    // expected; device numbers pending), opt-in on desktop until native Windows/Linux drivers have
-    // been checked (neutral on MoltenVK). WWHD_VK_NARROW_BARRIERS=1|0 overrides it everywhere.
+    // Precise resource dependencies: opt-in everywhere (WWHD_VK_NARROW_BARRIERS=1). Measured on an
+    // OnePlus 8 Pro (Adreno 650, Mesa Turnip, issue #104): no speed difference, but device-lost in 4 of
+    // 10 runs with them on and 0 of 18 with them off or with Turnip's sysmem rendering; neutral on
+    // MoltenVK. WWHD_VK_NARROW_BARRIERS=1|0 overrides the default.
     if (e && *e) return std::strcmp(e, "0") != 0;
-#ifdef __ANDROID__
-    return true;
-#else
     return false;
-#endif
   }();
   return enabled;
 }
@@ -826,7 +876,7 @@ void transition_buffer(Buffer& buffer, VkPipelineStageFlags stage, VkAccessFlags
   b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
   b.buffer = buffer.buffer;
   b.size = VK_WHOLE_SIZE;
-  vkCmdPipelineBarrier(command_buffer(), d.source, d.destination, 0, 0, nullptr, 1, &b, 0, nullptr);
+  record::vkCmdPipelineBarrier(command_buffer(), d.source, d.destination, 0, 0, nullptr, 1, &b, 0, nullptr);
 }
 void transition_image(Surface *s, VkImageLayout layout,
                       VkPipelineStageFlags stage, VkAccessFlags access) {
@@ -858,10 +908,59 @@ void transition_image(Surface *s, VkImageLayout layout,
   b.srcAccessMask = narrow_barriers() ? dependency.sourceAccess :
       (s->layout == VK_IMAGE_LAYOUT_UNDEFINED ? 0 : VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
   b.dstAccessMask = access;
-  vkCmdPipelineBarrier(command_buffer(), narrow_barriers() ? dependency.source :
+  record::vkCmdPipelineBarrier(command_buffer(), narrow_barriers() ? dependency.source :
       (s->layout == VK_IMAGE_LAYOUT_UNDEFINED ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT),
       stage, 0, 0, nullptr, 0, nullptr, 1, &b);
   s->layout = layout;
+}
+static VkResult initialize_submission_queries(Renderer::Submission& slot,bool passes) {
+  VkQueryPoolCreateInfo info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+  info.queryType=VK_QUERY_TYPE_TIMESTAMP;
+  info.queryCount=passes ? 2+2*Renderer::Submission::maxGpuScopes : 2;
+  return vkCreateQueryPool(R.device,&info,nullptr,&slot.timestampQueries);
+}
+bool begin_exact_preparation() {
+  if(!active_deferred_commands)deferred_commands().start_capture();
+  return active_deferred_commands!=nullptr;
+}
+static void destroy_unsubmitted_slot(Renderer::Submission& slot) {
+  if(slot.timestampQueries) vkDestroyQueryPool(R.device,slot.timestampQueries,nullptr);
+  const auto destroyDescriptors=reinterpret_cast<PFN_vkDestroyDescriptorPool>(vkGetDeviceProcAddr(R.device,"vkDestroyDescriptorPool"));
+  const auto destroyFence=reinterpret_cast<PFN_vkDestroyFence>(vkGetDeviceProcAddr(R.device,"vkDestroyFence"));
+  const auto destroyCommands=reinterpret_cast<PFN_vkDestroyCommandPool>(vkGetDeviceProcAddr(R.device,"vkDestroyCommandPool"));
+  if(slot.descriptorPool && destroyDescriptors) destroyDescriptors(R.device,slot.descriptorPool,nullptr);
+  if(slot.fence && destroyFence) destroyFence(R.device,slot.fence,nullptr);
+  if(slot.commandPool && destroyCommands) destroyCommands(R.device,slot.commandPool,nullptr);
+}
+static VkResult try_initialize_submission(Renderer::Submission& slot) {
+  VkCommandPoolCreateInfo pool{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+  pool.queueFamilyIndex=R.queueFamily;
+  pool.flags=VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+  VkResult result=vkCreateCommandPool(R.device,&pool,nullptr,&slot.commandPool);
+  if(result!=VK_SUCCESS)return result;
+  VkCommandBufferAllocateInfo ca{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  ca.commandPool=slot.commandPool;ca.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY;ca.commandBufferCount=1;
+  result=vkAllocateCommandBuffers(R.device,&ca,&slot.cmd);
+  if(result!=VK_SUCCESS)return result;
+  VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};fi.flags=VK_FENCE_CREATE_SIGNALED_BIT;
+  result=vkCreateFence(R.device,&fi,nullptr,&slot.fence);
+  if(result!=VK_SUCCESS)return result;
+  VkDescriptorPoolSize sizes[]={{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,65536},
+    {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,32768},{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,32768},
+    {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,65536}};
+  VkDescriptorPoolCreateInfo dp{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+  dp.maxSets=32768;dp.poolSizeCount=std::size(sizes);dp.pPoolSizes=sizes;
+  return vkCreateDescriptorPool(R.device,&dp,nullptr,&slot.descriptorPool);
+}
+void initialize_submission(Renderer::Submission& slot) {
+  vk_check(try_initialize_submission(slot),"initialize submission slot");
+}
+static void resolve_retained_submission(Renderer::Submission& slot) {
+  if(slot.retainedUnsubmitted) {
+    if(!slot.deferredOwner)throw std::logic_error("retained submission has no command owner");
+    slot.deferredOwner->finish_exact();
+    if(slot.retainedUnsubmitted)throw std::logic_error("submission boundary was not emitted");
+  }
 }
 static void cleanup_submission(Renderer::Submission& slot) {
   for (auto& complete : slot.completions) complete();
@@ -894,6 +993,7 @@ static void cleanup_submission(Renderer::Submission& slot) {
   ++R.submissionGeneration;
 }
 static void retire_submission(Renderer::Submission& slot, WaitTiming& timing=submitWait) {
+  resolve_retained_submission(slot);
   if (!slot.pending) return;
   VkResult status=timed_call(fenceStatusTiming,[&] { return vkGetFenceStatus(R.device,slot.fence); });
   if (status==VK_NOT_READY) {
@@ -924,6 +1024,8 @@ static void activate_submission(size_t index) {
   R.recording=false;R.rendering=false;R.passTracked=false;
 }
 static void drain_submissions() {
+  if(active_deferred_commands)active_deferred_commands->finish_exact();
+  for(auto& slot:R.submissions)resolve_retained_submission(slot);
   // A fence signal covers earlier submissions on this same graphics queue.
   // Wait once at the newest pending fence rather than waking at each older
   // fence in ring-array order. Keep each slot's status check and fenced cleanup.
@@ -933,63 +1035,98 @@ static void drain_submissions() {
   if (newest) retire_submission(*newest);
   for (auto& slot:R.submissions) retire_submission(slot);
 }
+// Overflow is allocated only when a captured tail prevents ring reuse. Slot
+// addresses and screenshot indices stay stable; the total is strictly bounded.
+static size_t next_submission_slot() {
+  const size_t next=(R.activeSubmission+1)%R.submissions.size();
+  if(!R.submissions[next].retainedUnsubmitted)return next;
+  constexpr size_t maxRetainedSlots=16;
+  if(R.submissions.size()<maxRetainedSlots) {
+    bool appended=false;
+    try {
+      R.submissions.emplace_back();appended=true;
+      auto& slot=R.submissions.back();
+      VkResult result=try_initialize_submission(slot);
+      if(result==VK_SUCCESS && R.gpuTimestampsEnabled)
+        result=initialize_submission_queries(slot,R.gpuPassTimestampsEnabled);
+      if(result==VK_SUCCESS)return R.submissions.size()-1;
+      destroy_unsubmitted_slot(slot);R.submissions.pop_back();appended=false;
+      LOG("[vulkan deferred] overflow slot unavailable (%d); resolving Exact",int(result));
+    } catch(const std::bad_alloc&) {
+      if(appended) { destroy_unsubmitted_slot(R.submissions.back());R.submissions.pop_back(); }
+    }
+  }
+  resolve_retained_submission(R.submissions[next]);
+  return next;
+}
 static void submit(VkSemaphore wait = VK_NULL_HANDLE,
                    VkSemaphore signal = VK_NULL_HANDLE, bool asynchronous=false) {
-  if (!R.recording)
-    return;
+  if (!R.recording)return;
+  // Presentation owns externally synchronized semaphores: finish the entire
+  // ordered CPU tail before handing those semaphores to Vulkan.
+  bool externalSync=wait || signal;
+#ifdef __ANDROID__
+  externalSync=externalSync || secondarySnapshotWait || secondarySnapshotSignal;
+#endif
+  if(externalSync && active_deferred_commands)active_deferred_commands->finish_exact();
   end_encoder();
-  auto& recordingSlot = R.submissions[R.activeSubmission];
-  if (recordingSlot.perfQuery != UINT32_MAX) {
-    auto& q = overlayGpuQueries[recordingSlot.perfQuery];
-    vkCmdWriteTimestamp(R.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, q.pool, 1);
-    perf::timestamp_write();
-    recordingSlot.perfQuery = UINT32_MAX;
-  }
-  if (recordingSlot.timestampRecorded)
-    vkCmdWriteTimestamp(R.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-                        recordingSlot.timestampQueries, 1);
-  vk_check(timed_call(commandEndTiming,[&] { return vkEndCommandBuffer(R.cmd); }), "end command buffer");
-  vk_check(timed_call(fenceResetTiming,[&] { return vkResetFences(R.device, 1, &R.fence); }), "reset fence");
-  std::array<VkPipelineStageFlags,2> stages{VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT};
-  std::array<VkSemaphore,2> waits{};
-  VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-  si.commandBufferCount = 1;
-  si.pCommandBuffers = &R.cmd;
-  if(wait)waits[si.waitSemaphoreCount++]=wait;
-#ifdef __ANDROID__
-  if(secondarySnapshotWait)waits[si.waitSemaphoreCount++]=secondarySnapshotWait;
-#endif
-  si.pWaitSemaphores=waits.data();si.pWaitDstStageMask=stages.data();
-  std::array<VkSemaphore,2> signals{};
-  if(signal)signals[si.signalSemaphoreCount++]=signal;
-#ifdef __ANDROID__
-  if(secondarySnapshotSignal)signals[si.signalSemaphoreCount++]=secondarySnapshotSignal;
-#endif
-  si.pSignalSemaphores=signals.data();
-  vk_check(timed_call(queueSubmitTiming, [&] {
-    return vkQueueSubmit(R.queue, 1, &si, R.fence);
-  }), "submit graphics");
-#ifdef __ANDROID__
-  const bool isolatedSnapshotQueued=secondarySnapshotSignal && isolatedSecondary && isolatedSecondary->prepared();
-  if(isolatedSnapshotQueued)isolatedSecondary->primary_submitted();
-  secondarySnapshotSignal=secondarySnapshotWait=VK_NULL_HANDLE;
-#endif
-  R.recording=false;
   auto& slot=R.submissions[R.activeSubmission];
+  if (slot.perfQuery != UINT32_MAX) {
+    auto& q = overlayGpuQueries[slot.perfQuery];
+    record::vkCmdWriteTimestamp(R.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, q.pool, 1);
+    perf::timestamp_write();slot.perfQuery=UINT32_MAX;
+  }
+  if (slot.timestampRecorded)
+    record::vkCmdWriteTimestamp(R.cmd,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,slot.timestampQueries,1);
+  auto* owner=active_deferred_commands;
   static uint64_t nextSubmissionSerial=0;
-  slot.serial=++nextSubmissionSerial;
+  const auto seal=[&slot,owner]() noexcept {
+    slot.serial=++nextSubmissionSerial;
+    slot.uploadBlocks=std::move(R.uploadBlocks);
+    slot.completions=std::move(R.completions);
+    slot.garbageBuffers=std::move(R.garbageBuffers);
+    slot.garbageImages=std::move(R.garbageImages);
+    slot.garbageCacheRegions=std::move(R.garbageCacheRegions);
+    slot.retainedUnsubmitted=true;slot.deferredOwner=owner;
+    R.recording=false;
+  };
+  const size_t slotIndex=R.activeSubmission;
 #ifdef __ANDROID__
-  if(isolatedSnapshotQueued)isolatedSnapshotSubmission=std::pair{R.activeSubmission,slot.serial};
+  const auto snapshotWait=secondarySnapshotWait,snapshotSignal=secondarySnapshotSignal;
+  secondarySnapshotWait=secondarySnapshotSignal=VK_NULL_HANDLE;
 #endif
-  slot.uploadBlocks=std::move(R.uploadBlocks);
-  slot.completions=std::move(R.completions);
-  slot.garbageBuffers=std::move(R.garbageBuffers);
-  slot.garbageImages=std::move(R.garbageImages);
-  slot.garbageCacheRegions=std::move(R.garbageCacheRegions);
-  slot.pending=true;
-  if (asynchronous) {
-    activate_submission((R.activeSubmission+1)%R.submissions.size());
-  } else {
+  const auto execute=[&slot,wait,signal,slotIndex
+#ifdef __ANDROID__
+    ,snapshotWait,snapshotSignal
+#endif
+  ] {
+    // Use the sealed slot, never the aliases of a newer active recording.
+    vk_check(timed_call(commandEndTiming,[&]{return vkEndCommandBuffer(slot.cmd);}),"end command buffer");
+    vk_check(timed_call(fenceResetTiming,[&]{return vkResetFences(R.device,1,&slot.fence);}),"reset fence");
+    std::array<VkPipelineStageFlags,2> stages{VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT};
+    std::array<VkSemaphore,2> waits{},signals{};
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount=1;si.pCommandBuffers=&slot.cmd;
+    if(wait)waits[si.waitSemaphoreCount++]=wait;
+    if(signal)signals[si.signalSemaphoreCount++]=signal;
+#ifdef __ANDROID__
+    if(snapshotWait)waits[si.waitSemaphoreCount++]=snapshotWait;
+    if(snapshotSignal)signals[si.signalSemaphoreCount++]=snapshotSignal;
+#endif
+    si.pWaitSemaphores=waits.data();si.pWaitDstStageMask=stages.data();si.pSignalSemaphores=signals.data();
+    vk_check(timed_call(queueSubmitTiming,[&]{return vkQueueSubmit(R.queue,1,&si,slot.fence);}),"submit graphics");
+#ifdef __ANDROID__
+    if(snapshotSignal && isolatedSecondary && isolatedSecondary->prepared()) {
+      isolatedSecondary->primary_submitted();
+      isolatedSnapshotSubmission=std::pair{slotIndex,slot.serial};
+    }
+#endif
+    slot.pending=true;slot.retainedUnsubmitted=false;slot.deferredOwner=nullptr;
+  };
+  if(owner)owner->owned_boundary(seal,execute);
+  else { seal();execute(); }
+  if(asynchronous)activate_submission(next_submission_slot());
+  else {
     retire_submission(slot,wait ? presentSubmitWait : submitWait);
     activate_submission(R.activeSubmission);
   }
@@ -1002,6 +1139,7 @@ void flush_async() {
   submit(VK_NULL_HANDLE,VK_NULL_HANDLE,true);
 }
 void flush() {
+  if(active_deferred_commands)active_deferred_commands->finish_exact();
   if (!R.recording && (!R.garbageBuffers.empty() || !R.garbageImages.empty() ||
                        !R.garbageCacheRegions.empty())) command_buffer();
   submit();
@@ -1033,6 +1171,7 @@ static void retire_secondary_swapchain(bool surface);
 static bool secondary_retirement_available();
 #endif
 static void make_swapchain(Screen &s) {
+  if(active_deferred_commands)active_deferred_commands->finish_exact();
 #ifdef __ANDROID__
   if (&s == &R.tv) {
     // Primary views only reference graphics-queue work. Do not synchronize
@@ -1075,7 +1214,7 @@ static void make_swapchain(Screen &s) {
 #else
   // AppKit windows: like the Metal layer, an sRGB drawable only for an sRGB scan buffer (the
   // composition, overlay blending included, then matches the Metal renderer's)
-  const VkFormat preferred = s.srgb ? VK_FORMAT_B8G8R8A8_SRGB : VK_FORMAT_B8G8R8A8_UNORM;
+  const VkFormat preferred = s.scanSrgb ? VK_FORMAT_B8G8R8A8_SRGB : VK_FORMAT_B8G8R8A8_UNORM;
 #endif
   for (auto f : fs) {
     VkFormatProperties props;
@@ -1233,6 +1372,7 @@ static void recover_primary_surface() {
 }
 
 static void recreate_surface(Screen &s) {
+  if(active_deferred_commands)active_deferred_commands->finish_exact();
   if (!SDL_GetPointerProperty(SDL_GetWindowProperties(s.window),
                               SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, nullptr)) {
     surfaceRecreate = true;  // the new native surface is not there yet: next frame
@@ -1376,7 +1516,7 @@ static void prepare_secondary_snapshot() {
     end_encoder();
     transition_image(scan,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_READ_BIT);
     isolatedSecondary->record_snapshot(command_buffer(),scan->image,scan->fmt.pixel,{scan->extent.width,scan->extent.height});
-    isolatedSourceLinear=source.srgb.load() || scan->fmt.pixel==VK_FORMAT_R8G8B8A8_SRGB ||
+    isolatedSourceLinear=source.scanSrgb || scan->fmt.pixel==VK_FORMAT_R8G8B8A8_SRGB ||
         scan->fmt.pixel==VK_FORMAT_B8G8R8A8_SRGB || scan->fmt.pixel==VK_FORMAT_A8B8G8R8_SRGB_PACK32;
     secondarySnapshotWait=isolatedSecondary->snapshot_wait();
     secondarySnapshotSignal=isolatedSecondary->snapshot_signal();
@@ -1390,14 +1530,14 @@ static void prepare_secondary_snapshot() {
   if(!scan || !scan->image)return;
   prepare_secondary_drawing(*scan);
   auto draw=prepare_present_image(R.drc,secondaryAcquired->image,secondaryDrawing.snapshot,
-      sourceScreen.srgb.load(),scale_filter(),fxaa_enabled());
+      sourceScreen.scanSrgb,scale_filter(),fxaa_enabled());
   if(!draw)return;
   auto& snapshot=secondaryDrawing.snapshot;
   transition_image(scan,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_READ_BIT);
   transition_image(&snapshot,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_WRITE_BIT);
   VkImageCopy copy{};copy.srcSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};
   copy.dstSubresource=copy.srcSubresource;copy.extent=scan->extent;
-  vkCmdCopyImage(command_buffer(),scan->image,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+  record::vkCmdCopyImage(command_buffer(),scan->image,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
       snapshot.image,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&copy);
   transition_image(&snapshot,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,VK_ACCESS_SHADER_READ_BIT);
   secondaryPreparedDraw=*draw;
@@ -1732,14 +1872,15 @@ static bool screen_has_window(const Screen& s) {
 #endif
   return s.window != nullptr;
 }
-static void present(Screen &s) {
+static bool present(Screen &s) {
+  if(active_deferred_commands)active_deferred_commands->finish_exact();
 #ifdef __ANDROID__
   if(&s==&R.drc && isolatedSecondary) {
-    if(isolatedSecondary->busy()) { ++R.secondaryPresentSkipped;return; }
+    if(isolatedSecondary->busy()) { ++R.secondaryPresentSkipped;return false; }
     if(!isolatedSecondary->acquired() && R.drc.visible && gfx::g_has_drc_window) {
       isolatedSecondary->acquire();R.secondaryPresentPending=R.secondaryAcquirePending=true;
     }
-    return;
+    return false;
   }
 #endif
 #ifdef __ANDROID__
@@ -1752,13 +1893,13 @@ static void present(Screen &s) {
     if (surfaceRecreate.exchange(false))
       recreate_surface(s);
     if (surfaceLost || !s.surface)
-      return;
+      return false;
   }
 #endif
 #ifdef __ANDROID__
-  if (&s == &R.drc && R.secondaryPresentPending) { ++R.secondaryPresentSkipped;return; }
+  if (&s == &R.drc && R.secondaryPresentPending) { ++R.secondaryPresentSkipped;return false; }
   if (&s == &R.drc && !workerAcquired && R.secondaryPresentFences && !secondary_retirement_available() &&
-      (s.resize || !s.swapchain || s.presentWanted != effective_present_mode())) return;
+      (s.resize || !s.swapchain || s.presentWanted != effective_present_mode())) return false;
 #endif
   // Presentation changed (settings overlay): a new swapchain, as for a resize (also for a window that
   // is not shown right now, so the next frame it shows uses the new mode)
@@ -1767,7 +1908,7 @@ static void present(Screen &s) {
   Surface* scan = presentation_source_screen(s).scan.get();
   if (!screen_has_window(s) || !s.visible || s.width <= 0 || s.height <= 0 || !scan ||
       !scan->image)
-    return;
+    return false;
   const auto& sourceFormat = format_properties(scan->fmt.pixel);
   if (!(sourceFormat.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT))
     exception_report::raise(
@@ -1780,7 +1921,7 @@ static void present(Screen &s) {
                         ? VK_FILTER_LINEAR
                         : VK_FILTER_NEAREST;
 #ifndef WWHD_SDL_HOST
-  if (s.swapchain && (s.swapFormat == VK_FORMAT_B8G8R8A8_SRGB) != s.srgb.load())
+  if (s.swapchain && (s.swapFormat == VK_FORMAT_B8G8R8A8_SRGB) != s.scanSrgb)
     s.resize = true;  // the scan buffer's encoding changed (GX2SetTVBuffer)
 #endif
 #ifdef __ANDROID__
@@ -1793,22 +1934,22 @@ static void present(Screen &s) {
         if(const auto* failure=dynamic_cast<const VulkanFailure*>(&e)) {
           if(failure->result==VK_ERROR_SURFACE_LOST_KHR) {
             secondary_surface_lost();
-            return;
+            return false;
           }
           if(failure->result==VK_ERROR_OUT_OF_DATE_KHR) {
             s.resize=true;
-            return;
+            return false;
           }
         }
         s.visible = false;
         gfx::g_has_drc_window = false;
-        return;
+        return false;
       }
       LOG("[vulkan] no swapchain (%s); waiting for a new surface", e.what());
       // Fast Activity replacement can coalesce pause/resume without a new
       // foreground event. Retry against SDL's current native surface ourselves.
       recover_primary_surface();
-      return;
+      return false;
     }
   }
 #else
@@ -1831,7 +1972,7 @@ static void present(Screen &s) {
     auto& candidate=secondaryPresentFences[nextSecondaryPresentFence];
     if(candidate.pending) {
       VkResult status=timed_call(fenceStatusTiming,[&] { return vkGetFenceStatus(R.device,candidate.fence); });
-      if(status==VK_NOT_READY)return;
+      if(status==VK_NOT_READY)return false;
       vk_check(status,"secondary presentation completion");candidate.pending=false;
     }
     if(!candidate.fence) {
@@ -1858,7 +1999,7 @@ static void present(Screen &s) {
       if (secondary) {
         const VkResult ready = timed_call(fenceStatusTiming,[&] { return vkGetFenceStatus(R.device, previous.fence); });
         if (ready == VK_NOT_READY)
-          return;
+          return false;
         vk_check(ready, "secondary acquire semaphore completion");
       }
       retire_submission(previous);
@@ -1907,7 +2048,7 @@ static void present(Screen &s) {
     });
     R.secondaryPresentPending=true;
     R.secondaryAcquirePending=true;
-    return;
+    return false;
   } else
 #endif
   ar = timed_call(timing.acquire, [&] {
@@ -1920,16 +2061,16 @@ static void present(Screen &s) {
   // No image was acquired and the semaphore remains unsignalled. Leave it
   // available for another frame; submitting a wait here would deadlock.
   if (ar == VK_NOT_READY || ar == VK_TIMEOUT)
-    return;
+    return false;
   if (ar == VK_ERROR_OUT_OF_DATE_KHR) {
     s.resize = true;
-    return;
+    return false;
   }
 #ifdef __ANDROID__
   if (ar == VK_ERROR_SURFACE_LOST_KHR) {
     if (&s == &R.tv) recover_primary_surface();
     else secondary_surface_lost();
-    return;
+    return false;
   }
 #endif
   if (ar != VK_SUBOPTIMAL_KHR)
@@ -1963,6 +2104,7 @@ static void present(Screen &s) {
       s.layouts[index]=VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
       const VkQueue queue=R.secondaryQueue;
       secondaryPresentWorker->submit([draw=*draw,acquireSemaphore,finished,swapchain,presentCompletion,index,queue] {
+        IsolatedCommandDispatch isolated;
         auto& state=secondaryDrawing;
         vk_check(vkResetCommandPool(draw.device,state.pool,0),"reset secondary command pool");
         vk_check(vkResetDescriptorPool(draw.device,state.descriptors,0),"reset secondary descriptor pool");
@@ -1993,7 +2135,7 @@ static void present(Screen &s) {
             std::chrono::steady_clock::now()-start).count())};
       });
       R.secondaryPresentPending=true;
-      return;
+      return false;
     }
   }
 #endif
@@ -2013,17 +2155,17 @@ static void present(Screen &s) {
     b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     auto cmd = command_buffer();
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+    record::vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                          VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
                          nullptr, 1, &b);
     VkClearColorValue black{};
-    vkCmdClearColorImage(cmd, s.images[index],
+    record::vkCmdClearColorImage(cmd, s.images[index],
                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1,
                          &b.subresourceRange);
     // Clear and blit overlap the swap image. Order the two transfer writes.
     b.oldLayout = b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     b.srcAccessMask = b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+    record::vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
                          VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
                          nullptr, 1, &b);
     const float ratio =
@@ -2039,14 +2181,14 @@ static void present(Screen &s) {
     blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     blit.dstOffsets[0] = {x, y, 0};
     blit.dstOffsets[1] = {x + w, y + h, 1};
-    vkCmdBlitImage(cmd, scan->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+    record::vkCmdBlitImage(cmd, scan->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                    s.images[index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
                    &blit, filter);
     b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     b.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
     b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     b.dstAccessMask = 0;
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+    record::vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
                          VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0,
                          nullptr, 1, &b);
     s.layouts[index] = b.newLayout;
@@ -2113,7 +2255,7 @@ static void present(Screen &s) {
           std::chrono::steady_clock::now()-started).count())};
     });
     R.secondaryPresentPending=true;
-    return;
+    return false;
   }
 #endif
   VkResult pr = timed_call(timing.present, [&] {
@@ -2146,19 +2288,20 @@ static void present(Screen &s) {
   if (!async)
     vk_check(timed_call(timing.idle, [&] { return vkQueueWaitIdle(R.queue); }, rprof::kWaitGpu),
              "present completion");
+  return pr == VK_SUCCESS || pr == VK_SUBOPTIMAL_KHR;
 }
 void copy_to_scan(uint32_t cb, uint32_t target) {
   Surface *src = surface_from_color_buffer(cb);
   if (!src)
     return;
   Screen &s = target == 4 ? R.drc : R.tv;
-  if (!s.scan || s.scan->extent.width != src->extent.width ||
-      s.scan->extent.height != src->extent.height ||
-      s.scan->fmt.pixel != src->fmt.pixel) {
-    if (s.scan)
-      destroy_surface_image(s.scan.get());
-    s.scan = std::make_unique<Surface>();
-    auto *d = s.scan.get();
+  if (!s.buildingScan || s.buildingScan->extent.width != src->extent.width ||
+      s.buildingScan->extent.height != src->extent.height ||
+      s.buildingScan->fmt.pixel != src->fmt.pixel) {
+    if (s.buildingScan)
+      destroy_surface_image(s.buildingScan.get());
+    s.buildingScan = std::make_unique<Surface>();
+    auto *d = s.buildingScan.get();
     d->width = src->extent.width;
     d->height = src->extent.height;
     d->format = src->format;
@@ -2166,10 +2309,12 @@ void copy_to_scan(uint32_t cb, uint32_t target) {
     d->scale = 1;
     create_surface_image(d, false);
   }
-  resample(src, s.scan.get(), 1);
+  resample(src, s.buildingScan.get(), 1);
   if (target & 1)
-    draw_mod_overlay(*s.scan);  // HUD of gameplay mods (stamina wheel), as the Metal renderer
-  mark_gpu_written(s.scan.get());
+    draw_mod_overlay(*s.buildingScan);  // HUD of gameplay mods (stamina wheel), as the Metal renderer
+  mark_gpu_written(s.buildingScan.get());
+  s.buildingScanSrgb = s.srgb.load();
+  s.buildingScanDirty = true;
 }
 // debug: WWHD_DUMP_FRAMES=100,300 writes the TV image of those frames to frame_<n>.png (and
 // frame_<n>_drc.png; WWHD_DUMP_PRESENT=1 adds the composed window, frame_<n>_present.png), as Metal
@@ -2178,7 +2323,7 @@ static void dump_scan(Screen &s, const std::string &path) {
     return;
   try {
     write_rgba_png(path, s.scan->extent.width, s.scan->extent.height,
-                   read_surface_rgba(*s.scan, s.srgb.load()));
+                   read_surface_rgba(*s.scan, s.scanSrgb));
     LOG("[gfx] wrote %s (%ux%u)", path.c_str(), s.scan->extent.width, s.scan->extent.height);
   } catch (const std::exception &e) {
     LOG("[gfx] cannot write %s: %s", path.c_str(), e.what());
@@ -2293,6 +2438,7 @@ static void service_screenshots() {
       continue;
     }
     // a slot reused for a newer submission retired ours first
+    if(slot.retainedUnsubmitted && slot.serial==it->serial) { ++it;continue; }
     const bool done = !slot.pending || slot.serial != it->serial || vkGetFenceStatus(R.device, slot.fence) == VK_SUCCESS;
     if (!done) {
       ++it;
@@ -2308,7 +2454,125 @@ static void service_screenshots() {
     it = pendingShots.erase(it);
   }
 }
+namespace {
+gfx::PresentPlan completedPresentPlan;
+bool completedPresentPlanValid = false;
+uint64_t nextPipelineRepeatNs = 0, lastNewPresentNs = 0;
+uint64_t pendingPresentationFrame = ~uint64_t{0};
+// Deliberately one-shot and separate from the synthetic smoke proof. Readbacks
+// perturb timing; this opt-in diagnostic must never be enabled for benchmarks.
+struct PendingPictureProof {
+  std::string directory;
+  uint64_t frame = 0, loadFrame = 0, loadStep = 0, logicStep = 0;
+  Surface* scans[2]{};
+  VkExtent3D extents[2]{};
+  std::vector<uint8_t> before[2];
+};
+PendingPictureProof begin_pending_picture_proof() {
+  static bool attempted = false;
+  const char* directory = std::getenv("WWHD_VK_PENDING_CAPTURE_DIR");
+  if (attempted || !directory || !*directory) return {};
+  const char* afterLoad = std::getenv("WWHD_VK_PENDING_CAPTURE_AFTER_LOAD");
+  if (afterLoad && std::strcmp(afterLoad, "0") && !ss::last_load_frame()) return {};
+  // Both separately published scans are required. Never inspect buildingScan.
+  if (!R.tv.scan || !R.drc.scan || !R.tv.scan->image || !R.drc.scan->image) return {};
+  attempted = true;
+  PendingPictureProof proof;
+  try {
+    proof.directory = directory;
+    proof.frame = R.frame; proof.loadFrame = ss::last_load_frame();
+    proof.loadStep = ss::last_load_step(); proof.logicStep = interp::logic_steps();
+    if (!std::filesystem::create_directories(proof.directory))
+      throw std::runtime_error("pending proof directory must be fresh");
+    Screen* screens[] = {&R.tv, &R.drc};
+    for (unsigned i = 0; i != 2; ++i) {
+      proof.scans[i] = screens[i]->scan.get();
+      proof.extents[i] = proof.scans[i]->extent;
+      const auto extent = proof.extents[i];
+      if (!extent.width || !extent.height || uint64_t(extent.width) * extent.height > 16777216)
+        throw std::runtime_error("pending capture exceeds 16 megapixels per scan");
+      proof.before[i] = read_surface_rgba(*proof.scans[i], screens[i]->scanSrgb);
+    }
+  } catch (const std::exception& error) {
+    LOG("[vulkan pending proof] capture failed: %s", error.what());
+    return {};
+  }
+  return proof;
+}
+void finish_pending_picture_proof(const PendingPictureProof& proof, bool presented) {
+  if (proof.directory.empty()) return;
+  try {
+    const bool stateUnchanged = R.frame == proof.frame && R.tv.scan.get() == proof.scans[0] &&
+                               R.drc.scan.get() == proof.scans[1];
+    if (!stateUnchanged) throw std::runtime_error("published scan or guest frame changed during repeat");
+    const char* names[] = {"tv", "gamepad"};
+    Screen* screens[] = {&R.tv, &R.drc};
+    bool exact[2]{};
+    for (unsigned i = 0; i != 2; ++i) {
+      const auto after = read_surface_rgba(*proof.scans[i], screens[i]->scanSrgb);
+      exact[i] = after == proof.before[i];
+      const auto stem = proof.directory + "/" + names[i];
+      write_rgba_png(stem + "-before.png", proof.extents[i].width, proof.extents[i].height, proof.before[i]);
+      write_rgba_png(stem + "-after.png", proof.extents[i].width, proof.extents[i].height, after);
+    }
+    const auto path = proof.directory + "/proof.json";
+    FILE* file = std::fopen(path.c_str(), "wb");
+    if (!file) throw std::runtime_error("cannot open pending proof metadata");
+    std::fprintf(file, "{\"frame\":%llu,\"load_frame\":%llu,\"load_step\":%llu,\"logic_step_before\":%llu,\"logic_step_after\":%llu,\"presented\":%s,\"guest_frame_and_scans_unchanged\":true,\"tv_exact\":%s,\"gamepad_exact\":%s,\"scope\":\"published scans; excludes composed window and overlays; readbacks perturb timing\"}\n",
+        (unsigned long long)proof.frame, (unsigned long long)proof.loadFrame,
+        (unsigned long long)proof.loadStep, (unsigned long long)proof.logicStep,
+        (unsigned long long)interp::logic_steps(), presented ? "true" : "false",
+        exact[0] ? "true" : "false", exact[1] ? "true" : "false");
+    const bool written = std::fclose(file) == 0;
+    if (!written) throw std::runtime_error("cannot write pending proof metadata");
+    LOG("[vulkan pending proof] presented=%u frame=%llu TV exact=%u GamePad exact=%u -> %s",
+        unsigned(presented), (unsigned long long)proof.frame, unsigned(exact[0]), unsigned(exact[1]), proof.directory.c_str());
+  } catch (const std::exception& error) {
+    LOG("[vulkan pending proof] capture failed: %s", error.what());
+  }
+}
+}
+void begin_pipeline_pending_frame() {
+  if (pendingPresentationFrame != R.frame) {
+    pendingPresentationFrame = R.frame;
+    // Allow the first demanded pipeline a frame budget before issuing a
+    // repeat. Normal guest pacing alone must not force an extra presentation
+    // for every small compilation. Later misses in this same frame share it.
+    nextPipelineRepeatNs = std::max(nextPipelineRepeatNs, stutter::now() + uint64_t(16666667));
+  }
+}
+void present_completed_frame_while_pipeline_pending() {
+  if(active_deferred_commands)active_deferred_commands->finish_exact();
+  const auto started = stutter::now();
+  if (!completedPresentPlanValid || started < nextPipelineRepeatNs) return;
+  // The current command stream stays paused at its exact draw. Submission of
+  // its prefix is legal, but only the separately published completed scans are
+  // sampled here; buildingScan and all guest attachments remain untouched.
+  end_encoder();
+  const auto proof = begin_pending_picture_proof();
+  set_present_plan(&completedPresentPlan);
+  bool presented = false;
+  try {
+    presented = present(R.tv);
+    if (completedPresentPlan.drc_window) presented = present(R.drc) || presented;
+    flush_async();
+  } catch (...) { set_present_plan(nullptr); throw; }
+  set_present_plan(nullptr);
+  finish_pending_picture_proof(proof, presented);
+  const auto ended = stutter::now();
+  nextPipelineRepeatNs = ended + 16666667; // At most 60 repeats/s, independent of guest progress.
+  if (presented && stutter::trace().enabled()) {
+    stutter::trace().add("repeated_frame", R.frame, 0, started, ended, 0);
+    stutter::trace().add("repeated_frame_age", R.frame, 0, lastNewPresentNs, ended, 0);
+  }
+}
 void swap() {
+  if(active_deferred_commands)active_deferred_commands->finish_exact();
+  for (Screen* s : {&R.tv, &R.drc}) if (s->buildingScanDirty) {
+    s->scan.swap(s->buildingScan);
+    s->scanSrgb = s->buildingScanSrgb;
+    s->buildingScanDirty = false;
+  }
   service_screenshots();
   const auto swapPhaseStarted=std::chrono::steady_clock::now();
 #ifdef __ANDROID__
@@ -2375,8 +2639,8 @@ void swap() {
   take_screenshots(plan);
   bool sampled[2] = {};
   if (plan.sample_auto && drcScan) {
-    sampled[0] = record_signature(0, *drcScan, R.drc.srgb.load());
-    sampled[1] = sampled[0] && tvScan && record_signature(1, *tvScan, R.tv.srgb.load());
+    sampled[0] = record_signature(0, *drcScan, R.drc.scanSrgb);
+    sampled[1] = sampled[0] && tvScan && record_signature(1, *tvScan, R.tv.scanSrgb);
   }
 #ifdef __ANDROID__
   prepare_secondary_snapshot();
@@ -2415,6 +2679,10 @@ void swap() {
   }
 #endif
   const auto swapBookkeepingStarted=std::chrono::steady_clock::now();
+  completedPresentPlan = plan;
+  completedPresentPlanValid = tvScan != nullptr;
+  lastNewPresentNs = stutter::now();
+  nextPipelineRepeatNs = lastNewPresentNs + 16666667;
   if (sampled[0]) {
     std::vector<float> d = read_signature(0), t = sampled[1] ? read_signature(1) : std::vector<float>{};
     gfx::display_auto_signature(d, sampled[1] ? &t : nullptr, R.frame + 1);
@@ -2424,7 +2692,7 @@ void swap() {
       continue;
     try {
       write_rgba_png(path, uint32_t(plan.dw), uint32_t(plan.dh),
-                     compose_offscreen(R.tv, uint32_t(plan.dw), uint32_t(plan.dh), R.tv.srgb.load()));
+                     compose_offscreen(R.tv, uint32_t(plan.dw), uint32_t(plan.dh), R.tv.scanSrgb));
       // the GamePad window's size: its swapchain, or (SDL host test runs with hidden windows, which
       // present nothing) the window's pixel size
       uint32_t drcW = R.drc.swapchain ? R.drc.swapExtent.width : 0, drcH = R.drc.swapchain ? R.drc.swapExtent.height : 0;
@@ -2436,7 +2704,7 @@ void swap() {
         std::string p = path;
         size_t dot = p.rfind(".png");
         p.insert(dot == std::string::npos ? p.size() : dot, "_drc");
-        write_rgba_png(p, drcW, drcH, compose_offscreen(R.drc, drcW, drcH, R.drc.srgb.load()));
+        write_rgba_png(p, drcW, drcH, compose_offscreen(R.drc, drcW, drcH, R.drc.scanSrgb));
       }
       gfx::display_log_present_dump(path, plan, float(tvScan->extent.width), float(tvScan->extent.height));
     } catch (const std::exception &e) {
@@ -2445,6 +2713,7 @@ void swap() {
   }
   set_present_plan(nullptr);
   service_screenshots();  // this frame's: the submission that holds them
+  stutter::frame(R.frame);
   std::atomic_ref<uint64_t>(R.frame).fetch_add(1);
   R.completed = R.frame;
 #ifdef __ANDROID__
@@ -2826,6 +3095,7 @@ static void log_instance_layers() {
 // The host has loaded the Vulkan loader's global functions (load_global_functions).
 static void init_device(std::vector<const char *> extensions,
                         const std::function<void()> &create_surfaces) {
+  load_device_setting();
   reset_pipeline_lookup_cache();
 #ifdef __APPLE__
   // This draw-heavy workload is faster with direct Metal resource bindings.
@@ -2913,47 +3183,79 @@ static void init_device(std::vector<const char *> extensions,
   std::vector<VkPhysicalDevice> devices(n);
   vkEnumeratePhysicalDevices(R.instance, &n, devices.data());
   devices.resize(n);
-  // First the GPUs with Vulkan 1.3 (in the driver's order), then those with VK_KHR_dynamic_rendering
-  std::string unsuitable;  // the GPUs passed over, for the message when none is left
-  for (DynamicRendering want : {DynamicRendering::Core, DynamicRendering::KHR}) {
-    for (auto device : devices) {
-      VkPhysicalDeviceProperties properties;
-      vkGetPhysicalDeviceProperties(device, &properties);
-      const DynamicRendering have = dynamic_rendering(device, properties, device_extensions(device));
-      if (have != want) {
-        if (want == DynamicRendering::KHR && have == DynamicRendering::None)
-          unsuitable += std::string("\n") + properties.deviceName + ": Vulkan " +
-                        version_text(device_api_version(properties)) + ", driver " +
-                        driver_version_text(properties) +
-                        (device_api_version(properties) < VK_API_VERSION_1_1 ? "; older than Vulkan 1.1"
-                                                                             : "; VK_KHR_dynamic_rendering missing");
-        continue;
+  std::string unsuitable;
+  std::vector<uint32_t> deviceQueues(devices.size(), UINT32_MAX);
+  std::vector<VkQueueFamilyProperties> deviceQueueProperties(devices.size());
+  device_inventory.clear();
+  for (size_t i = 0; i < devices.size(); ++i) {
+    auto device = devices[i];
+    VkPhysicalDeviceProperties properties;
+    vkGetPhysicalDeviceProperties(device, &properties);
+    const auto have = dynamic_rendering(device, properties, device_extensions(device));
+    DeviceInfo info;
+    info.name = properties.deviceName;
+    info.vendor = properties.vendorID;
+    info.device = properties.deviceID;
+    info.type = properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? "discrete" :
+                properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? "integrated" :
+                properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU ? "virtual" :
+                properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU ? "CPU" : "other";
+    info.driver = driver_version_text(properties);
+    info.version = version_text(device_api_version(properties));
+    info.core = have == DynamicRendering::Core;
+    if (device_api_version(properties) >= VK_API_VERSION_1_1) {
+      VkPhysicalDeviceIDProperties id{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
+      VkPhysicalDeviceProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+      props.pNext = &id;
+      vkGetPhysicalDeviceProperties2(device, &props);
+      bool nonzero = false;
+      for (auto byte : id.deviceUUID) nonzero |= byte != 0;
+      if (nonzero) {
+        info.identity = "uuid:";
+        constexpr char hex[] = "0123456789abcdef";
+        for (auto byte : id.deviceUUID) { info.identity += hex[byte >> 4]; info.identity += hex[byte & 15]; }
       }
+    }
+    if (info.identity.empty()) info.identity = "id:" + std::to_string(info.vendor) + ":" +
+        std::to_string(info.device) + ":" + info.name;
+    if (have == DynamicRendering::None)
+      info.unavailable = device_api_version(properties) < VK_API_VERSION_1_1 ?
+          "older than Vulkan 1.1" : "VK_KHR_dynamic_rendering missing";
+    else {
       uint32_t qn;
       vkGetPhysicalDeviceQueueFamilyProperties(device, &qn, nullptr);
       std::vector<VkQueueFamilyProperties> qs(qn);
       vkGetPhysicalDeviceQueueFamilyProperties(device, &qn, qs.data());
-      for (uint32_t q = 0; q < qn; q++) {
+      for (uint32_t q = 0; q < qn; ++q) {
         VkBool32 tv = 0, drc = VK_TRUE;
         vkGetPhysicalDeviceSurfaceSupportKHR(device, q, R.tv.surface, &tv);
-        if (R.drc.surface)
-          vkGetPhysicalDeviceSurfaceSupportKHR(device, q, R.drc.surface, &drc);
+        if (R.drc.surface) vkGetPhysicalDeviceSurfaceSupportKHR(device, q, R.drc.surface, &drc);
         if ((qs[q].queueFlags & VK_QUEUE_GRAPHICS_BIT) && tv && drc) {
-          R.physicalDevice = device;
-          R.formatProperties.clear();
-          R.queueFamily = q;
-          R.computeQueue = (qs[q].queueFlags & VK_QUEUE_COMPUTE_BIT) != 0;
-          R.gpuTimestampValidBits = qs[q].timestampValidBits;
-          R.dynamicRenderingKHR = have == DynamicRendering::KHR;
-          break;
+          deviceQueues[i] = q; deviceQueueProperties[i] = qs[q]; break;
         }
       }
-      if (R.physicalDevice)
-        break;
-      unsuitable += std::string("\n") + properties.deviceName + ": cannot draw to the game window";
+      if (deviceQueues[i] == UINT32_MAX) info.unavailable = "cannot draw to the game window";
     }
-    if (R.physicalDevice)
-      break;
+    LOG("[vulkan] GPU %zu: %s (%s, vendor %04x, device %04x, Vulkan %s, driver %s, %s): %s",
+        i, info.name.c_str(), info.type.c_str(), info.vendor, info.device, info.version.c_str(),
+        info.driver.c_str(), info.identity.c_str(), info.usable() ? "usable" : info.unavailable.c_str());
+    if (!info.usable()) unsuitable += "\n" + info.name + ": " + info.unavailable;
+    device_inventory.push_back(info);
+  }
+  const char* deviceEnv = getenv("WWHD_VK_DEVICE");
+  const auto choice = choose_device(device_inventory, device_setting(), deviceEnv ? deviceEnv : "");
+  if (choice.index >= 0) {
+    const auto i = size_t(choice.index);
+    R.physicalDevice = devices[i];
+    R.formatProperties.clear();
+    R.queueFamily = deviceQueues[i];
+    R.computeQueue = (deviceQueueProperties[i].queueFlags & VK_QUEUE_COMPUTE_BIT) != 0;
+    R.gpuTimestampValidBits = deviceQueueProperties[i].timestampValidBits;
+    R.dynamicRenderingKHR = !device_inventory[i].core;
+    active_device = device_inventory[i].name;
+    device_fallback = choice.fallback.empty() ? "" : choice.fallback + "; using " + active_device + ".";
+    if (!device_fallback.empty()) LOG("[vulkan] %s (%s)", device_fallback.c_str(), deviceEnv ? "env" : "setting");
+    LOG("[vulkan] chosen GPU: %s (%s)", active_device.c_str(), choice.reason.c_str());
   }
   if (!R.physicalDevice)
     exception_report::raise(
@@ -2967,6 +3269,10 @@ static void init_device(std::vector<const char *> extensions,
   LOG("[vulkan] device: %s (Vulkan %s, driver %s%s)", R.properties.deviceName,
       version_text(R.properties.apiVersion).c_str(), driver_version_text(R.properties).c_str(),
       R.dynamicRenderingKHR ? "; dynamic rendering through VK_KHR_dynamic_rendering" : "");
+  R.attachmentViewUsage =
+      attachment_view_usage_wanted(R.properties.vendorID, getenv("WWHD_VK_ATTACHMENT_VIEW_USAGE"));
+  if (R.attachmentViewUsage)
+    LOG("[vulkan] attachment views name their usage (issue #144; WWHD_VK_ATTACHMENT_VIEW_USAGE=0 turns it off)");
   if (perf_enabled()) {
     const auto& limits=R.properties.limits;
     LOG("[vulkan uniforms] dynamic/set %u; uniform/stage %u; uniform/set %u; resources/stage %u; alignment %llu; range %u",
@@ -3305,7 +3611,13 @@ void init() {
 }
 #endif
 void save_renderer_caches() {
-  // Called during orderly shutdown under the renderer execution lock.
+  // Save-only checkpoint: the guest continues after test-end checkpoints.
+  wait_idle();
+  vk::save_shader_cache();
+  save_pipeline_cache(false);
+}
+void shutdown_renderer_caches() {
+  // Destructive teardown is reserved for orderly shutdown under execution lock.
   reset_feedback_images();
   wait_idle();
   bc_decode_shutdown();
@@ -3586,7 +3898,7 @@ static void test_fullscreen_key() {
 static void quit_game() {
   audio::finish_dump();  // _Exit bypasses atexit handlers
   screenshot::finish();  // the screenshots taken are written first
-  gx2::checkpoint_vulkan_caches();
+  gx2::shutdown_vulkan_caches();
   std::_Exit(0);
 }
 static bool close_request(const SDL_Event& event) {

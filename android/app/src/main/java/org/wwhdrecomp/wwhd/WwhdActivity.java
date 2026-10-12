@@ -64,9 +64,16 @@ public class WwhdActivity extends SDLActivity {
         return onDeviceGame != null ? onDeviceGame.getAbsolutePath() : super.getMainSharedObject();
     }
 
+    protected File shaderUserDirectory() { return AndroidUserDirectories.config(getExternalFilesDir(null)); }
+
     @Override protected String[] getArguments() {
-        return selection != null && selection.game != null ?
-            new String[] {"--game", selection.game.getAbsolutePath()} : super.getArguments();
+        java.util.ArrayList<String> args = new java.util.ArrayList<>();
+        if (selection != null && selection.game != null) {
+            args.add("--game"); args.add(selection.game.getAbsolutePath());
+            args.add("--shader-prebuild-library"); args.add(selection.library.getAbsolutePath());
+        }
+        // Keep devel's external config folder; no implicit WWHD_USER_DIR override.
+        return args.toArray(new String[0]);
     }
 
     @Override protected void onResume() {

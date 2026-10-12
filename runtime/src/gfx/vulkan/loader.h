@@ -17,7 +17,7 @@
 #define WWHD_VK_INSTANCE_FUNCTIONS(X) \
   X(vkCreateDevice) X(vkDestroySurfaceKHR) X(vkEnumerateDeviceExtensionProperties) X(vkEnumeratePhysicalDevices) \
   X(vkGetDeviceProcAddr) X(vkGetPhysicalDeviceFeatures) X(vkGetPhysicalDeviceFeatures2) \
-  X(vkGetPhysicalDeviceFormatProperties) X(vkGetPhysicalDeviceMemoryProperties) X(vkGetPhysicalDeviceProperties) \
+  X(vkGetPhysicalDeviceFormatProperties) X(vkGetPhysicalDeviceMemoryProperties) X(vkGetPhysicalDeviceProperties) X(vkGetPhysicalDeviceProperties2) \
   X(vkGetPhysicalDeviceQueueFamilyProperties) X(vkGetPhysicalDeviceSurfaceCapabilitiesKHR) \
   X(vkGetPhysicalDeviceSurfaceFormatsKHR) X(vkGetPhysicalDeviceSurfacePresentModesKHR) \
   X(vkGetPhysicalDeviceSurfaceSupportKHR)
@@ -35,12 +35,12 @@
   X(vkCreatePipelineLayout) X(vkCreateQueryPool) X(vkCreateSampler) X(vkCreateSemaphore) \
   X(vkCreateShaderModule) X(vkCreateSwapchainKHR) X(vkDestroyBuffer) X(vkDestroyDescriptorSetLayout) \
   X(vkDestroyCommandPool) X(vkDestroyDescriptorPool) \
-  X(vkDestroyImage) X(vkDestroyImageView) X(vkDestroyPipeline) X(vkDestroyPipelineLayout) \
+  X(vkDestroyImage) X(vkDestroyImageView) X(vkDestroyPipeline) X(vkDestroyPipelineCache) X(vkDestroyPipelineLayout) \
   X(vkDestroyQueryPool) X(vkDestroySampler) X(vkDestroySemaphore) X(vkDestroyShaderModule) \
   X(vkDestroySwapchainKHR) X(vkDestroyFence) X(vkDeviceWaitIdle) X(vkEndCommandBuffer) X(vkFreeMemory) \
   X(vkGetBufferMemoryRequirements) X(vkGetDeviceQueue) X(vkGetFenceStatus) X(vkGetImageMemoryRequirements) \
   X(vkGetPipelineCacheData) X(vkGetQueryPoolResults) X(vkGetSwapchainImagesKHR) X(vkMapMemory) \
-  X(vkQueuePresentKHR) X(vkQueueSubmit) X(vkQueueWaitIdle) X(vkResetCommandPool) X(vkResetDescriptorPool) \
+  X(vkQueuePresentKHR) X(vkQueueSubmit) X(vkQueueWaitIdle) X(vkMergePipelineCaches) X(vkResetCommandPool) X(vkResetDescriptorPool) \
   X(vkResetFences) X(vkUnmapMemory) X(vkUpdateDescriptorSets) X(vkWaitForFences)
 // dynamic rendering: Vulkan 1.3 core, or VK_KHR_dynamic_rendering on Vulkan 1.1 / 1.2 drivers (the
 // ...KHR entry points, loaded under these names; the structures are the same)

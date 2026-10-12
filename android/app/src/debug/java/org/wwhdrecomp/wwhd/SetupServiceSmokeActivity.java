@@ -49,6 +49,7 @@ public final class SetupServiceSmokeActivity extends Activity {
                 result.put("job", id);
             } else if ("pause".equals(mode)) SetupService.start(this, SetupService.PAUSE);
             else if ("resume".equals(mode)) SetupService.start(this, SetupService.RESUME);
+            else if ("continue-heat".equals(mode)) SetupService.start(this, SetupService.CONTINUE_HEAT);
             else if ("start".equals(mode)) SetupService.start(this, null);
             else if ("synthetic-build".equals(mode)) {
                 File job = SetupStore.current(this);

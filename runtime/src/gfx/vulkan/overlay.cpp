@@ -1,9 +1,11 @@
+#include "deferred_dispatch.h"
 // The settings overlay's Dear ImGui draw data, drawn by the Vulkan renderer into the TV window's
 // composition (present.cpp compose()). The renderer's own command buffer, upload arena, descriptor
 // pool and pipeline cache are used, so the overlay needs no queue submissions of its own and works
 // for every target format (swap images in any encoding, offscreen present dumps).
 #include "../../exception_report.h"
 #include "backend.h"
+#include "pipeline_trace.h"
 #include "present.h"
 #include "shaders.h"
 #include "imgui.h"
@@ -170,7 +172,7 @@ VkPipeline pipeline(VkFormat format,bool additive=false) {
         ci.pColorBlendState = &bs;
         ci.pDynamicState = &ds;
         ci.layout = res.layout;
-        vk_check(vkCreateGraphicsPipelines(R.device, R.pipelineCache, 1, &ci, nullptr, &result), "overlay pipeline");
+        vk_check(stutter::create_graphics(R.frame, "overlay_pipeline", R.device, R.pipelineCache, 1, &ci, nullptr, &result), "overlay pipeline");
     } catch (...) {
         vkDestroyShaderModule(R.device, vs, nullptr);
         if (fs) vkDestroyShaderModule(R.device, fs, nullptr);
@@ -193,7 +195,7 @@ void barrier(VkCommandBuffer cmd, Texture& t, VkImageLayout to, VkAccessFlags sr
     auto dependency = derive_dependency(t.use, to_stage, dst, t.layout != to);
     b.srcAccessMask = narrow_barriers() ? dependency.sourceAccess : src;
     b.dstAccessMask = dst;
-    vkCmdPipelineBarrier(cmd, narrow_barriers() ? dependency.source : from_stage, to_stage, 0, 0, nullptr, 0, nullptr, 1, &b);
+    record::vkCmdPipelineBarrier(cmd, narrow_barriers() ? dependency.source : from_stage, to_stage, 0, 0, nullptr, 0, nullptr, 1, &b);
     t.layout = to;
 }
 
@@ -253,7 +255,7 @@ void update_texture(VkCommandBuffer cmd, ImTextureData* tex) {
     copy.bufferOffset = staging.offset;
     copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     copy.imageExtent = {uint32_t(tex->Width), uint32_t(tex->Height), 1};
-    vkCmdCopyBufferToImage(cmd, staging.buffer, t->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+    record::vkCmdCopyBufferToImage(cmd, staging.buffer, t->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
     barrier(cmd, *t, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
             VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
     tex->SetStatus(ImTextureStatus_OK);
@@ -288,18 +290,18 @@ void overlay_draw(ImDrawData* d, VkCommandBuffer cmd, VkFormat format, VkExtent2
         vp += l->VtxBuffer.Size;
         ip += l->IdxBuffer.Size;
     }
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline(format));
-    vkCmdBindVertexBuffers(cmd, 0, 1, &vtx.buffer, &vtx.offset);
-    vkCmdBindIndexBuffer(cmd, idx.buffer, idx.offset, sizeof(ImDrawIdx) == 2 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
+    record::vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline(format));
+    record::vkCmdBindVertexBuffers(cmd, 0, 1, &vtx.buffer, &vtx.offset);
+    record::vkCmdBindIndexBuffer(cmd, idx.buffer, idx.offset, sizeof(ImDrawIdx) == 2 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
     VkViewport viewport{0, 0, float(extent.width), float(extent.height), 0, 1};
-    vkCmdSetViewport(cmd, 0, 1, &viewport);
+    record::vkCmdSetViewport(cmd, 0, 1, &viewport);
     Params p{};
     p.scale[0] = 2.0f / d->DisplaySize.x;
     p.scale[1] = 2.0f / d->DisplaySize.y;
     p.translate[0] = -1.0f - d->DisplayPos.x * p.scale[0];
     p.translate[1] = -1.0f - d->DisplayPos.y * p.scale[1];
     p.linear = linear ? 1 : 0;
-    vkCmdPushConstants(cmd, res.layout, VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof p, &p);
+    record::vkCmdPushConstants(cmd, res.layout, VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof p, &p);
     std::unordered_map<Texture*, VkDescriptorSet> sets;
     VkDescriptorSet bound = VK_NULL_HANDLE;
     int vtx_base = 0, idx_base = 0;
@@ -307,7 +309,7 @@ void overlay_draw(ImDrawData* d, VkCommandBuffer cmd, VkFormat format, VkExtent2
         for (const ImDrawCmd& c : l->CmdBuffer) {
             if (c.UserCallback) {
                 if(c.UserCallback==overlay::guesthud::blend_callback)
-                    vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,pipeline(format,c.UserCallbackData!=nullptr));
+                    record::vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,pipeline(format,c.UserCallbackData!=nullptr));
                 continue;
             }
             float x0 = (c.ClipRect.x - d->DisplayPos.x) * sx, y0 = (c.ClipRect.y - d->DisplayPos.y) * sy;
@@ -322,7 +324,7 @@ void overlay_draw(ImDrawData* d, VkCommandBuffer cmd, VkFormat format, VkExtent2
             int linear_texture=linear&&overlay::guesthud::image_texture(uint64_t(c.GetTexID()));
             if(p.linear_texture!=linear_texture) {
                 p.linear_texture=linear_texture;
-                vkCmdPushConstants(cmd,res.layout,VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT,0,sizeof p,&p);
+                record::vkCmdPushConstants(cmd,res.layout,VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT,0,sizeof p,&p);
             }
             VkDescriptorSet& set = sets[t];
             if (!set) {
@@ -340,12 +342,12 @@ void overlay_draw(ImDrawData* d, VkCommandBuffer cmd, VkFormat format, VkExtent2
                 vkUpdateDescriptorSets(R.device, 1, &w, 0, nullptr);
             }
             if (set != bound) {
-                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, res.layout, 0, 1, &set, 0, nullptr);
+                record::vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, res.layout, 0, 1, &set, 0, nullptr);
                 bound = set;
             }
             VkRect2D scissor{{int32_t(x0), int32_t(y0)}, {uint32_t(x1 - x0), uint32_t(y1 - y0)}};
-            vkCmdSetScissor(cmd, 0, 1, &scissor);
-            vkCmdDrawIndexed(cmd, c.ElemCount, 1, c.IdxOffset + idx_base, int32_t(c.VtxOffset + vtx_base), 0);
+            record::vkCmdSetScissor(cmd, 0, 1, &scissor);
+            record::vkCmdDrawIndexed(cmd, c.ElemCount, 1, c.IdxOffset + idx_base, int32_t(c.VtxOffset + vtx_base), 0);
         }
         vtx_base += l->VtxBuffer.Size;
         idx_base += l->IdxBuffer.Size;

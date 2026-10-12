@@ -28,24 +28,32 @@ segundo: 30 es la velocidad completa.
 | Galaxy Z Fold 8 | SM8850, Adreno 840 | 60 fps, 30 cuando se calienta | 26–30 / 30 | excelente, en las dos pantallas |
 | Lenovo Legion Tab | Snapdragon 8 Gen 3, Adreno 750 | 30 fps estables | 28,7–30 / 30 | bueno |
 | OnePlus 8 Pro | Snapdragon 865, Adreno 650 (Mesa Turnip) | 30 fps | 26–30 / 30 | funciona; un cierre de la GPU todavía en estudio |
+| Galaxy Tab S6 Lite | Snapdragon 720G, Adreno 618 (Mesa Turnip), 4 GB | 15–24 fps | 15–24 / 30 | funciona lento: más o menos a media velocidad en Outset |
 
 Necesitas un teléfono de 64 bits con Android 13 o posterior y Vulkan 1.3 (o un driver
 personalizado en Adreno), y unos pocos GB libres.
 
 ## Cómo jugar
 
-### Próximamente: la app de instalación (sin PC)
+### La app de instalación (sin PC)
 
-La app de instalación se está añadiendo al proyecto ([#98](https://github.com/ZeldaWWHDRecomp/ZeldaWWHDRecomp/pull/98)).
-No lleva código del juego: prepara el juego en tu teléfono a partir de tu propia copia.
+La app de instalación viene en todas las versiones oficiales: descarga el `WindWakerHD-<versión>-android-arm64.apk`
+en la página de [Releases](https://github.com/ZeldaWWHDRecomp/ZeldaWWHDRecomp/releases) (el APK `android-x86_64` es para emuladores y Chromebooks). No lleva
+código del juego: prepara el juego en tu teléfono a partir de tu propia copia. Las versiones siguientes
+se instalan encima y conservan tus partidas y tus ajustes (el teléfono vuelve a preparar el juego
+cuando una actualización lo necesita).
 
-1. Instala la app.
-2. Elige tu juego: una carpeta del juego ya extraída, un archivo `.wua` de Cemu, o una imagen de disco `.wud`/`.wux` con sus claves.
-3. Espera mientras el teléfono prepara el juego. Solo pasa una vez y tarda unos minutos; la
-   pantalla muestra cuántas partes van listas y cuánto falta, aproximadamente.
-4. Juega.
+1. Instala el APK. Si ya tienes una versión preparada en tu PC, exporta antes tu partida (mantén
+   pulsado el icono de la app) y desinstala esa versión: las dos están firmadas de forma distinta.
+2. Abre la app y elige tu juego: **Choose extracted game folder** (carpeta extraída), **Choose WUA
+   archive** (archivo `.wua`) o **Choose WUD / WUX disc image** (imagen de disco; después también
+   **Choose disc key file** y **Choose common key file**, las claves).
+3. Pulsa **Start / resume / retry setup**. El teléfono extrae y compila el juego una sola vez; la
+   pantalla muestra el progreso, por ejemplo "Compiling: 30/80 · about 12 min left". Puedes salir
+   de la app mientras tanto, y **Pause setup** lo detiene de forma segura.
+4. Cuando indique que la instalación terminó, pulsa **Play current build**.
 
-### Hoy: prepáralo en tu PC
+### O bien: prepáralo en tu PC
 
 1. Instala el SDK y el NDK de Android, JDK 17 o posterior, CMake, Ninja y Python 3.
 2. Extrae tu juego y genera su código (pasos 1 y 2 de *Building* en el [README](../README.md)).
@@ -70,11 +78,6 @@ botones táctiles mientras está conectado.
 **¿Qué versión del juego?**
 La versión de Wii U de The Wind Waker HD, de EE. UU. o de Europa. Las partidas de una Wii U real
 también funcionan.
-
-**¿Por qué todavía no hay un APK para descargar?**
-Un APK preparado hoy en un PC contiene el juego recompilado, que no se puede compartir. La app de
-instalación prepara el juego en tu teléfono, así que la propia app sí se puede compartir. Se está
-probando ahora.
 
 **Mi teléfono se calienta. ¿Es normal?**
 El juego es exigente. Cuando el teléfono se calienta, el juego baja solo de 60 a 30 fps estables

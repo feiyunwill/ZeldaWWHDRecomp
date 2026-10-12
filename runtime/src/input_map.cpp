@@ -393,6 +393,18 @@ static void apply_deadzone(float& x, float& y, float dz) {
     y *= scale;
 }
 
+// issue #40: scale the vector's length by the range and cap it at full deflection, keeping
+// the direction, so a stick that physically stops short still reaches 1.0.
+static void apply_range(float& x, float& y, float range) {
+    range = std::clamp(range, kMinStickRange, kMaxStickRange);
+    if (range == 1.0f) return;
+    float len = std::sqrt(x * x + y * y);
+    if (len <= 0) return;
+    float scale = std::min(len * range, 1.0f) / len;
+    x *= scale;
+    y *= scale;
+}
+
 input::PadState controller_state(const Mapping& m, const float values[kPadCount]) {
     float v[kActionCount];
     for (int a = 0; a < kActionCount; a++) {
@@ -409,6 +421,8 @@ input::PadState controller_state(const Mapping& m, const float values[kPadCount]
     float dz = std::clamp(m.deadzone, 0.0f, 0.9f);
     apply_deadzone(s.lx, s.ly, dz);
     apply_deadzone(s.rx, s.ry, dz);
+    apply_range(s.lx, s.ly, m.left_range);
+    apply_range(s.rx, s.ry, m.right_range);
     if (m.invert_camera_y) s.ry = -s.ry;
     return s;
 }
@@ -563,10 +577,12 @@ std::string to_json(const Mapping& m) {
         o += "    " + quote(action_id(a)) + ": " + (m.pad[a] == kPadNone ? std::string("null") : quote(pad_id(m.pad[a])));
         o += a + 1 < kActionCount ? ",\n" : "\n";
     }
-    char opt[192];
+    char opt[320];
     snprintf(opt, sizeof opt,
-             "  },\n  \"options\": {\n    \"stick_deadzone\": %.3g,\n    \"invert_camera_y\": %s%s\n  }\n}\n",
-             m.deadzone, m.invert_camera_y ? "true" : "false",
+             "  },\n  \"options\": {\n    \"format\": 2,\n    \"stick_deadzone\": %.3g,\n"
+             "    \"left_stick_range\": %.3g,\n    \"right_stick_range\": %.3g,\n"
+             "    \"invert_camera_y\": %s%s\n  }\n}\n",
+             m.deadzone, m.left_range, m.right_range, m.invert_camera_y ? "true" : "false",
              m.face_auto ? ",\n    \"face_layout\": \"auto\"" : "");
     return o + opt;
 }
@@ -611,8 +627,19 @@ bool from_json(const std::string& text, Mapping& out, std::string* error) {
         }
     }
     if (const Json* op = root.get("options"); op && op->type == Json::Obj) {
-        if (const Json* d = op->get("stick_deadzone"); d && d->type == Json::Num)
-            m.deadzone = std::clamp((float)d->n, 0.0f, 0.9f);
+        const Json* format = op->get("format");
+        const bool legacy = !format || format->type != Json::Num || format->n < 2;
+        if (const Json* d = op->get("stick_deadzone"); d && d->type == Json::Num) {
+            // Old saves always wrote zero, the former default. Format 2 distinguishes a
+            // deliberate zero from that default; saving writes the marker after migration.
+            if (!(legacy && d->n == 0))
+                m.deadzone = std::clamp((float)d->n, 0.0f, 0.9f);
+        }
+        // issue #40: missing keys keep the default 1.0 (no scaling)
+        if (const Json* r = op->get("left_stick_range"); r && r->type == Json::Num)
+            m.left_range = std::clamp((float)r->n, kMinStickRange, kMaxStickRange);
+        if (const Json* r = op->get("right_stick_range"); r && r->type == Json::Num)
+            m.right_range = std::clamp((float)r->n, kMinStickRange, kMaxStickRange);
         if (const Json* i = op->get("invert_camera_y"); i && i->type == Json::Bool) m.invert_camera_y = i->b;
         // only "automatic" is stored: the two manual presets are the shape of the face bindings
         if (const Json* f = op->get("face_layout"); f && f->type == Json::Str) m.face_auto = f->s == "auto";

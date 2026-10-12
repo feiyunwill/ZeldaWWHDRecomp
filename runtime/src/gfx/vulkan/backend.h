@@ -6,6 +6,7 @@
 #endif
 #include <atomic>
 #include <array>
+#include <deque>
 #include <cstdint>
 #include <memory>
 #include <functional>
@@ -16,6 +17,9 @@
 #include "api.h"
 #include "buffer_cache_core.h"
 namespace gfxvk {
+class DeferredCommands;
+bool begin_exact_preparation();
+void drain_pending_guest_pipelines();
 struct Buffer { ResourceUse use; VkBuffer buffer=VK_NULL_HANDLE; VkDeviceMemory memory=VK_NULL_HANDLE; void* mapped=nullptr; VkDeviceSize size=0;
                 VkMemoryPropertyFlags properties=0; /* of the memory type create_buffer chose */ };
 struct UploadSlice { VkBuffer buffer=VK_NULL_HANDLE; VkDeviceSize offset=0,size=0; void* mapped=nullptr; };
@@ -54,6 +58,10 @@ struct Screen {
  std::vector<ResourceUse> imageUses;
  VkSemaphore acquired=VK_NULL_HANDLE,finished=VK_NULL_HANDLE;
  std::unique_ptr<Surface> scan;
+ // Never overwrite the published scan while the next guest frame is being
+ // built. Publish at swap; reuse the former published allocation next time.
+ std::unique_ptr<Surface> buildingScan;
+ bool buildingScanDirty=false,buildingScanSrgb=false,scanSrgb=false;
  std::atomic<bool> visible{true},srgb{false},resize{false};
  int presentMode=-1,presentWanted=-1; // present mode of the swapchain, and the setting it was made for
  std::atomic<int> width{1280},height{720};
@@ -103,6 +111,7 @@ struct Renderer {
  std::atomic<uint64_t> secondaryIdleWaits{0},secondaryRetired{0},secondaryRetirementPending{0};
  bool dynamicRenderingKHR=false; // VK_KHR_dynamic_rendering (device older than Vulkan 1.3)
  bool portabilitySubset=false,imageViewSwizzle=true,imageViewReinterpretation=true;
+ bool attachmentViewUsage=false; // attachment views name their usage (issue #144: Intel; WWHD_VK_ATTACHMENT_VIEW_USAGE)
  bool imageView2DOn3DImage=true; // 2D views of volume slices (render targets); core Vulkan 1.1, optional in the portability subset
  bool samplerMipLodBias=true,separateStencilMaskRef=true,constantAlphaColorBlendFactors=true,vertexAttributeAccessBeyondStride=true,samplerMirrorClampToEdge=false;
  VkPhysicalDeviceProperties properties{}; VkQueue queue=VK_NULL_HANDLE; uint32_t queueFamily=0;
@@ -173,6 +182,8 @@ struct Renderer {
   std::array<GpuScope,maxGpuScopes> gpuScopes{};
   uint32_t gpuScopeCount=0,activeRenderScope=UINT32_MAX;
   bool pending=false;
+  bool retainedUnsubmitted=false;
+  DeferredCommands* deferredOwner=nullptr;
   uint64_t serial=0; // Submission order on the single graphics queue.
   std::vector<UploadBlock> uploadBlocks;
   std::vector<std::function<void()>> completions;
@@ -180,7 +191,7 @@ struct Renderer {
   std::vector<RetiredImage> garbageImages;
   std::vector<bufcache::Region> garbageCacheRegions;
  };
- std::array<Submission,4> submissions{};
+ std::deque<Submission> submissions=std::deque<Submission>(4);
  size_t activeSubmission=0;
  Screen tv,drc;
  std::unordered_multimap<uint32_t,std::unique_ptr<Surface>> surfaces;
@@ -188,7 +199,9 @@ struct Renderer {
 };
 extern Renderer R;
 // Render-thread checkpoint; failures leave the cache dirty for a later retry.
-void save_pipeline_cache();
+void save_pipeline_cache(bool shutdown = true);
+void present_completed_frame_while_pipeline_pending();
+void begin_pipeline_pending_frame();
 // Only guest GX2Flush uses this asynchronous path. flush() remains a drain for
 // readbacks and renderer tools; final presentation also waits synchronously.
 void flush_async();

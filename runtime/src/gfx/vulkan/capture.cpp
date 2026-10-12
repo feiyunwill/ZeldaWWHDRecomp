@@ -1,3 +1,4 @@
+#include "deferred_dispatch.h"
 #include "../../exception_report.h"
 #include "gfx/depth_peek.h"
 #include "runtime.h"
@@ -42,7 +43,7 @@ void peek_z(const uint32_t* cells, uint32_t n) {
         destinations[i] = cells[i*3+2];
     }
     transition_image(depth,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_READ_BIT);
-    vkCmdCopyImageToBuffer(command_buffer(),depth->image,depth->layout,staging.buffer,points,regions.data());
+    record::vkCmdCopyImageToBuffer(command_buffer(),depth->image,depth->layout,staging.buffer,points,regions.data());
     derive_dependency(staging.use,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_WRITE_BIT);
     transition_buffer(staging,VK_PIPELINE_STAGE_HOST_BIT,VK_ACCESS_HOST_READ_BIT);
     uint64_t ticket = ::gfx::depth_peek::next_ticket();
@@ -106,7 +107,7 @@ std::vector<uint8_t> read_rgba(Surface& source,bool encodeSrgb) {
  Buffer buffer=create_readback_buffer(count*bytes);
  try {
   transition_image(&source,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_READ_BIT);
-  VkBufferImageCopy region{};region.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};region.imageExtent={width,height,1};auto cmd=command_buffer();vkCmdCopyImageToBuffer(cmd,source.image,source.layout,buffer.buffer,1,&region);
+  VkBufferImageCopy region{};region.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};region.imageExtent={width,height,1};auto cmd=command_buffer();record::vkCmdCopyImageToBuffer(cmd,source.image,source.layout,buffer.buffer,1,&region);
   derive_dependency(buffer.use,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_WRITE_BIT);
   transition_buffer(buffer,VK_PIPELINE_STAGE_HOST_BIT,VK_ACCESS_HOST_READ_BIT);flush();
   const auto* raw=static_cast<const uint8_t*>(buffer.mapped);std::vector<uint8_t> rgba(count*4);
@@ -142,7 +143,7 @@ void service_captures() {
  {std::lock_guard lock(captureMutex);for(auto it=captures.begin();it!=captures.end();)if(it->frame<=frame_count()){paths.push_back(std::move(it->path));it=captures.erase(it);}else ++it;}
  if(paths.empty())return;
  try {
-  auto& source=*R.tv.scan;auto rgba=read_rgba(source,R.tv.srgb.load());
+  auto& source=*R.tv.scan;auto rgba=read_rgba(source,R.tv.scanSrgb);
   for(const auto& path:paths)try {write_png(path,source.extent.width,source.extent.height,rgba);fprintf(stderr,"[gfx] wrote %s (%ux%u)\n",path.c_str(),source.extent.width,source.extent.height);}catch(const std::exception& e){fprintf(stderr,"[gfx] PNG capture failed: %s\n",e.what());}
  }catch(const std::exception& e){fprintf(stderr,"[gfx] TV capture failed: %s\n",e.what());}
 }

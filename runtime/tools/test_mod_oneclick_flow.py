@@ -25,7 +25,9 @@ def run(root, ident, mode):
         manifest['setup'][:0] = [dict(id='source', type='game_path', title='GameCube game', game='gc_usa'),
             dict(id='prepare', type='run_tool', title='Prepare island maps from your GameCube game',
                  tool='tools/prepare.py', arguments=['{data}', '{game:gc_usa}', str(root / 'fail-tool')], outputs=['result.bin'])]
-        (source / 'tools/prepare.py').write_text("import pathlib,sys,time\ntime.sleep(.05)\nif pathlib.Path(sys.argv[3]).exists():\n print('synthetic deliberate failure');sys.exit(7)\npathlib.Path(sys.argv[1],'result.bin').write_text('synthetic maps, no game data')\n")
+        (source / 'tools/fixture_helper.py').write_text("VALUE = 1\n")
+        # imports a module of its own, like real tools do: Python must not leave __pycache__ in the package
+        (source / 'tools/prepare.py').write_text("import pathlib,sys,time\nimport fixture_helper\ntime.sleep(.05)\nif pathlib.Path(sys.argv[3]).exists():\n print('synthetic deliberate failure');sys.exit(7)\npathlib.Path(sys.argv[1],'result.bin').write_text('synthetic maps, no game data')\n")
     if mode == 'choice':
         manifest['options'] = [dict(id='consent', name='Consent', type='bool', default=False),
                                dict(id='colour', name='Colour', type='enum', default='green', choices=['green', 'blue'])]

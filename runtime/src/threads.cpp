@@ -33,6 +33,7 @@
 #include "scheduler_tick.h"
 #include "render_prof.h"
 #include "platform/perf_hint.h"
+#include "platform/thread_sampler.h"
 
 static void wake_timed_events();
 
@@ -605,7 +606,7 @@ static void* thread_main(void* p) {
     {
         // the game's main thread (the first, unnamed one) builds every frame's GX2 commands
         static std::atomic<bool> hinted{false};
-        if (name.empty() && !hinted.exchange(true)) perf_hint::add_current_thread();
+        if (name.empty() && !hinted.exchange(true)) perf_hint::add_current_thread(), thread_sampler::add_current_thread("game");
     }
 #ifdef __APPLE__
     ht->mach = pthread_mach_thread_np(pthread_self());

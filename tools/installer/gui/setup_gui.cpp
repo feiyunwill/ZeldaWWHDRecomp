@@ -457,8 +457,11 @@ struct App {
     double free_bytes = 0, source_bytes = 0, toolchain_bytes = 0;
     bool opt_remove_toolchain = false, opt_shortcut = false;
     bool code_mods = false;
+    bool prepare_shaders = true;
+    bool shader_skip_requested = false;
     std::deque<std::pair<std::string, std::string>> queue;  // requests to send one after another
     std::string after;                                       // then: play | quit | open
+    std::string leaving;  // Done screen: Play or Quit was pressed (its options are queued and no longer shown)
     bool exec_game = false;                                  // start the game when the window has closed
 
     // save import
@@ -802,10 +805,13 @@ static void apply_dialog(const std::string& target, const std::string& path) {
 static void start_install(const std::string& source) {
     A.install_source = source;
     A.steps.clear();
+    A.shader_skip_requested = false;
     A.current = -1;
     std::string f = "\"source\":" + jstr(source);
     f += std::string(",\"code_mods\":") + (A.code_mods ? "true" : "false");
     if (source != "installed") f += ",\"path\":" + jstr(A.source_path);
+    f += std::string(",\"skip_shader_prebuild\":") + (A.prepare_shaders ? "false" : "true");
+    f += ",\"shader_prebuild_cancel\":" + jstr(A.data_dir + "/shader-prebuild-cancel");
     request("install", f);
     go(Screen::Installing);
 }
@@ -1114,6 +1120,8 @@ static void screen_welcome() {
 }
 
 static void code_mods_choice() {
+    checkbox("Prepare shaders now (recommended)", &A.prepare_shaders);
+    muted("You can skip this and rebuild the shader cache later in Graphics settings.");
     checkbox("Build with code-mod support", &A.code_mods);
     muted("For mods in the catalogue or Mods tab marked as code mods. Built-in mods, graphics packs and "
           "content mods do not need this. The game code gets a small check in every function, which can "
@@ -1243,7 +1251,7 @@ static void screen_keys() {
 static double step_weight(const std::string& id) {
     static const std::map<std::string, double> w = {{"keys", 1},      {"archive", 1},   {"folder", 1},
                                                     {"compiler", 3},  {"extract", 15},  {"copy", 8},
-                                                    {"translate", 8}, {"compile", 60},  {"app", 4}};
+                                                    {"translate", 8}, {"compile", 60},  {"app", 4}, {"shaders", 20}};
     auto it = w.find(id);
     return it == w.end() ? 1 : it->second;
 }
@@ -1277,6 +1285,17 @@ static void screen_installing() {
     }
     ImGui::EndChild();
     ImGui::Spacing();
+    const bool preparing = std::any_of(A.steps.begin(), A.steps.end(), [](const Step& step) {
+        return step.id == "shaders" && step.state == 1;
+    });
+    if (preparing) {
+        if (A.shader_skip_requested) muted("Skipping shader preparation; finishing setup...");
+        else if (ImGui::Button("Skip shader preparation")) {
+            if (auto* file = SDL_IOFromFile((A.data_dir + "/shader-prebuild-cancel").c_str(), "wb")) {
+                SDL_CloseIO(file); A.shader_skip_requested = true;
+            }
+        }
+    }
     if (details_header()) log_pane(std::max(60.0f, space_above_footer()));
 }
 
@@ -1403,7 +1422,12 @@ static void screen_done() {
         muted("Game files and saves: " + A.data_dir);
     }
     if (!A.save_msg.empty()) muted(A.save_msg);
-    if (A.portable) {
+    if (!A.leaving.empty()) {
+        // the chosen options run now, then the window closes: showing them again (reset, so they look
+        // like a new question) would ask after the answer was given
+        ImGui::Spacing();
+        muted(A.leaving == "play" ? "Starting the game..." : "Finishing...");
+    } else if (A.portable) {
         ImGui::Spacing();
         if (A.toolchain_bytes > 0) {
             checkbox(("Remove the downloaded compiler (" + format_size(A.toolchain_bytes) + ")").c_str(),
@@ -1421,15 +1445,15 @@ static void screen_done() {
             &A.opt_shortcut);
         muted("Off by default: then nothing is written outside this folder.");
     }
-    int b = footer({"Quit", "Open folder", "Play"}, 2, busy() || !A.after.empty() ? 7 : 0);
+    int b = footer({"Quit", "Open folder", "Play"}, 2, busy() || !A.after.empty() || !A.leaving.empty() ? 7 : 0);
     auto queue_options = [] {
         if (A.portable && A.toolchain_bytes > 0 && A.opt_remove_toolchain) A.queue.push_back({"remove_toolchain", ""});
         if (A.portable && A.opt_shortcut) A.queue.push_back({"shortcut", ""});
         A.toolchain_bytes = 0, A.opt_shortcut = false;  // once
     };
-    if (b == 0) queue_options(), A.after = "quit";
+    if (b == 0) queue_options(), A.after = A.leaving = "quit";
     if (b == 1) open_folder(home_folder());
-    if (b == 2) queue_options(), A.after = "play";
+    if (b == 2) queue_options(), A.after = A.leaving = "play";
 }
 
 static void screen_fatal() {

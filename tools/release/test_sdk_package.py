@@ -14,7 +14,7 @@ import package
 
 class SDKPackage(unittest.TestCase):
     def test_platform_sdk_archives_pass_guard(self):
-        for platform in ("macos-arm64", "linux-x86_64", "linux-aarch64", "windows-x86_64"):
+        for platform in ("macos-arm64", "linux-x86_64", "linux-aarch64", "windows-x86_64", "windows-arm64"):
             with self.subTest(platform=platform), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp) / ("WindWakerHD-test-" + platform)
                 package.copy_sdk_headers(str(root))
@@ -30,6 +30,22 @@ class SDKPackage(unittest.TestCase):
                 problems, count = guard.scan(str(archive))
                 self.assertGreater(count, 10)
                 self.assertEqual(problems, [])
+
+    def test_optional_template_packaging_uses_synthetic_payload(self):
+        from test_guard_template import fixture, encode
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / 'source'
+            destination = Path(tmp) / 'package'
+            source.mkdir()
+            self.assertFalse(package.copy_shader_template(str(source), str(destination)))
+            self.assertFalse(destination.exists())
+            relative = Path('tools/shadercache/template.bin')
+            template = source / relative
+            template.parent.mkdir(parents=True)
+            template.write_bytes(encode(fixture()))
+            self.assertTrue(package.copy_shader_template(str(source), str(destination)))
+            self.assertEqual((destination / relative).read_bytes(), template.read_bytes())
+            self.assertEqual(guard.scan(str(destination))[0], [])
 
     def test_installer_local_imports_are_shipped(self):
         installer = Path(package.ROOT) / "tools/installer"

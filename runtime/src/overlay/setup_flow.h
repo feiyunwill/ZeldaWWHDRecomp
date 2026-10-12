@@ -1,6 +1,7 @@
 // Production setup loop, also driven by the game-free offscreen integration fixture.
 #pragma once
 #include "setup_widgets.h"
+#include "experimental_ui.h"
 #include "../mods/code_mods.h"
 #include <algorithm>
 #include <cstdio>
@@ -44,6 +45,8 @@ inline bool setup_open(const std::string& id) {
 inline void request_setup(const mods::packages::View& mod) {
     if(!setup_run.id.empty()||!mod.game_source_warning.empty()||(mod.kind=="guest"&&mods::packages::platform_key().starts_with("android")))return;
     {auto& worker=setup_work();std::lock_guard guard(worker.mutex);if(worker.running)return;}
+    // An experimental mod warns (and backs up the saves) before its setup, which ends by enabling it.
+    if(experimental::gate(mod,[mod]{request_setup(mod);}))return;
     auto steps=mods::packages::setup_steps(mod.id);
     if(mods::setup::offer(steps,!mod.game_source_warning.empty())==mods::setup::Action::Blocked)return;
     setup_confirm={mod.id,mod.name,std::move(steps),{},true};

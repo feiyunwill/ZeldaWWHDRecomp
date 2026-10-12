@@ -131,7 +131,10 @@ input reaches the logic once per step.
 
 GX2's virtual vsync (gx2_core.cpp) ticks 2 or 4 times per 59.94 Hz vsync at 120/240 fps (quarter-
 vsync ticks rounded to the rate's granule; 30/60 fps keep the 59.94 Hz timing exactly), so the
-game's swap interval 2 becomes N+1 flips per step. The drawn rate is capped to what the display
+game's swap interval 2 becomes N+1 flips per step. A frame that is ready on time flips on its
+vsync; a late one flips as soon as it is ready instead of waiting for the next vsync, and a flip
+more than one 59.94 Hz vsync late moves the grid to it (`gx2/vsync_pacing.h`, issue #125: on the
+fixed grid a computer drawing 55 frames a second got 30 at 60 fps). The drawn rate is capped to what the display
 shows when presentation waits for its vsync (Metal, Vulkan FIFO): 240 fps on a 120 Hz display draws
 120, on a 60 Hz one 60 (`interp::output_fps`; the hosts report the refresh rate: NSScreen
 maximumFramesPerSecond, SDL's display mode, Android's Display, which the game asks for a faster
@@ -145,6 +148,16 @@ showing the same picture twice), otherwise drops the rest and the next logic pas
 time. Pass durations are averaged per kind (a slow logic pass must not keep cheap in-between
 passes out), a single sample counts at most twice the average (one hitch kept them out for 10 s),
 and after 10 s without an in-between pass one probe re-measures them.
+
+One-shot hides (`runtime/src/interp_nodraw.h`, `runtime/tools/interp_nodraw_test.cpp`): logic can
+hide an actor for one frame with `fopAcStts_NODRAW_e` (actor status `+0x2E0`, bit `0x01000000`);
+`fopAc_Draw` (`025D4654`) skips the draw and clears the bit, so logic must ask again every step.
+The talk camera does (`dCamera_c::talktoCamera`: the over-the-shoulder shots hide the listener,
+usually Link). Hold passes have no logic to ask again: the hook on `fopAc_Draw` records which actors
+the logic pass drew with the bit set and sets it again for the same step's hold passes (issue #126:
+Link flickered in conversations at 60/120/240 fps and in true 60). Persistent hides (the `daPy`
+no-draw flag, `+0x3B8` bit `0x08000000`; the camera attention status) need nothing: they stay set
+across passes.
 
 Logic stays at 30 Hz. For each rendered tick, record per model (J3DModel pointer) the world
 matrices produced by `calc` and the camera inputs of `camera_draw`. For the in-between frame,
