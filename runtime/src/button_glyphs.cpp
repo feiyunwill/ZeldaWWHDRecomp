@@ -1,5 +1,5 @@
-// Draw-time face styling and shoulder labels using the game's HUD font, through common game/GX2
-// path. See docs/button-glyphs.md for hook points and layout semantics.
+// Draw-time face styling (Xbox colours and positions, PlayStation shapes) and shoulder labels
+// using the game's HUD font, through common game/GX2 path. See docs/button-glyphs.md for hook points and layout semantics.
 #include "button_glyphs.h"
 #include "button_glyph_font.h"
 
@@ -25,39 +25,61 @@ void imp_gx2_GX2InitTextureRegs(Cpu* c);
 
 namespace {
 
-// Session gate: until by label has been on once, the hooks must not write game memory at all
-// (no glyph markers, no shoulder texture). Players who never use it then run exactly the stock
-// path. The first activation latches this flag; marking then works as in any by-label session,
-// so later layout changes still reach text cached in either mode.
+using input_map::FaceStyle;
+using input_map::PromptStyle;
+using input_map::ShoulderStyle;
+
+// Session gate: until a restyled look (by label, or a fixed shoulder name choice) has been on
+// once, the hooks must not write game memory at all (no glyph markers, no composed texture).
+// Players who never use it then run exactly the stock path. The first activation latches this
+// flag; marking then works as in any restyled session, so later changes still reach text cached
+// in either mode.
 std::atomic<bool> labels_used{false};
 
-bool xbox_style() {
-    // Per guest thread: layouts can be recorded on multiple cores. Each set_current invalidates
-    // the cached choice, including transitions through custom bindings. No SDL/AppKit dependency.
-    thread_local uint32_t generation = ~0u;
-    thread_local bool enabled = false;
-    const uint32_t now = input_map::generation();
-    if (now != generation) {
-        enabled = input_map::face_layout(input_map::current()) == input_map::FaceLayout::kLabels;
-        if (enabled) labels_used.store(true, std::memory_order_relaxed);
-        generation = now;
-    }
-    return enabled;
+void forget_rebuilt();
+
+// The look as of the last style change, packed; a different one rebuilds every cached text once.
+std::atomic<uint32_t> last_signature{0};
+uint32_t signature(const PromptStyle& s) {
+    return 0x100u | (uint32_t)s.face | (s.colours ? 4u : 0u) | (uint32_t)s.shoulders << 3 | (s.positions ? 0x20u : 0u);
 }
 
-// By label live now, or it has been on at least once in this session.
-bool marking() { return xbox_style() || labels_used.load(std::memory_order_relaxed); }
+PromptStyle style() {
+    // Per guest thread: layouts can be recorded on multiple cores. Each set_current (and a new pad
+    // family) invalidates the cached choice, including transitions through custom bindings. No
+    // SDL/AppKit dependency, and nothing beyond a generation compare per call.
+    thread_local uint32_t generation = ~0u;
+    thread_local PromptStyle current;
+    const uint32_t now = input_map::generation();
+    if (now != generation) {
+        current = input_map::prompt_style(input_map::current(), input_map::pad_family());
+        if (current.active()) labels_used.store(true, std::memory_order_relaxed);
+        const uint32_t sig = signature(current);
+        if (last_signature.exchange(sig, std::memory_order_relaxed) != sig && labels_used.load(std::memory_order_relaxed))
+            forget_rebuilt();
+        generation = now;
+    }
+    return current;
+}
+bool restyled() { return style().active(); }
+
+// Restyled now, or it has been at least once in this session.
+bool marking() { return restyled() || labels_used.load(std::memory_order_relaxed); }
 
 // The first activation happens against text cached in stock mode, which carries no markers the
 // hooks could recognise. Each text box is therefore rebuilt once: the game re-runs Print, which
 // marks the new quads. The registry is a one-shot switch (only consulted after activation) and
 // never identifies glyphs; it cannot go stale because it only ever forces a rebuild.
 std::mutex rebuilt_mutex;
-std::unordered_set<uint32_t> rebuilt;  // text boxes rebuilt since by label was first used (or the last state load)
+std::unordered_set<uint32_t> rebuilt;  // text boxes rebuilt since by label was first used (or the last state load / style change)
 bool first_rebuild(uint32_t text_box) {
     if (!labels_used.load(std::memory_order_relaxed)) return false;
     std::lock_guard lock(rebuilt_mutex);
     return rebuilt.insert(text_box).second;
+}
+void forget_rebuilt() {
+    std::lock_guard lock(rebuilt_mutex);
+    rebuilt.clear();
 }
 
 struct SavedWord {
@@ -66,8 +88,10 @@ struct SavedWord {
 };
 
 thread_local int hud_shoulder = -1;
+thread_local int hud_face = -1;  // a HUD face-letter pane (T_A_00 on P_A_00, ...)
 thread_local uint32_t hud_box = 0;
 std::string_view pane_name(uint32_t pane);
+uint32_t child_named(uint32_t parent, std::string_view name);
 
 uint32_t shoulder_atlas(Cpu* cpu) {
     const uint32_t manager = ld32(GD(0x101F4A50));
@@ -85,9 +109,9 @@ uint32_t shoulder_atlas(Cpu* cpu) {
     if (!cpu) return 0;  // a cached list can be invalidated and rebuilt with a real CPU context
     const uint32_t table = ld32(font + 4), get_glyph = table ? ld32(table + 0x8C) : 0;
     if (!get_glyph) return 0;
-    thread_local uint32_t scratch = mem::host_alloc(4*0x18, 16);
-    std::array<uint32_t,4> records;
-    constexpr uint32_t characters[] = {'L','R','1','2'};
+    thread_local uint32_t scratch = mem::host_alloc(6*0x18, 16);
+    std::array<uint32_t,6> records;
+    constexpr uint32_t characters[] = {'L','R','1','2','B','T'};
     // Guest calls may yield: do not hold the host cache mutex across them. This is the same
     // Font::GetGlyph ABI that the original CharWriter uses, on a copy of the caller's CPU.
     for (uint32_t i = 0; i < records.size(); i++) {
@@ -98,7 +122,7 @@ uint32_t shoulder_atlas(Cpu* cpu) {
         get.pc = get_glyph; get.ctr = get_glyph;
         ppc_dispatch(&get);
     }
-    const auto pixels = button_glyphs::shoulder_font_atlas(records);
+    const auto pixels = button_glyphs::button_atlas(records);
     std::lock_guard lock(mutex);
     for (const auto& atlas : atlases) if (atlas.font == font && atlas.resource == resource) return atlas.info;
     // Loaded font resources are immutable during a session (content mods activate at boot).
@@ -106,21 +130,30 @@ uint32_t shoulder_atlas(Cpu* cpu) {
     if (pixels.empty()) { atlases.push_back({font,resource,0}); return 0; }
     // Font-sheet info has a 16-byte header followed by GX2Texture (+0x10), as bound by
     // the game's text draw at 028F86C8. Host-only storage survives guest state restores.
+    // Two sheet objects on the same image: the RGBA one (info) and, 0x100 bytes on, a coverage
+    // twin (coverage_sheet) for shapes that take the text colours like the HUD's letters.
     const uint32_t info = [&] {
-        const uint32_t object = mem::host_alloc(0xAC, 256);
-        const uint32_t image = mem::host_alloc(128 * 256 * 4, 256);
+        const uint32_t object = mem::host_alloc(0x200, 256);
+        constexpr uint32_t width = button_glyphs::kAtlasWidth, height = button_glyphs::kAtlasHeight;
+        const uint32_t image = mem::host_alloc(width * height * 4, 256);
         std::memset(mem::ptr(object), 0, 0xAC);
         std::memcpy(mem::ptr(object), mem::ptr(ld32(records[0] + 0x14)), 16);
-        st8(object + 0x0E, 1);  // colour sheet: preserve RGBA, rather than treating it as an alpha font
+        // +0x0E = 0: an RGBA sheet like the game's own icon font (issue #141). The header copied
+        // from the HUD font says 1 (a coverage sheet), which the batch at 028F7A4C turns into the
+        // text-colour path: it maps the texture through the text box's black/white colours, and
+        // a dialog's white text then turned the whole framed ZL/ZR label white.
+        st8(object + 0x0E, 0);
         std::memcpy(mem::ptr(image), pixels.data(), pixels.size());
         const uint32_t texture = object + 0x10;
-        st32(texture, 5); st32(texture + 4, 128); st32(texture + 8, 256); st32(texture + 12, 1);  // one-layer font array
+        st32(texture, 5); st32(texture + 4, width); st32(texture + 8, height); st32(texture + 12, 1);  // one-layer font array
         st32(texture + 0x10, 1); st32(texture + 0x14, 0x1A);  // one mip, RGBA8
-        st32(texture + 0x1C, 1); st32(texture + 0x20, 128*256*4); st32(texture + 0x24, image);
-        st32(texture + 0x30, 1); st32(texture + 0x38, 256); st32(texture + 0x3C, 128);  // linear-aligned
+        st32(texture + 0x1C, 1); st32(texture + 0x20, width*height*4); st32(texture + 0x24, image);
+        st32(texture + 0x30, 1); st32(texture + 0x38, height); st32(texture + 0x3C, width);  // linear-aligned
         st32(texture + 0x78, 1); st32(texture + 0x80, 1); st32(texture + 0x84, 0x00010203);
         Cpu init{}; init.r[3] = texture;
         imp_gx2_GX2InitTextureRegs(&init);
+        std::memcpy(mem::ptr(object + 0x100), mem::ptr(object), 0xAC);
+        st8(object + 0x100 + 0x0E, 1);  // coverage sheet: the text-colour path, as the HUD font's own
         return object;
     }();
     atlases.push_back({font,resource,info});
@@ -137,17 +170,49 @@ void patch_float(std::vector<SavedWord>& saved, uint32_t address, float value) {
     stf32(address, value);
 }
 
-void shoulder_quad(std::vector<SavedWord>& saved, uint32_t quad, int shoulder, bool frame, Cpu* cpu) {
+// The atlas sheet that draws through the text box's colours (coverage = the cell's alpha).
+constexpr uint32_t coverage_sheet(uint32_t atlas) { return atlas + 0x100; }
+
+// Point a glyph quad at a cell of the composed atlas (a shoulder label or a PlayStation shape).
+// `coverage`: keep the quad a coverage glyph on the coverage sheet, so the game colours (and
+// dims) it exactly like the letter it replaces; otherwise an RGBA picture (#141).
+void atlas_quad(std::vector<SavedWord>& saved, uint32_t quad, int row, bool frame, Cpu* cpu, bool coverage = false) {
     const uint32_t atlas = shoulder_atlas(cpu);
     if (!atlas) return;
-    patch(saved, quad + 0x28, atlas);
-    patch_float(saved, quad + 0x18, frame ? 0.0f : 0.5f);
-    patch_float(saved, quad + 0x1C, (3-shoulder) * 0.25f);
-    patch_float(saved, quad + 0x20, frame ? 0.5f : 1.0f);
-    patch_float(saved, quad + 0x24, (4-shoulder) * 0.25f);
-    // The composed array has one layer, regardless of the source glyph's page. Restore its
-    // original page and colour-font flag with the rest of the authored quad afterwards.
-    patch(saved, quad + 0x2C, (ld32(quad + 0x2C) & ~0xFF00u) | 1);
+    const button_glyphs::Cell cell = button_glyphs::atlas_cell(row, frame);
+    patch(saved, quad + 0x28, coverage ? coverage_sheet(atlas) : atlas);
+    patch_float(saved, quad + 0x18, cell.u0);
+    patch_float(saved, quad + 0x1C, cell.v0);
+    patch_float(saved, quad + 0x20, cell.u1);
+    patch_float(saved, quad + 0x24, cell.v1);
+    // The composed array has one layer, regardless of the source glyph's page. Bit 0 of +0x2F
+    // marks a coverage glyph (alpha font, coloured by the text box's colours); a composed RGBA
+    // picture clears it like the original icons (issue #141), a coverage shape sets it. The original
+    // page and flag are restored with the rest of the authored quad afterwards.
+    patch(saved, quad + 0x2C, (ld32(quad + 0x2C) & ~0xFF01u) | (coverage ? 1u : 0u));
+}
+
+int shoulder_row(ShoulderStyle names, int shoulder) {
+    return names == ShoulderStyle::kXbox ? button_glyphs::xbox_row(shoulder) : button_glyphs::numbered_row(shoulder);
+}
+
+// A HUD face letter: T_A_00 holding "A" on its P_A_00 picture (and so on for B, X, Y).
+int face_box(uint32_t box) {
+    const auto name = pane_name(box);
+    const int face = name == "T_A_01" ? 0 : button_glyphs::face_text(name);
+    if (face < 0) return -1;
+    const uint32_t parent = ld32(box + 0x0C);
+    if (!parent) return -1;
+    if (button_glyphs::face_picture(pane_name(parent)) != face) {
+        // CommandA_00 puts the ordinary letter beside its picture under N_Center_01,
+        // unlike CommandGuide's child letter. Require that exact container and a matching
+        // sibling picture; never treat arbitrary single-letter text as a button prompt.
+        constexpr std::string_view pictures[] = {"P_A_00", "P_B_00", "P_X_00", "P_Y_00"};
+        if (pane_name(parent) != "N_Center_01" || !child_named(parent, pictures[face])) return -1;
+    }
+    const uint32_t text = ld32(box + 0xA4);
+    constexpr char letters[] = {'A', 'B', 'X', 'Y'};
+    return text && ld16(box + 0xCE) == 1 && ld16(text) == letters[face] ? face : -1;
 }
 
 int shoulder_box(uint32_t box) {
@@ -164,7 +229,7 @@ int shoulder_box(uint32_t box) {
     return length == 2 && ld16(text) == 'Z' && ld16(text + 2) == letter ? shoulder : -1;
 }
 
-void style(std::vector<SavedWord>& saved, uint32_t address, int face) {
+void tint_word(std::vector<SavedWord>& saved, uint32_t address, int face) {
     const uint32_t rgba = ld32(address);
     saved.push_back({address, rgba});
     st32(address, button_glyphs::tint(rgba, face));
@@ -234,7 +299,7 @@ void button_glyphs::calculate_pane(Cpu* c, PpcFunc calculate) {
     // restoring a state cannot leave the previous layout's cached global positions behind.
     // Only once by label has been used: until then the stock path stays untouched.
     if (marking()) c->r[5] = 1;
-    if (!xbox_style()) return calculate(c);
+    if (!style().positions) return calculate(c);
     const Point from = button_centre(groups[face], pictures[face]);
     const Point to = button_centre(groups[face ^ 1], pictures[face ^ 1]);
     const float dx = to.x - from.x, dy = to.y - from.y;
@@ -252,13 +317,15 @@ void button_glyphs::calculate_pane(Cpu* c, PpcFunc calculate) {
 void button_glyphs::prepare_text_box(uint32_t text_box, Cpu* cpu) {
     const uint32_t list = ld32(text_box + 0xFC);
     if (!list) return;
+    // First: a style change forgets the rebuilt boxes, before this one is recorded below.
+    const PromptStyle look = style();
+    const bool active = look.active();
     if (!ld8(list + 6)) {
         // The game rebuilds this text anyway; remember the box so it is not forced next frame.
         first_rebuild(text_box);
         return;
     }
-    const bool xbox = xbox_style();
-    // The first by-label frame rebuilds each cached text once: it carries no identity bits yet,
+    // The first restyled frame rebuilds each cached text once: it carries no identity bits yet,
     // so the game has to re-run Print before the draw hooks can style it.
     if (first_rebuild(text_box)) { st8(list + 6, 0); return; }
     const int hud = shoulder_box(text_box);
@@ -266,20 +333,27 @@ void button_glyphs::prepare_text_box(uint32_t text_box, Cpu* cpu) {
         const uint32_t flag = list + 0xA4 + 0x2F;
         if (marked_shoulder(ld8(flag)) < 0) st8(flag, mark_shoulder(ld8(flag), hud));
     }
+    const int letter = face_box(text_box);
+    if (letter >= 0 && ld16(list + 4) && marking()) {
+        const uint32_t flag = list + 0xA4 + 0x2F;
+        if (marked_face(ld8(flag)) < 0) st8(flag, mark(ld8(flag), letter));
+    }
     for (uint32_t i = 0, count = ld16(list + 4); i < count; i++) {
         const uint8_t flags = ld8(list + 0xA4 + i * 0x30 + 0x2F);
-        const int shoulder = marked_shoulder(flags);
-        if ((marked_face(flags) >= 0 || shoulder >= 0) && styled(flags) != xbox) {
+        const int face = marked_face(flags), shoulder = marked_shoulder(flags);
+        if ((face >= 0 || shoulder >= 0) && styled(flags) != active) {
             st8(list + 6, 0);  // the original DrawSelf rebuilds the text and its vertex buffer
             return;
         }
-        if (shoulder >= 0 && xbox) {
+        // quads drawn from the composed atlas: restyled shoulder labels and PlayStation shapes
+        if ((shoulder >= 0 && look.shoulders != ShoulderStyle::kOriginal) ||
+            (face >= 0 && look.face == FaceStyle::kPlayStation)) {
             // Restoring a state in a fresh process can bring cached batch pointers from the
             // previous host allocation. Rebuild unless it binds this process's live atlas.
             const uint32_t atlas = shoulder_atlas(cpu);
             bool bound = false;
             for (uint32_t batch = 0, n = ld32(list + 0xA0); batch < n && batch < 8; batch++)
-                bound |= ld32(list + 0x20 + batch*0x10) == atlas;
+                bound |= ld32(list + 0x20 + batch*0x10) == atlas || ld32(list + 0x20 + batch*0x10) == coverage_sheet(atlas);
             if (atlas && !bound) { st8(list + 6, 0); return; }
             if (!atlas) {
                 // A clean stock fallback is reusable. A foreign cached atlas is not, even
@@ -299,13 +373,17 @@ void button_glyphs::prepare_text_box(uint32_t text_box, Cpu* cpu) {
 }
 
 void button_glyphs::draw_text_box(Cpu* c, PpcFunc draw) {
+    if (!marking()) return draw(c);  // no pane recognition or writes in a never-restyled session
     const int previous = hud_shoulder;
     const uint32_t previous_box = hud_box;
+    const int previous_face = hud_face;
     hud_box = c->r[3];
     hud_shoulder = shoulder_box(hud_box);
+    hud_face = face_box(hud_box);
     prepare_text_box(hud_box, c);
     draw(c);
     hud_shoulder = previous;
+    hud_face = previous_face;
     hud_box = previous_box;
 }
 
@@ -330,15 +408,22 @@ extern "C" void hook_0286E9F0(Cpu* c) {
 // a stale vertex cache on the next setting change or save-state restore. Ordinary text and
 // unrelated icons are not styled; the optional outline pass uses the game's outline colours.
 extern "C" void hook_028F7C7C(Cpu* c) {
-    const bool xbox = xbox_style();
+    const PromptStyle look = style();
+    const bool active = look.active();
     const bool mark = marking();
+    const bool shapes = look.face == FaceStyle::kPlayStation;
     const uint32_t list = c->r[4];
     std::vector<SavedWord> saved;
     const uint16_t original_count = ld16(list + 4);
     bool needs_shoulder = hud_shoulder >= 0 && original_count;
-    for (uint32_t i = 0; !needs_shoulder && i < original_count; i++)
-        needs_shoulder = button_glyphs::marked_shoulder(ld8(list + 0xA4 + i*0x30 + 0x2F)) >= 0;
-    const bool shoulder_ready = xbox && needs_shoulder && shoulder_atlas(c);
+    bool needs_shape = shapes && hud_face >= 0 && original_count;
+    for (uint32_t i = 0; i < original_count && !(needs_shoulder && (needs_shape || !shapes)); i++) {
+        const uint8_t flags = ld8(list + 0xA4 + i*0x30 + 0x2F);
+        needs_shoulder |= button_glyphs::marked_shoulder(flags) >= 0;
+        needs_shape |= shapes && button_glyphs::marked_face(flags) >= 0;
+    }
+    const bool shoulder_ready = look.shoulders != ShoulderStyle::kOriginal && needs_shoulder && shoulder_atlas(c);
+    const bool shape_ready = needs_shape && shoulder_atlas(c);
     if (hud_shoulder >= 0 && original_count) {
         const uint32_t quad = list + 0xA4;
         if (mark) st8(quad + 0x2F, button_glyphs::mark_shoulder(ld8(quad + 0x2F), hud_shoulder));
@@ -359,17 +444,48 @@ extern "C" void hook_028F7C7C(Cpu* c) {
             st16(list + 4, 1);  // one complete R1/R2/L1/L2 label, not the old separate Z and R/L
         }
     }
+    if (hud_face >= 0 && original_count && shape_ready) {
+        // The HUD letter becomes the shape, square and centred on the letter, on the game's own
+        // button picture. Coloured: white vertex colours, the shape carries its own colour.
+        // Without colours the shape is a coverage glyph: the game's own letter colours and
+        // dimming apply to it unchanged.
+        const uint32_t quad = list + 0xA4;
+        if (mark) st8(quad + 0x2F, button_glyphs::mark(ld8(quad + 0x2F), hud_face));
+        const float w = (float)ldf32(quad), h = (float)ldf32(quad + 4);
+        const float x = (float)ldf32(quad + 8), y = (float)ldf32(quad + 0x0C);
+        const float side = h * 0.8f;
+        if (std::isfinite(side) && side > 0 && std::isfinite(w) && std::isfinite(x) && std::isfinite(y)) {
+            patch_float(saved, quad, side);
+            patch_float(saved, quad + 4, side);
+            patch_float(saved, quad + 8, x + (w - side) * 0.5f);
+            patch_float(saved, quad + 0x0C, y + (h - side) * 0.5f);
+        }
+        if (look.colours)
+            for (uint32_t corner = 0x10; corner <= 0x14; corner += 4) patch(saved, quad + corner, ld32(quad + corner) | 0xFFFFFF00u);
+        st16(list + 4, 1);
+    }
     for (uint32_t i = 0, count = ld16(list + 4); i < count; i++) {
         const uint32_t quad = list + 0xA4 + i * 0x30;
         const int face = button_glyphs::marked_face(ld8(quad + 0x2F));
         const int shoulder = button_glyphs::marked_shoulder(ld8(quad + 0x2F));
         if (face < 0 && shoulder < 0) continue;
-        if (mark) st8(quad + 0x2F, button_glyphs::rendered(ld8(quad + 0x2F), xbox));
-        if (xbox && face >= 0) {
-            style(saved, quad + 0x10, face);
-            style(saved, quad + 0x14, face);
+        if (mark) st8(quad + 0x2F, button_glyphs::rendered(ld8(quad + 0x2F), active));
+        if (face >= 0 && hud_face < 0) {  // dialog/icon-font glyphs; HUD letters keep their ink
+            if (look.face == FaceStyle::kXbox && look.colours) {
+                tint_word(saved, quad + 0x10, face);
+                tint_word(saved, quad + 0x14, face);
+            } else if (shape_ready) {
+                atlas_quad(saved, quad, button_glyphs::shape_row(face, look.colours), true, c);
+            }
         }
-        if (shoulder_ready && shoulder >= 0) shoulder_quad(saved, quad, shoulder, hud_shoulder < 0, c);
+        if (face >= 0 && hud_face >= 0 && shape_ready)
+            atlas_quad(saved, quad, button_glyphs::shape_row(face, look.colours), false, c, !look.colours);
+        // Dialogs: the framed label is an RGBA picture (#141). HUD shoulder plates: the bare
+        // caption is a coverage glyph like the plate's own "R"/"ZR", so the game draws it in the
+        // plate's dark letter colour and dims it with the button (#143); as a picture it was
+        // white on the white plate.
+        if (shoulder_ready && shoulder >= 0)
+            atlas_quad(saved, quad, shoulder_row(look.shoulders, shoulder), hud_shoulder < 0, c, hud_shoulder >= 0);
     }
     f_028F7C7C_orig(c);
     restore(saved);
@@ -382,7 +498,8 @@ extern "C" void hook_028F7C7C(Cpu* c) {
 extern "C" void hook_02874D54(Cpu* c) {
     const uint32_t picture = c->r[3];
     const int face = button_glyphs::face_picture(pane_name(picture));
-    if (face < 0 || !xbox_style()) return f_02874D54_orig(c);
+    const PromptStyle look = style();
+    if (face < 0 || look.face != FaceStyle::kXbox || !look.colours) return f_02874D54_orig(c);
     std::array<uint32_t, 4> saved;
     for (uint32_t i = 0; i < saved.size(); i++) {
         const uint32_t address = picture + 0xA8 + 4 * i;
@@ -396,8 +513,5 @@ extern "C" void hook_02874D54(Cpu* c) {
 namespace button_glyphs {
 // A loaded save state brings back text boxes cached at addresses that may already be in the
 // one-shot rebuild set: forget it, so each is rebuilt (and marked) again when first drawn.
-void ss_reset() {
-    std::lock_guard lock(rebuilt_mutex);
-    rebuilt.clear();
-}
+void ss_reset() { forget_rebuilt(); }
 }  // namespace button_glyphs

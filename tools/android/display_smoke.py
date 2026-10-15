@@ -13,6 +13,7 @@ from pathlib import Path
 import re
 import shlex
 import subprocess
+import adb_util
 import time
 
 PACKAGE = "org.wwhdrecomp.wwhd"
@@ -80,6 +81,17 @@ def capture_timeout_evidence(adb, output):
             print("Cannot capture " + service + " timeout evidence: " + str(error), flush=True)
 
 
+def capture_metric_trend(label, trend, output):
+    """Keep trend diagnostics even if the evidence directory cannot be written."""
+    print(label + " metric trend: " + json.dumps(trend), flush=True)
+    try:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.with_suffix(".trend.json").write_text(
+            json.dumps({"phase": label, "samples": trend}, indent=2) + "\n")
+    except OSError as error:
+        print("Cannot capture metric trend: " + str(error), flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--adb", default="adb")
@@ -103,13 +115,14 @@ def main():
     args = parser.parse_args()
     if args.shared_general and not args.require_isolated_device: parser.error("--shared-general requires --require-isolated-device")
     prefix = [args.adb, "-s", args.serial]
+    adb_util.wait_until_ready(prefix)
 
     def adb(*command, check=True):
         if command and command[0] == "shell":
             # adb joins shell arguments into a remote command. Quote them to
             # preserve empty settings and multi-display values containing ';'.
             command = ("shell", shlex.join(command[1:]))
-        return subprocess.run(prefix + list(command), check=check, text=True,
+        return adb_util.run(prefix + list(command), check=check, text=True,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20).stdout.strip()
 
     if adb("shell", "getprop", "ro.kernel.qemu") != "1":
@@ -131,11 +144,11 @@ def main():
     timing_context = {}
     passed = False
     settings_path = "/sdcard/Android/data/" + PACKAGE + "/files/config/wwhd/settings.ini"
-    probe = subprocess.run(prefix + ["shell", shlex.join(["test", "-f", settings_path])],
+    probe = adb_util.run(prefix + ["shell", shlex.join(["test", "-f", settings_path])],
                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20)
     if probe.returncode not in (0, 1):
         raise RuntimeError("cannot inspect emulator app settings")
-    saved_settings = subprocess.check_output(prefix + ["exec-out", "cat", settings_path], timeout=20) if probe.returncode == 0 else None
+    saved_settings = adb_util.check_output(prefix + ["exec-out", "cat", settings_path], timeout=20) if probe.returncode == 0 else None
 
     def command(value):
         # Atomic publication prevents the native loop reading a partial command.
@@ -146,7 +159,7 @@ def main():
         target = args.output.with_name(args.output.stem + suffix + ".png")
         target.parent.mkdir(parents=True, exist_ok=True)
         with target.open("wb") as output:
-            subprocess.run(prefix + ["exec-out", "screencap", "-p"], stdout=output,
+            adb_util.run(prefix + ["exec-out", "screencap", "-p"], stdout=output,
                            stderr=subprocess.PIPE, check=True, timeout=20)
 
     def metrics():
@@ -156,9 +169,13 @@ def main():
     def until(label, predicate, timeout=20):
         deadline = time.monotonic() + timeout
         latest = None
+        trend = []
+        started = time.monotonic()
         while time.monotonic() < deadline:
             try:
                 latest = metrics()
+                trend.append({"elapsed": round(time.monotonic() - started, 2), **latest})
+                trend = trend[-100:]
                 if predicate(latest):
                     observations.append({"phase": label, **latest})
                     print(label + ": " + json.dumps(latest), flush=True)
@@ -169,6 +186,7 @@ def main():
         # Preserve routing/lifecycle evidence before finally releases the held
         # pointer and removes the overlay. A clear-preview snapshot alone cannot
         # establish which window actually received a later injected event.
+        capture_metric_trend(label, trend, args.output)
         capture_timeout_evidence(adb, args.output)
         raise AssertionError(label + " timed out; last metrics=" + repr(latest))
 
@@ -339,7 +357,7 @@ def main():
             until("main progresses during blocked secondary present", lambda m:
                   m["primary_presented"] >= blocked["primary_presented"] + 60 and
                   m["secondary_presented"] == blocked["secondary_presented"] and
-                  m["secondary_present_pending"] and m["secondary_present_skipped"] > 0)
+                  m["secondary_present_pending"] and m["secondary_present_skipped"] > 0, timeout=120)
             before_resize = metrics()
             command("resize_primary")
             until("primary swapchain recreates during blocked secondary present", lambda m:
@@ -691,7 +709,7 @@ def main():
                     if saved_settings is None:
                         adb("shell", "rm", "-f", settings_path)
                     else:
-                        subprocess.run(prefix + ["shell", "-T", "cat > " + shlex.quote(settings_path)],
+                        adb_util.run(prefix + ["shell", "-T", "cat > " + shlex.quote(settings_path)],
                                        input=saved_settings, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                        check=True, timeout=20)
                 finally:

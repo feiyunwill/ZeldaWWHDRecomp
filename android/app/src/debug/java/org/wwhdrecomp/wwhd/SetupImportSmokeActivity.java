@@ -56,6 +56,11 @@ public final class SetupImportSmokeActivity extends Activity {
                 SetupStore.remove(new File(job, "job.json"));
                 SetupImport.prepare(this, job, control);
                 require(Files.readAllBytes(new File(job, "input/game/content/asset").toPath())[0] == 42, "Corrupt checkpoint output was reused");
+                // A completed private snapshot does not require the original SAF selection.
+                SetupStore.remove(new File(job, "source.json"));
+                SetupImport.prepare(this, job, control);
+                require(new File(job, "input/game/content/asset").length() == 127,
+                    "Source-less snapshot could not resume");
                 File shortJob = create("short", "archive", document("short"));
                 try { SetupImport.prepare(this, shortJob, control); throw new IOException("Accepted short provider output"); }
                 catch (IOException expected) { require(expected.getMessage().contains("changed size"), "Wrong short-read error"); }
@@ -68,44 +73,48 @@ public final class SetupImportSmokeActivity extends Activity {
                 source.put("disc_uri", document("key").toString()).put("common_uri", document("key").toString());
                 SetupStore.write(new File(image, "source.json"), source);
                 SetupImport.prepare(this, image, control);
-                require(new File(image, "input/disc.key").length() == 16 && new File(image, "input/common.key").length() == 16, "Key copy failed");
+                require(!new File(image, "input/disc.key").exists() && !new File(image, "input/common.key").exists(), "Key bytes were copied");
+                require(!SetupStore.read(new File(image, "job.json")).getJSONObject("input").has("disc_key"), "Private key destination retained");
                 require(new File(image, "import-checkpoints").list().length == 1, "Key digest leaked into checkpoints");
                 byte[] configuration = Files.readAllBytes(new File(image, "job.json").toPath());
-                byte[] originalSource = Files.readAllBytes(new File(image, "source.json").toPath());
                 byte[] receipt = Files.readAllBytes(new File(image, "import-checkpoints/0.json").toPath());
                 int dumpOpens = ImportDocuments.OPENS.get("dump").get();
                 SetupStore.write(new File(image, "host.json"), new JSONObject().put("state", "running"));
                 try { SetupImport.selectKey(image, "disc", document("replacementkey")); throw new IOException("Allowed active key replacement"); }
                 catch (IOException expected) { require(expected.getMessage().contains("Pause"), "Wrong active replacement error"); }
                 SetupStore.write(new File(image, "host.json"), new JSONObject().put("state", "failed"));
-                SetupImport.selectKey(image, "disc", document("bigkey"));
-                try { SetupImport.prepare(this, image, control); throw new IOException("Accepted oversized replacement key"); }
-                catch (IOException expected) { require(expected.getMessage().contains("4096"), "Wrong replacement-key error"); }
-                require(Files.readAllBytes(new File(image, "input/disc.key").toPath())[0] == 42 &&
-                    SetupImport.keyReplacement(image, "disc").isFile(), "Failed key replacement discarded retry or old key");
+                // Interrupted old releases retain key bytes until the job completes.
+                Files.write(new File(image, "input/disc.key").toPath(), new byte[16]);
+                SetupImport.prepare(this, image, control);
+                require(new File(image, "input/disc.key").length() == 16, "Interrupted legacy key copy was removed");
                 SetupImport.selectKey(image, "disc", document("replacementkey"));
                 final int[] keyCheckpoints = {0};
                 try {
                     SetupImport.prepare(this, image, new SetupImport.Control() {
-                        @Override public void checkpoint() throws Exception { if (++keyCheckpoints[0] == 2) throw new Pause(); }
+                        @Override public void checkpoint() throws Exception { if (++keyCheckpoints[0] == 1) throw new Pause(); }
                         @Override public void progress(long copied, long total, int complete, int files) { }
                     });
-                    throw new IOException("Ignored pause during replacement key copy");
+                    throw new IOException("Ignored pause during replacement key selection");
                 } catch (Pause expected) { }
-                require(Files.readAllBytes(new File(image, "input/disc.key").toPath())[0] == 42 &&
-                    !new File(image, "import-partial/disc").exists(), "Paused replacement changed the old key");
+                require(new File(image, "input/disc.key").length() == 16 &&
+                    SetupImport.keyReplacement(image, "disc").isFile(), "Paused replacement lost the selection or saved key bytes");
                 SetupImport.prepare(this, image, control);
-                require(Files.readAllBytes(new File(image, "input/disc.key").toPath())[0] == 43 &&
-                    Files.readAllBytes(new File(image, "input/common.key").toPath())[0] == 42 &&
-                    !SetupImport.keyReplacement(image, "disc").exists(), "Replacement did not update only the selected key");
-                // Replaying a pending record models termination after key rename, before marker removal.
+                JSONObject changed = SetupStore.read(new File(image, "source.json"));
+                require(changed.getString("disc_uri").equals(document("replacementkey").toString()) &&
+                    changed.getString("common_uri").equals(document("key").toString()) &&
+                    !SetupImport.keyReplacement(image, "disc").exists(), "Replacement did not update only the selected URI");
+                // Replaying a pending record models termination after URI update, before marker removal.
                 SetupImport.selectKey(image, "disc", document("replacementkey"));
                 SetupImport.prepare(this, image, control);
                 require(ImportDocuments.OPENS.get("dump").get() == dumpOpens &&
                     java.util.Arrays.equals(configuration, Files.readAllBytes(new File(image, "job.json").toPath())) &&
-                    java.util.Arrays.equals(originalSource, Files.readAllBytes(new File(image, "source.json").toPath())) &&
                     java.util.Arrays.equals(receipt, Files.readAllBytes(new File(image, "import-checkpoints/0.json").toPath())),
                     "Key retry changed or recopied the private dump");
+                SetupKeyAccess.cleanupCompleted(image);
+                require(new File(image, "input/disc.key").isFile(), "Failed job lost legacy key");
+                SetupStore.write(new File(image, "host.json"), new JSONObject().put("state", "complete"));
+                SetupKeyAccess.cleanupCompleted(image);
+                require(!new File(image, "input/disc.key").exists(), "Completed job retained legacy key copy");
                 File partial = create("partial", "archive", document("root/code/cking.rpx"));
                 final int[] checkpoints = {0};
                 try {
@@ -122,10 +131,10 @@ public final class SetupImportSmokeActivity extends Activity {
                 JSONObject oversizedSource = SetupStore.read(new File(oversized, "source.json"));
                 oversizedSource.put("disc_uri", document("bigkey").toString()).put("common_uri", document("key").toString());
                 SetupStore.write(new File(oversized, "source.json"), oversizedSource);
-                try { SetupImport.prepare(this, oversized, control); throw new IOException("Accepted oversized key"); }
-                catch (IOException expected) { require(expected.getMessage().contains("4096"), "Wrong oversized-key error"); }
-                require(!new File(oversized, "job.json").exists(), "Published oversized key job");
-                result.put("passed", true).put("checks", "pipe streams, unknown size, pause/resume during writes, digest corruption, filename collisions, short output, unsafe names, bounded private keys, failed-job key correction, replacement pause/failure/replay without recopying dump");
+                SetupImport.prepare(this, oversized, control);
+                require(!new File(oversized, "input/disc.key").exists(), "Key file copied during import");
+                // Size and format are checked by the Python worker, after the read-only SAF open.
+                result.put("passed", true).put("checks", "pipe streams, unknown size, pause/resume during writes, digest corruption, filename collisions, short output, unsafe names, no private key copies, legacy cleanup, failed-job URI correction, replacement pause/replay without recopying dump");
             } catch (Exception failure) {
                 try { result.put("passed", false).put("error", failure.toString()); } catch (Exception ignored) { }
             } finally {

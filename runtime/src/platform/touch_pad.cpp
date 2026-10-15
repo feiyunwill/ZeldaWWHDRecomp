@@ -7,6 +7,9 @@
 #include <mutex>
 #include "../runtime.h"
 #include "touch_face.h"
+#include "../gfx/display_modes.h"
+#include "../overlay/hostui.h"
+#include "../overlay/overlay.h"
 
 namespace {
 std::mutex g_mu;
@@ -59,5 +62,30 @@ extern "C" JNIEXPORT void JNICALL Java_org_wwhdrecomp_wwhd_TouchControls_nativeD
     g_pad = nullptr;
     g_id = 0;
     LOG("[input] touch controls off");
+}
+#endif
+
+#ifdef __ANDROID__
+extern "C" JNIEXPORT jint JNICALL Java_org_wwhdrecomp_wwhd_TouchControls_nativeTouchState(JNIEnv*, jclass) {
+    return (gfx::touch_buttons_visible() ? 1 : 0) | (gfx::g_touch_controls ? 2 : 0) | (overlay::captures() ? 4 : 0);
+}
+extern "C" JNIEXPORT void JNICALL Java_org_wwhdrecomp_wwhd_TouchControls_nativeRevealButtons(JNIEnv*, jclass) {
+    gfx::reveal_touch_buttons();
+}
+extern "C" JNIEXPORT void JNICALL Java_org_wwhdrecomp_wwhd_TouchControls_nativeShowControls(JNIEnv*, jclass, jboolean shown) {
+    gfx::g_touch_controls = shown;
+    hostui::set("touchControls", shown ? "1" : "0");
+}
+#endif
+
+#ifdef __ANDROID__
+extern "C" JNIEXPORT void JNICALL Java_org_wwhdrecomp_wwhd_TouchControls_nativeScreenDpi(JNIEnv*, jclass, jfloat dpi) {
+    overlay::set_android_screen_dpi(dpi);
+}
+#endif
+
+#ifdef __ANDROID__
+extern "C" JNIEXPORT void JNICALL Java_org_wwhdrecomp_wwhd_TouchControls_nativeControllerConnected(JNIEnv*, jclass, jboolean connected) {
+    gfx::g_touch_controller = connected;
 }
 #endif

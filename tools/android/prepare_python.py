@@ -71,11 +71,13 @@ def source_files(root, test_fixtures=False):
                     root / "tools/android/ondevice_setup.py",
                     root / "tools/android/shader_prebuild_android.py",
                     root / "tools/rpx.py"]
-    # Newer desktop installers import this production sibling. Older branches
-    # do not have it; support both without changing installer behavior.
-    code_mods = root / "tools/installer/code_mods.py"
-    if code_mods.is_file():
-        source_paths.append(code_mods)
+    # Newer desktop installers import these production siblings at start-up (setup.py:
+    # "import code_mods", "import decomp_setup"). Older branches do not have them; support
+    # both without changing installer behavior.
+    for sibling in ("code_mods.py", "decomp_setup.py"):
+        path = root / "tools/installer" / sibling
+        if path.is_file():
+            source_paths.append(path)
     source_paths += [path for path in (root / "tools/recomp").rglob("*")
                      if path.is_file() and (path.suffix in (".py", ".txt") or (path.parent.name == "builds" and path.suffix == ".json"))
                      and path.name != "android_fixture.py" and "__pycache__" not in path.parts]

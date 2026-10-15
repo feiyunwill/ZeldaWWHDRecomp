@@ -32,8 +32,8 @@ public final class SetupPolicy {
 
     public static String description(String reason) {
         if ("manual".equals(reason)) return "Paused by you";
-        if ("heat".equals(reason)) return "Waiting for the phone to cool down";
-        if ("critical".equals(reason)) return "Paused because Android reports the phone as critically hot";
+        if ("heat".equals(reason)) return "Waiting for the Android device to cool down";
+        if ("critical".equals(reason)) return "Paused because Android reports the device as critically hot";
         if ("battery".equals(reason)) return "Waiting for charging or at least 30% battery";
         if ("battery_unknown".equals(reason)) return "Waiting for battery information";
         return "Paused at a safe checkpoint";
@@ -46,7 +46,7 @@ public final class SetupPolicy {
         if ("critical".equals(reason))
             return description(reason) + " (" + readings(thermal, temperatureTenths) + "). " +
                 "Setup continues once it cools down. Continue anyway does not apply here: " +
-                "at this level the phone throttles hard or shuts down regardless.";
+                "at this level the Android device throttles hard or shuts down regardless.";
         return description(reason);
     }
 

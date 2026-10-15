@@ -95,13 +95,20 @@ bool read_glyph(uint32_t record, Glyph& glyph) {
 
 }  // namespace
 
-std::vector<uint8_t> shoulder_font_atlas(const std::array<uint32_t,4>& records) {
-    std::array<Glyph,4> glyphs;
-    for (int i = 0; i < 4; i++) if (!read_glyph(records[i],glyphs[i])) return {};
-    std::vector<uint8_t> atlas(128*256*4);
-    for (int shoulder = 0; shoulder < 4; shoulder++) {
-        const Glyph& letter = glyphs[shoulder&1], &number = glyphs[shoulder < 2 ? 2 : 3];
-        const int number_x = letter.advance;
+std::vector<uint8_t> button_atlas(const std::array<uint32_t,6>& records) {
+    std::array<Glyph,6> glyphs;  // L R 1 2 B T
+    for (int i = 0; i < 6; i++) if (!read_glyph(records[i],glyphs[i])) return {};
+    std::vector<uint8_t> atlas(kAtlasWidth*kAtlasHeight*4);
+    auto put = [&](int row, int column, int x, int y, uint32_t rgba) {
+        const uint32_t offset = ((row*64+y)*kAtlasWidth+column*64+x)*4;
+        atlas[offset] = rgba>>24; atlas[offset+1] = rgba>>16; atlas[offset+2] = rgba>>8; atlas[offset+3] = rgba;
+    };
+    for (int row = 0; row < 8; row++) {
+        const int shoulder = row & 3;
+        const bool xbox = row >= 4;
+        // L/R, then 1/2 (numbered) or B/T (Xbox: bumper, trigger)
+        const Glyph& letter = glyphs[shoulder&1], &suffix = glyphs[(xbox ? 4 : 2) + (shoulder < 2 ? 0 : 1)];
+        const int suffix_x = letter.advance;
         int left = 10000, top = 10000, right = -10000, bottom = -10000;
         auto bounds = [&](const Glyph& glyph, int origin) {
             for (int y = 0; y < glyph.height; y++) for (int x = 0; x < glyph.width; x++) if (glyph.at(x,y) > 0) {
@@ -109,7 +116,7 @@ std::vector<uint8_t> shoulder_font_atlas(const std::array<uint32_t,4>& records) 
                 top = std::min(top,y); bottom = std::max(bottom,y+1);
             }
         };
-        bounds(letter,0); bounds(number,number_x);
+        bounds(letter,0); bounds(suffix,suffix_x);
         if (right <= left || bottom <= top) return {};
         for (int column = 0; column < 2; column++) {
             const bool frame = column == 0;
@@ -119,7 +126,7 @@ std::vector<uint8_t> shoulder_font_atlas(const std::array<uint32_t,4>& records) 
                 const float sx = left+(x-origin_x+0.5f)/scale_x-0.5f;
                 const float sy = top+(y-origin_y+0.5f)/scale_y-0.5f;
                 const uint32_t coverage = std::clamp<int>(std::lround(std::max(letter.sample(sx-letter.left,sy),
-                                                  number.sample(sx-number_x-number.left,sy))),0,255);
+                                                  suffix.sample(sx-suffix_x-suffix.left,sy))),0,255);
                 uint32_t rgba = 0xFFFFFF00 | coverage;
                 if (frame) {
                     const uint32_t background = shoulder_background(x,y);
@@ -127,11 +134,14 @@ std::vector<uint8_t> shoulder_font_atlas(const std::array<uint32_t,4>& records) 
                     const uint32_t ink = (36*coverage + shade*(255-coverage)+127)/255;
                     rgba = (ink<<24)|(ink<<16)|(ink<<8)|std::max(background&255,coverage);
                 }
-                const uint32_t offset = (((3-shoulder)*64+y)*128+column*64+x)*4;
-                atlas[offset] = rgba>>24; atlas[offset+1] = rgba>>16; atlas[offset+2] = rgba>>8; atlas[offset+3] = rgba;
+                put(row, column, x, y, rgba);
             }
         }
     }
+    // the PlayStation shapes: our own geometry, no font involved
+    for (int face = 0; face < 4; face++) for (bool colour : {true, false}) for (int column = 0; column < 2; column++)
+        for (int y = 0; y < 64; y++) for (int x = 0; x < 64; x++)
+            put(shape_row(face, colour), column, x, y, face_shape(face, colour, column == 0, x, y));
     return atlas;
 }
 

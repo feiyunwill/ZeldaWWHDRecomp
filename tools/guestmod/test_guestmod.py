@@ -200,6 +200,25 @@ WWHD_HOOK(0x02000000, all_services, (void)) {
     wwhd_log_int("step", (int)wwhd_logic_step());
     wwhd_file_write("progress.bin", p, 64);
     wwhd_file_read("progress.bin", p, 64);
+    if (wwhd_mail_send("hello", "A friend", "Text") == WWHD_MAIL_WAITING) wwhd_log("sent");
+    wwhd_log_int("letter", wwhd_mail_state("hello"));
+    if (wwhd_chart_give("tale") == WWHD_CHART_OWNED) wwhd_log("given");
+    wwhd_chart_mark("tale", "start", WWHD_CHART_COLUMN_X('D'), WWHD_CHART_ROW_Z(2), WWHD_CHART_ICON_STORY, "Windfall");
+    wwhd_log_int("chart", wwhd_chart_state("tale"));
+    wwhd_chart_unmark("tale", 0);
+    wwhd_chart_finish("tale");
+    wwhd_quest_define("tale", "A tale", 0, 0);
+    wwhd_quest_step("tale", 1, "Go", "Windfall");
+    wwhd_quest_place("tale", 0.0f, 0.0f);
+    wwhd_quest_no_place("tale");
+    wwhd_quest_known("tale", "Known");
+    wwhd_quest_portrait("tale", "assets/p.png");
+    wwhd_log_int("quest", wwhd_quest_state("tale"));
+    wwhd_quest_carry("tale", 1);
+    wwhd_quest_talk("tale", 1, "windfall-um1", "Hello", 6);
+    wwhd_quest_set_flag("tale", 1, 1);
+    wwhd_log_int("flag", wwhd_quest_flag("tale", 1));
+    wwhd_quest_done("tale");
     wwhd_free(p);
 }
 '''
@@ -210,7 +229,11 @@ WWHD_HOOK(0x02000000, all_services, (void)) {
                 if kind == "svc":
                     self.assertIn("c->pc = 0x%08Xu;" % address, translated, name)
             for name in ("wwhd_audio_open","wwhd_audio_submit","wwhd_audio_available","wwhd_audio_close","wwhd_audio_epoch","wwhd_file_write","wwhd_hud_register","wwhd_hud_emit","wwhd_hud_texture",
-                         "wwhd_hud_release","wwhd_hud_epoch","wwhd_hud_clip","wwhd_setting_get","wwhd_setting_changed"):
+                         "wwhd_hud_release","wwhd_hud_epoch","wwhd_hud_clip","wwhd_setting_get","wwhd_setting_changed",
+                         "wwhd_mail_send","wwhd_mail_state","wwhd_chart_give","wwhd_chart_finish","wwhd_chart_state",
+                         "wwhd_chart_mark","wwhd_chart_unmark","wwhd_quest_define","wwhd_quest_step","wwhd_quest_place",
+                         "wwhd_quest_no_place","wwhd_quest_known","wwhd_quest_portrait","wwhd_quest_done","wwhd_quest_state","wwhd_quest_carry","wwhd_quest_talk",
+                         "wwhd_quest_set_flag","wwhd_quest_flag"):
                 self.assertIn(name,t.services)
             Path(d, "manifest.json").write_text(json.dumps({"kind": "guest", "id": "services", "guest": {"api_version": 1}}))
             result = builder.build(d, str(Path(d, "cache")), 0x7F000000, builder.default_cc(), str(Path(REPO, "runtime/include")))

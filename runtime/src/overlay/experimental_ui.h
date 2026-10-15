@@ -1,6 +1,8 @@
-// Experimental mods in the Mods tab: the warning before enabling one (which backs up the saves) and
-// the "Save backups" section (list, Back up now, Restore at next start). Same ImGui navigation as the
-// other overlay dialogs; the host supplies controller B. Used by the overlay and offscreen tests.
+#include "tooltip.h"
+// Experimental mods in the Mods tab: their label and the "Save backups" section (list, Back up now,
+// Restore at next start). The warning before switching one on is part of the mod's review (mods_tab.h),
+// whose first step backs up the saves. Same ImGui navigation as the other overlay dialogs; the host
+// supplies controller B.
 #pragma once
 #include "../mods/packages.h"
 #include "../mods/save_backup.h"
@@ -16,72 +18,6 @@ inline constexpr const char* kBadge = "Experimental";
 inline void badge() {
     ImGui::SameLine();
     ImGui::TextColored(kBadgeColour, "%s", kBadge);
-}
-
-// ---- warning before enabling
-struct Confirm {
-    std::string id, name;
-    std::vector<std::pair<std::string, std::string>> mods;  // experimental packages this enable turns on
-    bool open_now = false;
-    std::function<void()> next;  // the normal enable flow, after the backup
-};
-inline Confirm confirm;
-
-// Called before every enable flow of a package (checkbox, Set up). Returns true when it opened the
-// warning instead; `next` then runs after the player confirmed and the backup succeeded.
-inline bool gate(const mods::packages::View& mod, std::function<void()> next) {
-    auto mods = mods::packages::unacknowledged_experimental(mod.id);
-    if (mods.empty()) return false;
-    confirm = {mod.id, mod.name, std::move(mods), true, std::move(next)};
-    return true;
-}
-
-enum class Answer { None, Accepted, Cancelled, Failed };
-inline std::string warning_text(const Confirm& c) {
-    std::string names;
-    for (size_t i = 0; i < c.mods.size(); i++)
-        names += (i == 0 ? "" : i + 1 == c.mods.size() ? " and " : ", ") + c.mods[i].second;
-    return names + (c.mods.size() == 1 ? " is" : " are") +
-           " experimental: untested, and it can cause game-breaking problems such as crashes, stuck events or lost "
-           "progress. Saving the game while it is active can damage your save so that it no longer loads or "
-           "plays correctly.";
-}
-inline constexpr const char* kBackupText =
-    "Before it is turned on, your saves are backed up. You can restore them at any time in Mods > Save backups.";
-
-// error receives the reason when the backup fails (the mod then stays off).
-inline Answer dialog(bool back, std::string& error) {
-    const char* title = "Experimental mod##experimental_confirm";
-    if (confirm.open_now) { ImGui::OpenPopup(title); confirm.open_now = false; }
-    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-    if (!ImGui::BeginPopupModal(title, nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings))
-        return Answer::None;
-    ImGui::PushTextWrapPos(ImGui::GetFontSize() * 30);
-    ImGui::TextColored(kBadgeColour, "%s", kBadge);
-    ImGui::TextWrapped("%s", warning_text(confirm).c_str());
-    ImGui::TextWrapped("%s", kBackupText);
-    if (confirm.mods.size() > 1 || confirm.mods[0].first != confirm.id)
-        ImGui::TextDisabled("Enabling %s also enables these packages.", confirm.name.c_str());
-    ImGui::PopTextWrapPos();
-    ImGui::Spacing();
-    bool accept = ImGui::Button("Back up saves and enable");
-    ImGui::SameLine();
-    bool cancel = ImGui::Button("Cancel", ImVec2(120, 0));
-    ImGui::SetItemDefaultFocus();  // keyboard and controller start on Cancel
-    if (back || ImGui::IsKeyPressed(ImGuiKey_Escape)) { cancel = true; accept = false; }
-    auto answer = Answer::None;
-    if (accept) {
-        if (mods::packages::acknowledge_experimental(confirm.id, error)) {
-            answer = Answer::Accepted;
-            if (confirm.next) confirm.next();
-        } else answer = Answer::Failed;
-    } else if (cancel) answer = Answer::Cancelled;
-    if (answer != Answer::None) {
-        confirm = {};
-        ImGui::CloseCurrentPopup();
-    }
-    ImGui::EndPopup();
-    return answer;
 }
 
 // ---- Save backups section
@@ -165,7 +101,7 @@ inline bool backups_section(bool back) {
             ImGui::BeginDisabled(info.name == staged);
             if (ImGui::SmallButton("Delete")) { backups.delete_choice = info.name; backups.open_delete = true; }
             ImGui::EndDisabled();
-            if (info.name == staged && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            if (info.name == staged && overlay::tooltip_hovered(ImGuiHoveredFlags_AllowWhenDisabled))
                 ImGui::SetTooltip("Staged for restore. Cancel the restore to delete it.");
             ImGui::PopID();
         }

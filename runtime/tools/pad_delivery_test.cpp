@@ -24,6 +24,7 @@ namespace interp { bool repeat_input(){return repeat;} bool fresh_sticks(){retur
 namespace mods { void move_speed_input(uint32_t){} void fast_forward_input(uint32_t&){} }
 namespace motion { void right_stick(float,float){} VpadMotion vpad(bool){return {};} }
 namespace threads { void park_sleep_until(std::chrono::steady_clock::time_point,bool,void (*)()){} }
+namespace story_notebook { void pad(input::PadState&, Cpu*){} void mute(input::PadState&){} }  // the notebook page (not under test)
 extern "C" void f_0203DEEC_orig(Cpu*){}
 extern "C" void imp_vpad_VPADRead(Cpu*);
 extern "C" void imp_padscore_KPADReadEx(Cpu*);

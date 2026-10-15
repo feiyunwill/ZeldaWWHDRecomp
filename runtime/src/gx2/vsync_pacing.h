@@ -19,6 +19,7 @@
 //   behind, so faster frames afterwards catch up with at most one vsync's worth of frames.
 // Frames that are ready on time flip exactly on the grid, as before.
 #pragma once
+#include <algorithm>
 #include <cstdint>
 
 namespace vsync_pacing {
@@ -45,6 +46,45 @@ inline uint64_t flip_executed(const Clock& c, int64_t& shift, uint64_t due, int6
     const uint64_t at = (c.index(t, shift) / granule + 1) * granule;
     shift += c.time(at, shift) - t;
     return at;
+}
+
+// Step slots (paced frame interpolation at 120/240 fps, issue #164). The game advances one logic
+// step every two 59.94 Hz vsyncs (its swap interval) and draws in-between frames between steps. A
+// step's first frame (its logic frame) is due on the step's slot, two vsyncs after the previous
+// step's slot, whatever the in-between frames did: the step schedule is the vsync grid itself.
+// - On time, every step lasts exactly two vsyncs on the grid (29.97 steps a second, as on the
+//   console). The separate 30.000 Hz wall-clock schedule of v0.2.13 drifted against the 29.97 Hz
+//   grid: for seconds at a time a logic pass slept past its frame's vsync, that frame flipped up to
+//   a vsync late and the step's in-between frames bunched up to catch up (an uneven step every
+//   step), and every few seconds an in-between frame was skipped where the drift used up the
+//   planning slack.
+// - A logic frame that flips late (a slow computer) keeps the schedule: the next slot is still two
+//   vsyncs after this one, and the next step plans fewer in-between frames to catch up (the game
+//   keeps its speed). The logic pass decides when it is too late for that (interp.cpp: it starts
+//   more than a step after its time) and drops the slot; the flip itself only counts as too late
+//   at two steps. (Its flip lags the pass by the frames queued for the GPU: with a 15 ms render
+//   load at 240 fps, logic frames flipped 18-36 ms after their slots while the passes kept time,
+//   and a one-step limit at the flip restarted the schedule every ~20 steps: 29.74 steps/s.) A new
+//   schedule starts one frame after the flip.
+// Slots are times on the vsync's clock, not ticks, so a move of the grid does not move them.
+//
+// The first granule boundary (vsync at the drawn rate) that starts at or after `slot`.
+inline uint64_t slot_tick(const Clock& c, int64_t slot, int64_t shift, uint64_t granule) {
+    const uint64_t tick = c.index(slot - 1, shift) + 1;  // (index: the last tick that starts at or before t)
+    return (tick + granule - 1) / granule * granule;
+}
+// The tick a flip is due on: `due` (`swap interval` after the previous flip), and a step's logic
+// frame not before its step's slot (slot < 0: none).
+inline uint64_t step_due(const Clock& c, uint64_t due, int64_t slot, int64_t shift, uint64_t granule) {
+    return slot < 0 ? due : std::max(due, slot_tick(c, slot, shift, granule));
+}
+// A step's logic frame flipped at t; `slot`: its slot (or, without one, the time it was due). The
+// next step's slot (`step`: two vsyncs; `frame`: one frame at the drawn rate). Two steps late or
+// more starts a new schedule: the next step may follow one frame after it (a computer that takes
+// longer than that for a logic pass runs the game at its own pace, without waiting for a slot on
+// top).
+inline int64_t next_slot(int64_t slot, int64_t t, int64_t step, int64_t frame) {
+    return t - slot < 2 * step ? slot + step : t + frame;
 }
 
 }  // namespace vsync_pacing

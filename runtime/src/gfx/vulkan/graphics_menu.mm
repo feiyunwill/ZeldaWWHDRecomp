@@ -66,7 +66,7 @@ static constexpr float scales[]={1,1.5f,2,3};
 - (void)rebuildShaders:(NSMenuItem*)item {
     NSAlert* alert = [NSAlert new];
     alert.messageText = shaderprebuild::request_rebuild() ? @"Shader cache rebuild requested" : @"Could not save the rebuild request";
-    alert.informativeText = @"Run setup and choose repair/update to prepare shaders and pipelines from your game files. The game will compile shaders as needed until then.";
+    alert.informativeText = [NSString stringWithUTF8String:shaderprebuild::setup_hint()];
     [alert runModal];
 }
 - (void)resolution:(NSMenuItem*)i { gfxvk::set_res_scale(scales[i.tag]); }

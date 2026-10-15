@@ -144,7 +144,7 @@ def main():
     import argparse
     from pathlib import Path
     import shlex
-    import subprocess
+    import adb_util
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--adb", default="adb")
@@ -156,9 +156,10 @@ def main():
     if not re.fullmatch(r"[0-9a-f]{32}", args.job_id): parser.error("invalid job ID")
     if not 1 <= args.seconds <= 86400: parser.error("capture window must be 1..86400 seconds")
     package = "org.wwhdrecomp.wwhd"
+    adb_util.wait_until_ready([args.adb, "-s", args.serial])
 
     def shell(*command):
-        return subprocess.run([args.adb, "-s", args.serial, "shell", shlex.join(command)],
+        return adb_util.run([args.adb, "-s", args.serial, "shell", shlex.join(command)],
                               capture_output=True, check=True, timeout=5).stdout
 
     report = {"device": {key: shell("getprop", prop).decode().strip() for key, prop in

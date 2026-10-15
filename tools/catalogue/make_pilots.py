@@ -30,7 +30,7 @@ def generate(output, heart_elf=None):
 
     def package(ident, name, kind, files, setup=None, licences=None, **extra):
         manifest = dict(format_version=1, id=ident, name=name, version="1.0.0",
-                        game_id="wwhd-usa", kind=kind, author="WWHD catalogue test fixtures",
+                        game_id="wwhd", minimum_manager_version="1.5.0", kind=kind, author="WWHD catalogue test fixtures",
                         description="Authored synthetic catalogue pilot; contains no game assets.", **extra)
         if setup:
             manifest["setup"] = setup

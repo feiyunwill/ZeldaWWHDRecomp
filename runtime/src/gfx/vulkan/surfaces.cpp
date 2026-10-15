@@ -5,6 +5,7 @@
 #include "mods/cemu_pack.h"
 // Guest surfaces backed by Vulkan images. LatteAddrLib supplies guest tiling geometry.
 #include "backend.h"
+#include "stereo.h"
 #include "attachment_view_usage.h"
 #include "pipeline_trace.h"
 #include "buffer_cache.h"
@@ -144,6 +145,7 @@ static bool screen_shaped(uint32_t width, uint32_t height, bool compressed, uint
     float r = (float)width * 9.0f / ((float)height * 16.0f);
     return r > 0.97f && r < 1.03f;
 }
+bool stereo_screen_target(uint32_t w, uint32_t h) { return screen_shaped(w, h, false, 1, 1); }
 bool target_aspect_factors(uint32_t w, uint32_t h, float& kx, float& ky) {
     bool on = screen_shaped(w, h, false, 1, 1) && (g_aspect_kx != 1.0f || g_aspect_ky != 1.0f);
     kx = on ? g_aspect_kx : 1.0f;
@@ -428,7 +430,7 @@ Surface* sampled_texture(const uint32_t* w, bool isDepthSampler) {
     // Prefer that depth image before creating a converted colour comparison texture.
     if (isDepthSampler) {
         Surface* renderedDepth = nullptr;
-        auto aliases = R.surfaces.equal_range(d.addr);
+        auto aliases = stereo_surface_cache(d).equal_range(d.addr);
         for (auto it = aliases.first; it != aliases.second; ++it) {
             auto* candidate = it->second.get();
             if (!candidate->isDepth || !candidate->gpuWritten || candidate->width != d.width ||
@@ -1058,7 +1060,8 @@ static Surface* adopt_newer_alias(Surface* s) {
 }
 Surface* find_or_create_surface(const SurfaceDesc& d,bool forRendering) {
     if(!d.addr)return nullptr;
-    auto range=R.surfaces.equal_range(d.addr);
+    auto& cache=stereo_surface_cache(d);
+    auto range=cache.equal_range(d.addr);
     Surface* exact=nullptr;Surface* rendered=nullptr;
     auto score=[&](Surface* s){return std::make_tuple(s->width==d.width&&s->height==d.height,s->slices==d.slices,s->writeSeq);};
     // a rendered surface can stand in for a sampled view only with the same image type
@@ -1091,10 +1094,10 @@ Surface* find_or_create_surface(const SurfaceDesc& d,bool forRendering) {
     s->format=d.format;s->dim=d.dim;s->tileMode=d.tileMode;s->swizzle=d.swizzle;s->isDepth=d.isDepth;
     s->fmt=d.isDepth&&!forRendering?comparison_format_info(d.format):format_info(d.format,d.isDepth);
     create_surface_image(s.get(),forRendering);
-    auto* raw=s.get();R.surfaces.emplace(d.addr,std::move(s));
+    auto* raw=s.get();cache.emplace(d.addr,std::move(s));
     // format views of one guest surface (adopt_newer_alias): flag them once, so lookups stay cheap
     if(!raw->isDepth&&!raw->fmt.compressed&&raw->fmt.convert==Convert::NONE) {
-        auto views=R.surfaces.equal_range(d.addr);
+        auto views=cache.equal_range(d.addr);
         for(auto it=views.first;it!=views.second;++it) {
             Surface* o=it->second.get();
             if(o!=raw&&!o->isDepth&&!o->fmt.compressed&&o->fmt.convert==Convert::NONE&&o->format!=raw->format&&(o->format&0x3F)==(raw->format&0x3F)&&
@@ -1268,6 +1271,9 @@ static std::vector<uint8_t> read_guest_texels(Surface* img,uint32_t layer,uint32
 }
 // GX2CopySurface done on the GPU into a linear destination: the game reads it once the call returns
 static void write_back_linear_copy(Surface* img,uint32_t layer,GX2Surface* d,uint32_t dbase,uint32_t dstMip,uint32_t dstSlice,uint32_t w,uint32_t h) {
+    // Guest memory has one canonical picture. The other eye stays GPU-local.
+    extern int stereoEye;
+    if (stereoEye) return;
     LatteAddrLib::AddrSurfaceInfo_OUT di{};
     LatteAddrLib::GX2CalculateSurfaceInfo(d->format,d->width,d->height,d->depth,d->dim,d->tileMode,d->aa,dstMip,&di);
     auto dtm=static_cast<Latte::E_HWTILEMODE>(di.hwTileMode);
@@ -1310,7 +1316,7 @@ void copy_surface_impl(uint32_t srcAddr,uint32_t srcMip,uint32_t srcSlice,uint32
     // (a newer view in another format is copied into it first, adopt_newer_alias)
     const uint32_t srcFormat=uint32_t(s->format.value());
     auto better=[&](Surface* image){return !gpuSrc||std::make_pair(image->format==srcFormat,image->writeSeq)>std::make_pair(gpuSrc->format==srcFormat,gpuSrc->writeSeq);};
-    for(auto& [addr,image]:R.surfaces) {
+    for(auto& [addr,image]:stereo_copy_cache(sbase,w,h,s->depth)) {
         if(!image->gpuWritten)continue;
         if(addr==sbase&&image->width==w&&image->height==h) {if(better(image.get())){gpuSrc=image.get();gpuLevel=0;}}
         else if(addr==uint32_t(s->imagePtr)&&image->mips>srcMip&&std::max(image->width>>srcMip,1u)==w&&std::max(image->height>>srcMip,1u)==h)
@@ -1387,16 +1393,21 @@ void copy_surface_impl(uint32_t srcAddr,uint32_t srcMip,uint32_t srcSlice,uint32
         uint32_t offset=element_offset(di,dtm,x,y,dstSlice,bpp,dswz,&dci,(df.depth||df.convert==Convert::D24_R32F));
         memcpy(mem::ptr(dbase+offset),rows.data()+(size_t(y)*bw+x)*sf.bytesPerBlock,sf.bytesPerBlock);
     }
-    for(auto& [address,image]:R.surfaces)if(address==dbase){image->gpuWritten=false;image->dirty=true;image->lastCheckedFrame=~0ull;}
+    for(auto& [address,image]:stereo_copy_cache(dbase,dw,dh,d->depth))if(address==dbase){image->gpuWritten=false;image->dirty=true;image->lastCheckedFrame=~0ull;}
 }
 void copy_surface(uint32_t src,uint32_t srcMip,uint32_t srcSlice,uint32_t dst,uint32_t dstMip,uint32_t dstSlice) {
     copy_surface_impl(src,srcMip,srcSlice,dst,dstMip,dstSlice);
 }
 void invalidate(uint32_t flags,uint32_t addr,uint32_t size) {
+    ++g_stat_invalidates; // once per guest invalidate; the stereo eye cache is a second pass of the same one
     buffer_cache_guest_invalidate(flags,addr,size);
-    ++g_stat_invalidates;if(!(flags&2)||size>=0x10000000)return;
+    invalidate_surface_cache(R.surfaces,flags,addr,size);
+}
+void invalidate_surface_cache(decltype(Renderer::surfaces)& surfaces,
+                              uint32_t flags,uint32_t addr,uint32_t size) {
+    if(!(flags&2)||size>=0x10000000)return;
     uint64_t end=uint64_t(addr)+size;
-    for(auto& [base,s]:R.surfaces) {
+    for(auto& [base,s]:surfaces) {
         if(s->gpuWritten||(base>=0xF4000000&&base<0xF6000000))continue;
         // Already pending a fresh upload/check: another write cannot further
         // invalidate it. Count only range checks that actually reset state.

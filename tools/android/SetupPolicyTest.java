@@ -63,12 +63,12 @@ public final class SetupPolicyTest {
         expect("43.1 °C", SetupPolicy.batteryTemperature(431));
         expect("n/a", SetupPolicy.batteryTemperature(-1));
         expect("n/a", SetupPolicy.batteryTemperature(Integer.MIN_VALUE));
-        expect("Waiting for the phone to cool down (battery 43.1 °C, thermal status: none)",
+        expect("Waiting for the Android device to cool down (battery 43.1 °C, thermal status: none)",
             SetupPolicy.description("heat", 0, 431));
-        expect("Waiting for the phone to cool down (battery n/a, thermal status: severe)",
+        expect("Waiting for the Android device to cool down (battery n/a, thermal status: severe)",
             SetupPolicy.description("heat", 3, -1));
         String critical = SetupPolicy.description("critical", 4, 470);
-        if (!critical.startsWith("Paused because Android reports the phone as critically hot (battery 47.0 °C, thermal status: critical).") ||
+        if (!critical.startsWith("Paused because Android reports the device as critically hot (battery 47.0 °C, thermal status: critical).") ||
             !critical.contains("Continue anyway does not apply"))
             throw new AssertionError(critical);
         expect("Waiting for charging or at least 30% battery", SetupPolicy.description("battery", 0, 300));

@@ -1,3 +1,5 @@
+#include "../stereo_projection.h"
+#include "../stereo.h"
 #include "atomic_temporary.h"
 // Real Latte microcode -> Cemu GLSL -> SPIR-V for the Vulkan backend.
 #include "shaders.h"
@@ -1214,7 +1216,8 @@ ShaderStats shader_stats() {
 }
 
 void pack_uniforms_into(const uint32_t* regs, const Shader& shader,
-                        std::vector<uint8_t>& data, float scaleX, float scaleY) {
+                        std::vector<uint8_t>& data, float scaleX, float scaleY,
+                        float eyeOffset, float convergence) {
     const auto& offsets = shader.uniforms;
     data.resize((std::max(offsets.offset_endOfBlock, 16) + 15) & ~15);
     // Reused capacity may contain another shader's payload. Define every byte,
@@ -1228,18 +1231,39 @@ void pack_uniforms_into(const uint32_t* regs, const Shader& shader,
     auto bitsf = [](uint32_t value) { float result; memcpy(&result, &value, 4); return result; };
     uint32_t aluBase = mmSQ_ALU_CONSTANT0_0 + (shader.vertex ? 0x400 : 0);
     uint32_t blockBase = shader.vertex ? mmSQ_VTX_UNIFORM_BLOCK_START : mmSQ_PS_UNIFORM_BLOCK_START;
+    auto projectionRow = [&](int offset, const void* bytes, size_t available) {
+        if (!shader.vertex || eyeOffset == 0 || available < 64) return;
+        float p[16]; memcpy(p,bytes,64);
+        if (stereo::project_eye(p,eyeOffset,convergence)) copy(offset,p,16);
+    };
     if (offsets.offset_remapped >= 0) {
-        for (const auto& entry : shader.dec->list_remappedUniformEntries_register)
+        for (const auto& entry : shader.dec->list_remappedUniformEntries_register) {
             copy(offsets.offset_remapped + entry.mappedIndexOffset, regs + aluBase + entry.indexOffset / 4, 16);
+            const bool layoutRow = eyeOffset != 0 && shader.vertex && stereo::is_layout(regs) &&
+                aluBase+entry.indexOffset/4 == stereo::layoutProjectionStart;
+            if (!layoutRow && entry.indexOffset <= 4096-64)
+                projectionRow(offsets.offset_remapped+entry.mappedIndexOffset,
+                    regs+aluBase+entry.indexOffset/4,4096-entry.indexOffset);
+        }
         for (const auto& group : shader.dec->list_remappedUniformEntries_bufferGroups) {
             uint32_t address = regs[blockBase + group.kcacheBankIdOffset / 4];
             if (!address) continue;
-            for (const auto& entry : group.entries)
+            const size_t blockSize = std::min<uint32_t>(regs[blockBase+group.kcacheBankIdOffset/4+1]+1,0x10000);
+            for (const auto& entry : group.entries) {
                 copy(offsets.offset_remapped + entry.mappedIndexOffset, ppc_ptr(address + entry.indexOffset), 16);
+                if (entry.indexOffset < blockSize)
+                    projectionRow(offsets.offset_remapped+entry.mappedIndexOffset,
+                        ppc_ptr(address+entry.indexOffset),blockSize-entry.indexOffset);
+            }
         }
     }
-    if (offsets.offset_uniformRegister >= 0)
+    if (offsets.offset_uniformRegister >= 0) {
         copy(offsets.offset_uniformRegister, regs + aluBase, size_t(offsets.count_uniformRegister) * 16);
+        if (shader.vertex && eyeOffset != 0)
+            stereo::project_uniform_block(data.data()+offsets.offset_uniformRegister,
+                size_t(offsets.count_uniformRegister)*16,eyeOffset,convergence,
+                stereo::is_layout(regs) ? stereo::layoutProjection.data() : nullptr);
+    }
     put(offsets.offset_alphaTestRef, bitsf(regs[Latte::REGADDR::SX_ALPHA_REF]));
     float point = float(regs[Latte::REGADDR::PA_SU_POINT_SIZE] & 0xFFFF) / 8.0f;
     put(offsets.offset_pointSize, (point == 0 ? 0.125f : point) * scaleX);

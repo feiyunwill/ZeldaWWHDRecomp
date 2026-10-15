@@ -13,6 +13,7 @@ MANIFEST = b'''<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersio
 </requestedPrivileges></security></trustInfo>
 <application xmlns="urn:schemas-microsoft-com:asm.v3"><windowsSettings>
 <activeCodePage xmlns="http://schemas.microsoft.com/SMI/2019/WindowsSettings">UTF-8</activeCodePage>
+<longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
 </windowsSettings></application></assembly>'''
 
 
@@ -55,6 +56,12 @@ class WindowsManifest(unittest.TestCase):
                              MANIFEST.replace(b'2019/WindowsSettings', b'2005/WindowsSettings'),
                              MANIFEST.replace(b'windowsSettings', b'unrelatedSettings')):
                 self.assertTrue(self.check(pe(manifest), name))
+
+    def test_long_path_awareness_is_required(self):  # issue #144
+        for manifest in (MANIFEST.replace(b'>true<', b'>false<'),
+                         MANIFEST.replace(b'longPathAware', b'unrelated'),
+                         MANIFEST.replace(b'2016/WindowsSettings', b'2005/WindowsSettings')):
+            self.assertTrue(self.check(pe(manifest), 'wwhd.exe'))
 
     def test_appended_utf8_decoy_cannot_replace_missing_manifest_setting(self):
         bad = pe(MANIFEST.replace(b'activeCodePage', b'unrelated'))+MANIFEST

@@ -80,7 +80,8 @@ std::vector<uint32_t> compile_compute(const std::string& source, std::string* er
 std::vector<uint32_t> compile_glsl(const std::string& source, bool vertex, std::string* error = nullptr);
 // Caller-owned CPU scratch; all active bytes are freshly zeroed and packed.
 void pack_uniforms_into(const uint32_t* regs, const Shader& shader,
-    std::vector<uint8_t>& data, float scaleX = 1.0f, float scaleY = 1.0f);
+    std::vector<uint8_t>& data, float scaleX = 1.0f, float scaleY = 1.0f,
+    float eyeOffset = 0, float convergence = 600);
 std::vector<uint8_t> pack_uniforms(const uint32_t* regs, const Shader& shader,
     float scaleX = 1.0f, float scaleY = 1.0f);
 // After guest memory replacement and render drain; compiled variants stay alive.

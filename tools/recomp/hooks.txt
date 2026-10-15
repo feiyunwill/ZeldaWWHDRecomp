@@ -238,3 +238,7 @@
 
 026E9A38 # Retire shared HUD countdown presentation history before layout destruction
 0262769C # Retire boat-race countdown presentation history before layout destruction
+
+023D813C # daPy_sightPacket_c::setSight: aiming marker projection scope
+020CBB70 # daBoomerang_sightPacket_c::setSight: target marker projection scope
+025F1018 # mDoLib_projectViewport: project scoped interpolated marker points through the drawn camera

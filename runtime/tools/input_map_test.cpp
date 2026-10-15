@@ -10,7 +10,15 @@
 #include <string>
 
 #include "input_map.h"
+#include "mouse_bindings.h"
+#include "camera_invert.h"
+#include "controller_selection.h"
 #include "platform/touch_face.h"
+#include "overlay/settings_shortcut.h"
+#include "overlay/binding_capture.h"
+#include "platform/android_controller.h"
+#include "platform/touch_buttons.h"
+#include "overlay/mobile_ui.h"
 
 using namespace input_map;
 
@@ -25,6 +33,56 @@ static input::PadState press(const Mapping& m, std::initializer_list<int> codes)
     bool keys[256] = {};
     for (int c : codes) keys[c] = true;
     return keyboard_state(m, keys);
+}
+
+static void test_mouse() {
+    auto m = Mapping::defaults();
+    const auto old = to_json(m);
+    for (const auto& slots : m.keys) for (int code : slots) CHECK(code < kMouse1);
+    const char* ids[] = {"Mouse1", "Mouse2", "Mouse3", "Mouse4", "Mouse5", "WheelUp", "WheelDown"};
+    for (int i=0;i<7;++i) {
+        CHECK(key_id(kMouse1+i) == ids[i]); CHECK(key_from_id(ids[i]) == kMouse1+i);
+        CHECK(!key_label(kMouse1+i).empty()); CHECK(!key_short_label(kMouse1+i).empty());
+        m.keys[kA][0] = kMouse1+i;
+        Mapping out; CHECK(from_json(to_json(m),out)); CHECK(out == m);
+        bool raw[kInputCount]{}; raw[kMouse1+i] = true;
+        CHECK(keyboard_state(m,raw,kInputCount).buttons == input::kA);
+        CHECK(keyboard_state(m,raw).buttons == 0); // legacy keyboard callers never read mouse slots
+    }
+    Mapping legacy; CHECK(from_json(old,legacy)); CHECK(legacy == Mapping::defaults());
+    m.keys[kA] = {kMouse1,kNoKey}; m.keys[kB] = {kMouse1,kNoKey};
+    CHECK(has_conflict(m,kA)); CHECK(conflict_count(m) == 1);
+    m.keys[kB] = {kMouse2,kNoKey}; m.keys[kX] = {kWheelUp,kNoKey}; m.keys[kY] = {kWheelDown,kNoKey};
+    input::MouseBindings mouse;
+    mouse.button(1,0,true,false); CHECK(mouse.read(m,true).buttons == 0); // capture-only click
+    mouse.button(1,0,false,true); mouse.button(1,0,true,true);
+    CHECK(mouse.read(m,true).buttons == input::kA);
+    mouse.consume(); CHECK(mouse.read(m,true).buttons == 0); // overlay transition without a read
+    mouse.button(2,1,true,true); CHECK(mouse.read(m,true).buttons == input::kB); // other device works
+    mouse.button(1,0,false,true); mouse.button(1,0,true,true);
+    CHECK(mouse.read(m,true).buttons == (input::kA|input::kB));
+    CHECK(mouse.read(m,false).buttons == 0); CHECK(mouse.read(m,true).buttons == 0); // text prompt
+    mouse.button(1,0,false,true); mouse.button(2,1,false,true);
+    mouse.wheel(2,true); CHECK(mouse.read(m,true).buttons == input::kX);
+    CHECK(mouse.read(m,true).buttons == 0); CHECK(mouse.read(m,true).buttons == input::kX);
+    CHECK(mouse.read(m,true).buttons == 0); CHECK(mouse.read(m,true).buttons == 0);
+    mouse.wheel(-1,false); CHECK(mouse.read(m,true).buttons == 0);
+    mouse.wheel(-0.5f,true); CHECK(mouse.read(m,true).buttons == 0);
+    mouse.wheel(-0.5f,true); CHECK(mouse.read(m,true).buttons == input::kY);
+    mouse.consume(); CHECK(mouse.read(m,true).buttons == 0);
+    mouse.wheel(1,true); mouse.wheel(-1,true); mouse.wheel(1,true);
+    CHECK(mouse.read(m,true).buttons == input::kX); CHECK(mouse.read(m,true).buttons == 0);
+    CHECK(mouse.read(m,true).buttons == input::kY); CHECK(mouse.read(m,true).buttons == 0);
+    CHECK(mouse.read(m,true).buttons == input::kX); CHECK(mouse.read(m,true).buttons == 0);
+    mouse.wheel(2,true); CHECK(mouse.read(m,true,nullptr,nullptr,false).buttons == 0);
+    CHECK(mouse.read(m,true).buttons == 0); // wheel option drops queued bindings
+    m.keys[kLUp]={kMouse1,kNoKey}; m.keys[kA].fill(kNoKey);
+    bool keyboard[256]{}; keyboard[kVK_ANSI_D]=true;
+    mouse.button(1,0,true,true);
+    auto combined=mouse.read(m,true,keyboard);
+    CHECK(std::fabs(combined.lx-0.70710678f)<0.0001f && std::fabs(combined.ly-0.70710678f)<0.0001f);
+    mouse.remove_device(1); CHECK(mouse.read(m,true,keyboard).lx == 1 && mouse.read(m,true,keyboard).ly == 0);
+    CHECK(mouse.read(m,false,keyboard).lx == 1); // consuming the mouse preserves keyboard input
 }
 
 static void test_defaults() {
@@ -72,6 +130,110 @@ static void test_defaults() {
     m.deadzone = 0;  // check axis bindings independently of the default dead zone
     s = controller_state(m, v);
     CHECK(std::fabs(s.lx + 0.6f) < 1e-6 && std::fabs(s.ry - 0.3f) < 1e-6);
+}
+
+static void test_apple_face_normalization() {
+    using AL = AppleFaceLayout;
+    using FL = FaceLabel;
+    for (const char* name : {"Switch Pro Controller", "Nintendo Switch Pro Controller",
+                            "Nintendo Switch Joy-Con (L/R)", "JoyCon Pair", "Nintendo SNES Controller",
+                            "SNES Controller", "Super Famicom Controller", "Nintendo Switch Online SNES"}) {
+        CHECK(apple_face_layout(name, nullptr) == AL::kNintendo);
+        CHECK(apple_face_layout(nullptr, name) == AL::kNintendo);
+    }
+    CHECK(apple_face_layout("sWiTcH pRo CoNtRoLlEr", "") == AL::kNintendo);
+    CHECK(apple_face_layout("Wireless Controller", "Nintendo") == AL::kNintendo);
+    for (const char* name : {"Nintendo Switch Joy-Con (L)", "Nintendo Switch Joy-Con (R)", "JoyCon (L)"})
+        CHECK(apple_face_layout(name, nullptr) == AL::kJoyConSingle);
+    for (const char* name : {"Xbox One", "DualSense", "DualShock 4", "Wireless Controller", "Switcheroo",
+                            "Nintendo N64 Controller", "Nintendo NES Controller", "Nintendo Genesis Controller", ""})
+        CHECK(apple_face_layout(name, nullptr) == AL::kStandard);
+    CHECK(apple_face_layout(nullptr, nullptr) == AL::kStandard);
+    CHECK(apple_face_layout("Xbox One", "Nintendo SNES-style pad") == AL::kStandard);
+    CHECK(apple_face_layout("Nintendo GameCube Controller", nullptr) == AL::kStandard);
+    CHECK(apple_face_layout("Nintendo Switch Joy-Con  (L / R)", nullptr) == AL::kNintendo);
+    const FL raw[] = {FL::kA, FL::kB, FL::kX, FL::kY};
+    const FL expected[] = {FL::kB, FL::kA, FL::kY, FL::kX};
+    for (AL layout : {AL::kStandard, AL::kNintendo, AL::kJoyConSingle}) {
+        FL labels[] = {raw[0], raw[1], raw[2], raw[3]};
+        apple_face_labels(layout, labels);
+        const int destinations[3][4] = {{kPadA, kPadB, kPadX, kPadY},
+                                       {kPadB, kPadA, kPadY, kPadX},
+                                       {kPadA, kPadX, kPadB, kPadY}};
+        for (int i = 0; i < 4; ++i) {
+            const int dest = destinations[int(layout)][i];
+            CHECK(apple_face_input(layout, kPadA + i) == dest);
+            CHECK(labels[dest - kPadA] == raw[i]);
+            float values[kPadCount]{};
+            values[apple_face_input(layout, kPadA + i)] = 0.73f;
+            CHECK(values[dest] == 0.73f);
+            Mapping m = Mapping::defaults();
+            CHECK(controller_state(m, values).buttons == action_bit(
+                dest == kPadB ? kA : dest == kPadA ? kB : dest == kPadY ? kX : kY));
+        }
+        for (int p = kPadLB; p < kPadCount; ++p) CHECK(apple_face_input(layout, p) == p);
+        CHECK(apple_face_input(layout, kPadNone) == kPadNone);
+        if (layout == AL::kNintendo) {
+            for (int i = 0; i < 4; ++i) CHECK(labels[i] == expected[i]);
+            CHECK(pad_family_from_labels(labels) == PadFamily::kNintendo);
+            note_face_labels(labels);
+            Mapping automatic = Mapping::defaults();
+            set_face_auto(automatic, true);
+            CHECK(automatic.face_auto && face_layout(automatic) == FaceLayout::kPosition);
+            const auto style = prompt_style(automatic, pad_family_from_labels(labels));
+            CHECK(style.face == FaceStyle::kOriginal && !style.positions && !style.active());
+        }
+    }
+    // Parse representative framework SF Symbols and localized names before routing them.
+    for (bool symbols : {false, true}) {
+        const char* names[4] = {symbols ? "a.circle" : "Button A", symbols ? "b.circle.fill" : "Button B",
+                                symbols ? "x.circle" : "Button X", symbols ? "y.circle.fill" : "Button Y"};
+        FL labels[4];
+        for (int i = 0; i < 4; ++i) labels[i] = face_label_from_text(names[i]);
+        apple_face_labels(AL::kNintendo, labels);
+        for (int i = 0; i < 4; ++i) CHECK(labels[i] == expected[i]);
+        Mapping m = Mapping::defaults();
+        note_face_labels(labels);
+        set_face_auto(m, true);
+        CHECK(face_layout(m) == FaceLayout::kPosition);
+        CHECK(prompt_style(m, pad_family()).face == FaceStyle::kOriginal);
+        for (int i = 0; i < 4; ++i) {
+            float values[kPadCount]{};
+            values[apple_face_input(AL::kNintendo, kPadA + i)] = 1;
+            CHECK(controller_state(m, values).buttons == action_bit(kA + i));
+            Mapping by_label = m;
+            apply_face_layout(by_label, FaceLayout::kLabels);
+            CHECK(controller_state(by_label, values).buttons == action_bit(
+                i == 0 ? kB : i == 1 ? kA : i == 2 ? kY : kX));
+        }
+    }
+    FL partial[] = {FL::kA, FL::kUnknown, FL::kX, FL::kUnknown};
+    apple_face_labels(AL::kNintendo, partial);
+    CHECK(partial[0] == FL::kUnknown && partial[1] == FL::kA &&
+          partial[2] == FL::kUnknown && partial[3] == FL::kX);
+    FL missing[4]{};
+    apple_face_labels(AL::kNintendo, missing);
+    for (FL label : missing) CHECK(label == FL::kUnknown);
+    Mapping m = Mapping::defaults(), saved;
+    CHECK(!apple_face_workaround(m, AL::kNintendo));
+    apply_face_layout(m, FaceLayout::kLabels);
+    CHECK(from_json(to_json(m), saved) && saved == m);
+    CHECK(apple_face_workaround(saved, AL::kNintendo));
+    CHECK(!apple_face_workaround(saved, AL::kStandard));
+    CHECK(!apple_face_workaround(saved, AL::kJoyConSingle));
+    // Detection never mutates a deliberate mapping, including non-face customizations.
+    saved.pad[kL] = kPadRT;
+    const Mapping before = saved;
+    CHECK(apple_face_workaround(saved, AL::kNintendo) && saved == before);
+    saved.face_auto = true;
+    CHECK(!apple_face_workaround(saved, AL::kNintendo));
+    saved.face_auto = false;
+    for (int a = kA; a <= kY; ++a) {
+        Mapping custom = saved;
+        custom.pad[a] = kPadLB;
+        CHECK(face_layout(custom) == FaceLayout::kCustom);
+        CHECK(!apple_face_workaround(custom, AL::kNintendo));
+    }
 }
 
 static void test_face_layout() {
@@ -185,6 +347,10 @@ static void test_face_auto() {
     Mapping m = Mapping::defaults();
     CHECK(!m.face_auto && face_layout(m) == FaceLayout::kPosition);
     note_face_labels(nintendo);
+    CHECK(std::string(pad_label(kPadA)) == "B (bottom)");
+    CHECK(std::string(pad_label(kPadB)) == "A (right)");
+    CHECK(std::string(pad_short_label(kPadX)) == "Y");
+    CHECK(std::string(pad_short_label(kPadY)) == "X");
     set_face_auto(m, true);
     CHECK(m.face_auto && face_layout(m) == FaceLayout::kPosition);
     note_face_labels(xbox);
@@ -247,6 +413,95 @@ static void test_face_auto() {
     Mapping r;
     CHECK(load_file(path, r) && r.face_auto && face_layout(r) == FaceLayout::kPosition);
     std::filesystem::remove_all(dir, ec);
+}
+
+// In-game button prompts (#143): the resolved style and the controls.json round trip
+static void test_prompts() {
+    using FL = FaceLabel;
+    const FL xbox[4] = {FL::kA, FL::kB, FL::kX, FL::kY};
+    const FL ps[4] = {FL::kCross, FL::kCircle, FL::kSquare, FL::kTriangle};
+    const FL nintendo[4] = {FL::kB, FL::kA, FL::kY, FL::kX};
+    const FL none[4] = {FL::kUnknown, FL::kUnknown, FL::kUnknown, FL::kUnknown};
+    CHECK(pad_family_from_labels(xbox) == PadFamily::kXbox);
+    CHECK(pad_family_from_labels(ps) == PadFamily::kPlayStation);
+    CHECK(pad_family_from_labels(nintendo) == PadFamily::kNintendo);
+    CHECK(pad_family_from_labels(none) == PadFamily::kUnknown);
+
+    Mapping m = Mapping::defaults();
+    CHECK(m.prompts == Mapping::Prompts::kAuto && m.shoulder_names == Mapping::ShoulderNames::kAuto && m.prompt_colours);
+    // by position: the game's own prompts, whatever the pad
+    for (PadFamily f : {PadFamily::kUnknown, PadFamily::kXbox, PadFamily::kPlayStation, PadFamily::kNintendo}) {
+        const PromptStyle s = prompt_style(m, f);
+        CHECK(!s.active() && !s.positions && !s.colours);
+    }
+    // by label, automatic: Xbox look (LB/RB/LT/RT) unless the pad is a PlayStation one (L1/R1/L2/R2)
+    apply_face_layout(m, FaceLayout::kLabels);
+    PromptStyle s = prompt_style(m, PadFamily::kXbox);
+    CHECK(s.face == FaceStyle::kXbox && s.colours && s.positions && s.shoulders == ShoulderStyle::kXbox);
+    CHECK(prompt_style(m, PadFamily::kUnknown) == s);
+    CHECK(prompt_style(m, PadFamily::kNintendo) == s);
+    s = prompt_style(m, PadFamily::kPlayStation);
+    CHECK(s.face == FaceStyle::kPlayStation && s.colours && s.positions && s.shoulders == ShoulderStyle::kNumbered);
+    // white buttons at the Xbox positions (#143 a)
+    m.prompt_colours = false;
+    s = prompt_style(m, PadFamily::kXbox);
+    CHECK(s.face == FaceStyle::kXbox && !s.colours && s.positions);
+    m.prompt_colours = true;
+    // fixed choices
+    m.prompts = Mapping::Prompts::kPlayStation;
+    CHECK(prompt_style(m, PadFamily::kXbox).face == FaceStyle::kPlayStation);
+    m.prompts = Mapping::Prompts::kXbox;
+    CHECK(prompt_style(m, PadFamily::kPlayStation).face == FaceStyle::kXbox);
+    m.prompts = Mapping::Prompts::kOriginal;
+    s = prompt_style(m, PadFamily::kXbox);
+    CHECK(!s.active() && !s.positions && !s.colours);
+    m.shoulder_names = Mapping::ShoulderNames::kNumbered;  // today's R1/R2 names, kept on request
+    CHECK(prompt_style(m, PadFamily::kXbox).shoulders == ShoulderStyle::kNumbered);
+    m.shoulder_names = Mapping::ShoulderNames::kNintendo;
+    m.prompts = Mapping::Prompts::kAuto;
+    CHECK(prompt_style(m, PadFamily::kXbox).shoulders == ShoulderStyle::kOriginal);
+    // a fixed shoulder choice also applies by position (the shoulder bindings do not move)
+    apply_face_layout(m, FaceLayout::kPosition);
+    m.shoulder_names = Mapping::ShoulderNames::kXbox;
+    s = prompt_style(m, PadFamily::kXbox);
+    CHECK(s.face == FaceStyle::kOriginal && !s.positions && s.shoulders == ShoulderStyle::kXbox && s.active());
+    // custom face bindings: the game's face prompts
+    apply_face_layout(m, FaceLayout::kLabels);
+    m.pad[kX] = kPadLB;
+    CHECK(prompt_style(m, PadFamily::kXbox).face == FaceStyle::kOriginal);
+
+    // controls.json: defaults are not written; every choice comes back
+    const Mapping d = Mapping::defaults();
+    const std::string plain = to_json(d);
+    CHECK(plain.find("button_prompts") == std::string::npos && plain.find("shoulder_names") == std::string::npos &&
+          plain.find("button_colours") == std::string::npos);
+    for (auto p : {Mapping::Prompts::kAuto, Mapping::Prompts::kOriginal, Mapping::Prompts::kXbox, Mapping::Prompts::kPlayStation})
+        for (auto n : {Mapping::ShoulderNames::kAuto, Mapping::ShoulderNames::kNintendo, Mapping::ShoulderNames::kNumbered,
+                       Mapping::ShoulderNames::kXbox})
+            for (bool c : {true, false}) {
+                Mapping w = d, r;
+                w.prompts = p;
+                w.shoulder_names = n;
+                w.prompt_colours = c;
+                std::string err;
+                CHECK(from_json(to_json(w), r, &err) && err.empty() && r == w);
+            }
+    Mapping r;
+    std::string err;
+    CHECK(from_json("{\"options\": {\"button_prompts\": \"sega\", \"shoulder_names\": 3}}", r, &err));
+    CHECK(r.prompts == Mapping::Prompts::kAuto && r.shoulder_names == Mapping::ShoulderNames::kAuto);
+    CHECK(err.find("button_prompts") != std::string::npos);
+
+    // a new pad family is a new generation: the prompts follow the pad that was plugged in
+    note_face_labels(xbox);
+    const uint32_t g = generation();
+    note_face_labels(ps);
+    CHECK(pad_family() == PadFamily::kPlayStation && generation() != g);
+    const uint32_t g2 = generation();
+    note_face_labels(none);  // unplugged: the last family stands
+    CHECK(pad_family() == PadFamily::kPlayStation && generation() == g2);
+    note_face_labels(xbox);
+    CHECK(pad_family() == PadFamily::kXbox);
 }
 
 static void test_face_label_text() {
@@ -337,7 +592,7 @@ static void test_json_roundtrip() {
     CHECK(press(r, {kVK_ANSI_K}).buttons == input::kB);
     CHECK(press(r, {kVK_ANSI_J}).buttons == input::kA);
     CHECK(press(r, {kVK_ANSI_H}).buttons == 0);
-    CHECK(press(r, {kVK_UpArrow}).ry == -1);  // inverted camera
+    CHECK(press(r, {kVK_UpArrow}).ry == 1);   // issue #167: the stick stays as it is (the camera inverts)
     CHECK(press(r, {kVK_ANSI_W}).ly == 1);    // move stick not inverted
     // the Automatic preset is the one face state that is stored
     CHECK(to_json(Mapping::defaults()).find("face_layout") == std::string::npos);
@@ -420,7 +675,38 @@ static void test_deadzone() {
     CHECK(std::fabs(controller_state(m, v).lx - 0.5f) < 1e-6);  // (0.6 - 0.2) / 0.8
     v[kPadLSRight] = 0; v[kPadRSDown] = 0.6f;
     m.invert_camera_y = true;
-    CHECK(std::fabs(controller_state(m, v).ry - 0.5f) < 1e-6);
+    CHECK(std::fabs(controller_state(m, v).ry + 0.5f) < 1e-6);  // issue #167: not inverted here
+}
+
+// issue #167: Invert camera up/down is camera only (camera_invert.h): the mapping hands the game the
+// stick as it is, and only the camera's reads of it are inverted, so the Wind Waker baton is not
+static void test_camera_invert() {
+    using camera_invert::Use;
+    Mapping m = Mapping::defaults();
+    float v[kPadCount] = {};
+    v[kPadRSUp] = 1.0f;
+    for (bool inv : {false, true}) {
+        m.invert_camera_y = inv;
+        const float ry = controller_state(m, v).ry;
+        CHECK(ry == 1.0f);                                                  // controller: raw either way
+        CHECK(camera_invert::stick_y(ry, inv, Use::kBaton) == 1.0f);        // baton: conducts up
+        CHECK(camera_invert::stick_y(ry, inv, Use::kFigureZoom) == 1.0f);   // figure viewer zoom
+        CHECK(camera_invert::stick_y(ry, inv, Use::kCamera) == (inv ? -1.0f : 1.0f));  // camera inverted
+        CHECK(camera_invert::mouse_pitch_sign(inv) == (inv ? -1.0f : 1.0f));
+    }
+    bool keys[256] = {};
+    for (int k : m.keys[kRUp])
+        if (k >= 0 && k < 256) keys[k] = true;
+    m.invert_camera_y = true;
+    CHECK(keyboard_state(m, keys).ry == 1.0f);  // keyboard: raw too
+    // every reader of the right stick's Y is classified; only the camera's are hooked
+    int camera = 0, baton = 0;
+    for (const auto& site : camera_invert::kSites) {
+        camera += site.use == Use::kCamera;
+        baton += site.use == Use::kBaton;
+        CHECK(camera_invert::inverts(site.use) == (site.use == Use::kCamera));
+    }
+    CHECK(camera == 5 && baton == 1);
 }
 
 // issue #40: per-stick range, applied radially after the dead zone
@@ -556,11 +842,94 @@ static void test_conflict_helpers() {
     for (int p = 1; p < kPadCount; p++) CHECK(*pad_short_label(p));
 }
 
+static void test_binding_capture_faces() {
+    for (int face : {kPadA, kPadB, kPadX, kPadY}) {
+        overlay::BindingCapture capture;
+        float values[kPadCount] = {};
+        values[kPadB] = 1;
+        CHECK(capture.poll(values) == -1);  // the confirm that opened capture
+        values[kPadB] = 0;
+        CHECK(capture.poll(values) == -1);
+        values[face] = 1;
+        CHECK(capture.poll(values) == face);
+        Mapping m = Mapping::defaults();
+        for (int action = kA; action <= kY; ++action) {
+            set_pad_binding(m, action, face);
+            CHECK(controller_state(m, values).buttons & action_bit(action));
+        }
+        capture.reset();
+        CHECK(capture.poll(values) == -1);
+    }
+}
+
+static void test_android_odin_mapping() {
+    const std::string old = "03000000,name,a:b0,b:b1,back:b4,start:b6,leftx:a0,lefty:a1,face:abxy,";
+    CHECK(android_controller::mapping(0x045e, 0x111, old) == old);
+    CHECK(android_controller::mapping(0x2020, 0x112, old) == old);
+    const auto fixed = android_controller::mapping(0x2020, 0x111, old);
+    CHECK(fixed.find("a:b1,b:b0,x:b3,y:b2,face:bayx,") != std::string::npos);
+    CHECK(fixed.find("back:b4,start:b6,leftx:a0,lefty:a1,") != std::string::npos);
+    CHECK(fixed.find("a:b0,") == std::string::npos);
+    CHECK(android_controller::mapping(0x2020, 0x111, fixed) == fixed);
+    Mapping repaired;
+    std::string warning;
+    CHECK(from_json(R"({"controller":{"A":null,"B":null,"X":null,"Y":null,"Home":null}})", repaired, &warning));
+    for (int a = kA; a <= kY; ++a) {
+        CHECK(repaired.pad[a] == Mapping::defaults().pad[a]);
+        CHECK(warning.find(std::string("null face binding ") + action_id(a) + " repaired") != std::string::npos);
+    }
+    CHECK(repaired.pad[kHome] == kPadNone);
+}
+
+static void test_settings_shortcut() {
+    using S = overlay::SettingsShortcut;
+    S s;
+    CHECK(s.poll(10, true, false, false) == S::None);
+    CHECK(s.poll(10.499, true, false, false) == S::None);
+    CHECK(s.poll(10.5, true, false, false) == S::Open);
+    CHECK(s.poll(13, true, false, true) == S::None);  // held: never toggle again
+    CHECK(s.poll(14, false, false, true) == S::None);
+    CHECK(s.poll(15, true, false, true) == S::Close);
+    CHECK(s.poll(16, false, false, false) == S::None);
+    CHECK(s.poll(17, true, false, false) == S::None);
+    CHECK(s.poll(17.2, false, false, false) == S::None);  // short Minus stays in the game
+    CHECK(s.poll(18, false, true, false) == S::Open);
+    CHECK(s.poll(19, false, true, true) == S::None);
+    CHECK(s.poll(20, false, false, true) == S::None);
+    CHECK(s.poll(21, false, true, true) == S::Close);
+    // Input polls continue while the renderer is stalled for three seconds.
+    S stalled;
+    double opened = -1;
+    for (int i = 0; i <= 3000; ++i)
+        if (stalled.poll(i / 1000.0, true, false, false) == S::Open) opened = i / 1000.0;
+    CHECK(opened == 0.5);
+}
+
 int main() {
+    for (int mode : {touch_buttons::Automatic, touch_buttons::AlwaysShow, touch_buttons::Hide})
+        for (bool controller : {false, true}) {
+            CHECK(touch_buttons::visible(mode, controller, false) ==
+                  (mode == touch_buttons::AlwaysShow || (mode == touch_buttons::Automatic && !controller)));
+            CHECK(touch_buttons::visible(mode, controller, true));
+        }
+    for (float dpi : {160.f, 320.f, 367.f, 420.f, 640.f}) {
+        const float automatic = mobile_ui::scale(dpi, 1, 0);
+        CHECK(std::fabs(49 * automatic * 25.4f / dpi - 8.0f) < 0.001f);
+        CHECK(mobile_ui::scale(dpi, 1, 1) < automatic);
+        CHECK(mobile_ui::scale(dpi, 1, 2) == automatic);
+        CHECK(mobile_ui::scale(dpi, 1, 3) > automatic);
+    }
+    CHECK(std::isfinite(mobile_ui::scale(NAN, NAN, 0)));
+    test_settings_shortcut();
+    test_android_odin_mapping();
+    test_binding_capture_faces();
     test_conflict_helpers();
+    test_mouse();
     test_defaults();
+    test_apple_face_normalization();
     test_face_layout();
     test_face_auto();
+    test_prompts();
     test_touch_face();
     test_face_label_text();
     test_names();
@@ -570,6 +939,27 @@ int main() {
     test_json_partial_and_bad();
     test_deadzone();
     test_stick_range();
+    test_camera_invert();
+    using controller_selection::decision;
+    CHECK(decision(true, true, 0, true, true) == 0);
+    CHECK(decision(true, true, 1, true, true) == 1);
+    CHECK(decision(false, true, 0, true, true) == -1);
+    CHECK(decision(true, false, 1, true, true) == -1);
+    CHECK(decision(true, true, -1, true, true) == -1);
+    CHECK(decision(true, true, 2, true, true) == -1);
+    CHECK(decision(true, true, 0, false, true) == -1);
+    CHECK(decision(true, true, 1, true, false) == -1);
+    Mapping skip = Mapping::defaults(), parsed;
+    CHECK(skip.skip_controller_selection);
+    CHECK(from_json("{\"options\":{}}", parsed));
+    CHECK(parsed.skip_controller_selection);
+    skip.skip_controller_selection = false;
+    CHECK(from_json(to_json(skip), parsed));
+    CHECK(parsed == skip);
+    set_current(skip, false);
+    CHECK(!skip_controller_selection());
+    set_current(Mapping::defaults(), false);
+    CHECK(skip_controller_selection());
     test_files();
     printf("input_map_test: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

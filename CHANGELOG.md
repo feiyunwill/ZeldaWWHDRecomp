@@ -7,6 +7,246 @@ what is on `devel` and not released yet (also in the
 
 ## Next update
 
+- **Story system for quest mods** (letters, a quest notebook and sea-chart marks, in the game's own style). The
+  port brings the system; all quest content comes from the mod catalogue:
+  - **Story system** (Mods > Built-in, on): it needs the **Story Notebook** package from the mod catalogue, which
+    setup installs (it needs the internet once). If setup was offline, install it later in Mods: switch the
+    Story system on, or press Install on its line. It's required for every quest mod and stays enabled. The game's
+    start never goes online; without the package the story system stays inactive and the normal game is
+    unchanged.
+  - **Letters by Rito mail:** a quest mod announces its quest with a letter from the Rito postbox, once Link has
+    the Delivery Bag. The Story Notebook package's letter brings the **story notebook**.
+  - **Story notebook:** in the Delivery Bag. Its page lists every mod quest with the next step, where to go and its
+    status, with an Archive tab for finished quests. "Show on chart" puts the game's red circle on the tracked
+    step, also in the zoomed chart square, and it follows characters who walk around.
+  - **Quests described as data:** a mod's `manifest.json` lists its quests, steps, places, characters and rewards.
+    Steps can wait for story or item conditions ("Not yet possible: ...").
+  - **Characters take part:** a quest can give a resident new lines. When several quests want the same character,
+    the game's own choice box asks which one. The King of Red Lions says a one-time line for the tracked quest.
+    Residents are named by neutral ids; their names and places are read from your own game files.
+  - **Mod charts:** mods can mark places on Link's sea chart with the game's rings, like the game's treasure charts.
+  - **Progress is kept in the save file** in a small block the game itself ignores. Removing the mods leaves a normal
+    save.
+  Details for mod authors in docs/mod-sdk-v2.md; the Story Notebook package and the example quest mods are in the
+  mod repository.
+
+## v0.2.14
+
+- **The controller selection after the title screen is skipped** (issue #189, thanks @floysh): the game no longer asks
+  whether you play with the Wii U GamePad or a Pro Controller, because the port already knows it from Controls. It picks
+  the matching option through the game's own selection, so everything that depends on it stays the same. To choose by
+  hand again, turn off **Controls > Skip controller selection**.
+
+- **GamePad screen "Automatic": follows the game's menus** (from a play test): in the automatic GamePad screen mode,
+  the GamePad picture now appears in the corner of the TV whenever the game opens something on the GamePad (items,
+  maps, the collection, the Delivery Bag, save and options, song and warp lists) and goes away shortly after it closes.
+  Before, it guessed from how much the GamePad picture changed and often missed the pause menu. Cmd+G still keeps
+  it up, and Off-TV Play shows the GamePad picture full size as before. The other GamePad screen modes are unchanged.
+
+- **PlayStation and Xbox button looks in the action hint near Link** (issue #188, thanks @floysh): the floating hint that
+  appears next to Link (for example "Speak" in front of a character) still showed the A button with PlayStation or
+  Xbox button labels. It now uses the same shapes and colours as the button cluster in the corner. With the original
+  look nothing changes.
+
+- **Experimental stereo 3D, HDR output and a gameplay FOV setting** (PR #168, thanks @pancreations): the Graphics tab
+  gains **Stereoscopic 3D** (Vulkan only: Half SBS, Full SBS and top-and-bottom, with depth, convergence and eye swap;
+  each eye renders its own view; 30 fps recommended for now), **HDR output** (Windows with Vulkan, when Windows HDR is
+  on; falls back to SDR with a note if the display can't do it) and **Gameplay FOV** (75% to 250%; cutscenes, dialogue
+  and menus keep their original view). All three are off / 100% by default, and the game looks and runs exactly as
+  before until you turn them on. Settings are kept between launches, on macOS too.
+
+- **Ports can bring their own renderer** (PR #187, issue #185, thanks @Pulpparty): a platform port (for example a
+  Switch build with deko3d) can now register its own renderer at start-up (`gfx/renderer_ext.h`) without editing the
+  renderer or GX2 code. Nothing changes for Metal and Vulkan: the renderer choice, menus, shader caches and
+  performance stay as they were.
+
+- **Mouse buttons and the wheel can be bound in Controls** (issue #165, thanks @PNOAGAMER): left, right, middle, side
+  buttons 4/5 and wheel up/down are now bindable like keys, so the game can be played fully with mouse and keyboard
+  together with the mouse camera (Mods > Built-in). Bound mouse buttons drive the game while the mouse camera has
+  captured the pointer in the TV window; the settings menu, GamePad-window touch and text prompts keep the mouse as
+  before, and "first person on the mouse wheel" keeps priority over wheel bindings. Nothing is bound by default.
+
+- **Setup: disc images and Cemu's keys.txt** (from a player support case): a `.wux`/`.wud` needs two keys, the disc key
+  of your dump and the Wii U common key. Setup now accepts Cemu's `keys.txt` directly and finds both keys in it
+  (choose it once for either key), the disc key can also be pasted, and the keys screen explains this, including
+  the no-key alternative (Cemu's "Convert to compressed Wii U archive (.wua)"). Clearer errors, e.g. when the
+  common key was entered as the disc key. Key values are never shown, logged or saved. (Desktop setup; Android follows.)
+
+- **Android setup: keys.txt and safer key handling:** the same `keys.txt` support as on desktop (choose Cemu's
+  `keys.txt` once, setup finds both keys). Key files are now only read when needed and no longer copied into the app;
+  if a key file was moved or its access was lost, setup asks you to choose it again instead of failing. Setups
+  started with an older version keep working.
+
+- **Less memory per shader translation** (PR #184, thanks @Pulpparty): the shader translator reserves 1 MB of text
+  per shader instead of 12 MB and grows only if needed (the largest game shader is far smaller), which helps devices
+  with little memory. One of its text functions also no longer cuts long text short.
+
+- **Building from a folder with spaces in its path** (PR #183, thanks @Pulpparty): the shader translator and two tests no
+  longer fail to compile when the checkout path contains a space (for example a Windows user name like `C:/Users/Jane Doe`).
+
+- **macOS: Nintendo controllers have the right buttons** (issue #181, thanks @Nickinfinity): with a Switch Pro Controller,
+  Joy-Cons or an SNES-style pad, **By position (Nintendo)** had A/B and X/Y swapped, because macOS reports these pads by
+  their printed letters. They now drive the right buttons and show Nintendo icons; a single sideways Joy-Con is handled
+  too. If you swapped A/B and X/Y by hand as a workaround, choose **Input > Face buttons > By position (Nintendo)** or
+  **Automatic** once after updating; your saved bindings are otherwise kept.
+
+- **Steam Deck Gaming Mode: the settings menu stays open** (issue #112, thanks @chaberl-art): with the TV and GamePad
+  screens in two windows, the menu could close again right after opening. F1 now toggles once per press (a release
+  is needed before it toggles again), keys and the save-state hotkeys (Shift+F1..F5 save, F2..F5 load) work from
+  either game window, and switching focus between them clears held keys without closing the menu. The log now says
+  why the menu opened or closed (`[overlay] closed (F1 key, window TV, ...)`). In Gaming Mode the menu, the save-state
+  messages and touch now follow the window that has focus, so they also show when the GamePad window is the one on
+  screen (before, the menu could open there invisibly and hold Link in place).
+
+- **Settings overlay: extension points for other platforms** (PR #175, thanks @Pulpparty): ports such as the
+  community Switch port can add their own settings tabs, hide built-in ones, plug in a system keyboard, controller
+  shortcuts and on-screen layers, without changing the overlay's code. Nothing changes on our platforms.
+
+- **The aiming reticle no longer doubles at 60+ fps** (issue #163, thanks @Julancho): with the boomerang, grappling
+  hook and hookshot, the red aiming dot (and the boomerang's target markers) stayed at the game's 30 Hz position
+  while the camera moved smoothly between frames, so it jumped back and forth during camera turns. It now moves
+  with the camera; 30 fps is unchanged. `WWHD_RETICLE_FIX=0` turns the fix off.
+
+- **No crash when memory for a shader's source runs out** (PR #171, thanks @Pulpparty): the shader translator's text
+  buffer now handles failed allocations (the shader just fails to compile and is retried) instead of writing through
+  a null pointer. Mostly matters on devices with little memory.
+
+- **Android: setup works again on the development build.** Since the decomp version arrived in setup, the app's
+  setup stopped right away ("No module named 'decomp_setup'"); the missing file is now packed with it. Also clearer
+  game-icon hints: "already on the home screen" for the plain icon too, and wording that fits every launcher
+  (PR #170, thanks @rhemfur).
+
+- **Android setup polish** (from the tester report on PR #98, thanks @rhemfur): the "Rebuild shader cache" hint
+  names the right button on each platform (on Android: *Start / resume / retry setup*); tooltips no longer stay on
+  touch screens; setup's own step reads "Reading shaders from your game files" so it doesn't look skippable, and its
+  notification brings setup back to the front; after an app update, setup shows "Updating the game for the new version".
+
+- **Fixed: the boat barely turned with "Sailing speed" on** (issue #169). The game turns the boat more slowly the
+  faster it sails, so the boosted speed hit its minimum turn rate. The rudder now responds like at normal speed for
+  both sails, while the boat keeps its boosted speed; automatic wind and the jump height are unchanged.
+
+- **Game code built with `-fwrapv`** (PR #172, thanks @Pulpparty): PowerPC integer arithmetic wraps around, and the
+  compiler now guarantees the same for the recompiled game code, the decomp version and the verify tools, instead of
+  relying on the code never overflowing. No visible change.
+
+- **Fixed: "Invert camera up/down" also inverted the Wind Waker baton** (issue #167). The setting now applies
+  only to the camera, including first-person views and item aiming (bow, hookshot, telescope, Picto Box) and the
+  mouse camera (which now follows it too); the baton and other right-stick controls keep their normal direction.
+
+- **Fixed: stutter at 240 fps and a slow start with "Keep game speed"** (issue #164). Since v0.2.13 the game's
+  30 logic steps drifted against the display (59.94 Hz), so every few seconds the in-between frames bunched up and
+  the picture hitched; the steps now follow the display's refresh. A hitch right after starting could also keep
+  all in-between frames off (30 fps) until the frame rate was changed; that measurement is now retried. Slower PCs
+  keep v0.2.13's smoother pacing (#125).
+
+- **Mods tab: Built-in and Community.** The Mods list is split into *Built-in* (the options that come
+  with the game, such as the camera and speed options) and *Community* (mods from the mod catalogue,
+  installed or ready to download, plus imported packages and graphics packs); *More* is unchanged.
+  Mods now use the game ID `wwhd` for both regions; older manifests with `wwhd-usa` keep working.
+- **Fixed: Call of the Sky could not be switched on from the catalogue.** After confirming the
+  experimental warning, the install stopped with "confirm the warning first", because the save backup
+  was skipped. The backup now always runs once before the mod is switched on, and a failed backup shows
+  its reason.
+- **Fixed: a red "conflicting ID" box in Mods › More** (Code-mod support). Release builds also no longer
+  show this debug highlight.
+
+- **Fixed: controllers stopped responding in the game after the settings overlay or the name screen**
+  (issue #153). If a trigger or stick did not fully return to rest, the game ignored all input after
+  closing the overlay or entering a name until the controller was reconnected. Now only the button that
+  closed it waits for its release; everything else reaches the game at once.
+
+- **Linux AppImage: portable use now uses the AppImage's standard portable mode** (issue #55). Start
+  the AppImage once with `--appimage-portable-home`, or create a folder named like it plus `.home` next
+  to it (e.g. `WindWakerHD-…-linux-x86_64.AppImage.home`); the game, its code, saves, settings and caches
+  then stay in that folder. **If you used the `….AppImage.data` folder from v0.2.13**, it is no longer
+  used; to keep your saves and settings, move its contents before starting the new version:
+  `….AppImage.data/share` → `….AppImage.home/.local/share`, `….AppImage.data/config` →
+  `….AppImage.home/.config` and `….AppImage.data/cache` → `….AppImage.home/.cache`, then start the
+  AppImage once with `--setup`.
+
+- **Share your shader coverage:** Settings › Graphics › **Export shader template** (desktop) or
+  `tools/shaderprep.py export` saves a code-free `my-template.bin` (shader hashes and GPU settings only, no
+  game code) from your own shader caches, so it can be contributed to the template that setup uses to
+  prepare shaders. `shaderprep.py template` no longer fails with "invalid recipe bounds" on long-played or
+  Vulkan caches and skips damaged records instead of stopping.
+
+- **European GameCube saves can be converted to HD** (`tools/savegame/gc2hd.py`): PAL saves (`GZLP01`)
+  are accepted, names with accents (and Œ/œ) come through, and the save's language is kept. The
+  converted `cking.sav` works with both the USA and the European HD game.
+- **Android handhelds and controllers** (issue #152, thanks @OTPR26):
+  - **Settings with a controller:** holding Select/− now opens the settings after half a second as
+    intended (it could take about 3 seconds on some devices), and a one-time hint says so.
+  - **Touch buttons hide with a controller:** the view and 🎮 buttons hide while a controller is
+    connected (built-in or external) and come back for a few seconds with a tap in their corner.
+    Settings › Display › *Touch buttons*: Automatic / Always show / Hide.
+  - **AYN Thor / Odin built-in controls:** A, B, X and Y now sit in their Nintendo positions, all four
+    can be bound in Controls, and empty bindings in `controls.json` are repaired.
+  - **Larger settings on phones and handhelds:** the settings fill most of the screen with bigger
+    buttons, sized for the screen; Settings › Display › *UI size* (Automatic / Small / Medium / Large).
+    The desktop look is unchanged.
+  - Texts say "Android device" instead of "phone", and the log names how Android reports a controller.
+
+- **Fixed: Windows setup failed in deep folders** (issue #144), for example in Downloads after Windows'
+  "Extract All" puts the folder inside a folder of the same name. The compiler now unpacks with long
+  paths, and the game and setup use much shorter names for shader caches, temporary files, code-mod
+  builds and save backups (existing caches are reused or rebuilt automatically). Only a folder deeper
+  than 175 characters makes setup stop right away, before downloading anything, and ask you to move it
+  to a shorter place such as `C:\Games\WindWakerHD`.
+- **Development builds (macOS): setup can also build the decomp version** (experimental, off by
+  default). A checkbox in setup (or `--decomp`) builds, next to the normal game, a version in which the
+  game functions of the public decompilation run as compiled source; it is built from your own game
+  on your Mac, and the normal game is always built first and stays the default. Choose which one starts
+  in setup, or start Wind Waker HD with `--decomp`. Setup downloads the decompilation's source (about
+  8 MB, only when the option is on) from its GitHub repository and checks it before use; the release
+  itself does not contain it. The decomp build now uses the readable decompilation; its model data is
+  generated from your game at build time. Regular releases are unchanged.
+
+- **Fixed: unreadable shoulder labels on the HUD** (issue #143). With *L1 R1 L2 R2* or *LB RB LT RT* as
+  shoulder names, the labels on the HUD's shoulder buttons were white on the white plates; they are now dark
+  like the game's own letters again (and dim the same way). Dialog labels are unchanged.
+- **Mods tab redesign.** Every mod has an on/off switch in one list, including mods you haven't
+  downloaded yet: switching one on downloads it, sets it up and turns it on. When something is needed,
+  one review asks it all at once (your GameCube game, choices, code-mod support, the experimental
+  warning), then one progress view follows and keeps running while you play. Mod pages explain in one
+  line why something can't change right now instead of showing greyed buttons; updating keeps a mod on
+  or off as it was; Remove also deletes a mod's prepared files and says how much space that frees. The
+  mod list loads by itself (cached, checked in the background; only the public list is fetched). Rarely
+  used things (profiles, install from a file, GameCube game, code-mod support, save backups, mod list
+  source, cheats) are under Mods › More.
+- **Experimental: build the game from the decompilation** (macOS, for developers). The CMake option
+  `WWHD_DECOMP=ON` compiles the game code from the public, verified decompilation
+  ([ZeldaWWHDDecomp/wwhd](https://github.com/ZeldaWWHDDecomp/wwhd), a submodule in `decomp/`) instead of
+  recompiling it; the libraries stay recompiled from your game. It plays identically to the normal build
+  but still uses more CPU, so releases stay recompiled. Off by default: normal builds are unchanged. See
+  docs/decomp-build.md.
+- **Fixed: aspect ratios other than 16:9** (PR #146, thanks @fluxehub). At 16:10 (and 4:3) the
+  extra height now shows more of the view above and below instead of cropping a 16:9 picture, and
+  the HUD sits at the real screen edges. At 21:9 and 32:9 the button cluster and the Wind Waker's
+  "Back" prompt keep the same distance from the edge as at 16:9, and the Wind's Requiem screen
+  fills the whole screen instead of showing dark side bars. Layouts drawn to both the TV and the
+  GamePad no longer flicker between the two aspect ratios, and Vulkan no longer leaves the last
+  pixel row black at 16:10 with 1.5x. 16:9 is unchanged.
+- **Android: a menu on the game widget and an "Add the game icon" button** (PR #150, thanks
+  @rhemfur). Long-press the home-screen widget, then Settings (Samsung) to export or import the save
+  or open the game setup. The setup screen has **Add the game icon to the home screen** under Play
+  for players who declined or removed it, and the automatic offer now waits until the setup screen
+  is in front, so Android no longer refuses it on some phones. Spanish texts for these and the save
+  export/import.
+
+- **New gameplay mods: faster ladders, faster sidling, sailing speed and automatic wind** (issues #95,
+  #96; all off by default, Mods tab and the macOS Gameplay menu). Ladders and sidling play faster with
+  the animation in step (1–3×); sailing speed has separate settings for the normal sail and the Swift
+  Sail; *Automatic wind* makes the normal sail behave like the Swift Sail (the wind follows the boat).
+  With the mods off the game is unchanged.
+- **Fixed: ZL/ZR (LT/RT, L2/R2) prompts in dialogs showed as a white box** with the face buttons set
+  to *by label* (issue #141). The shoulder labels in dialogs are now drawn as pictures like the
+  game's own icons, in every language.
+- **Button prompt options** (issue #143, Controls tab of the settings overlay and the macOS Controls
+  window): *Button prompts* Automatic / Original / Xbox / PlayStation (Automatic shows PlayStation
+  shapes on a PlayStation pad), *Shoulder names* Automatic / L R ZL ZR / L1 R1 L2 R2 / LB RB LT RT,
+  and *Coloured face buttons* (on by default; off keeps the game's white buttons). The PlayStation
+  shapes are drawn by the port, no images are included. Unassigned (dimmed) HUD buttons now keep
+  their shape visible, and the prompt strokes are a little bolder.
 ## v0.2.13
 
 - **Linux AppImage: a portable mode** (issue #55, idea by @missionfloyd). Create a folder named like the

@@ -10,15 +10,16 @@
 //   Metal                                                   default
 // If Vulkan cannot start (no Vulkan loader / MoltenVK / suitable device), the game starts with Metal
 // and says why (log, window title, a sheet on the TV window).
+// A platform port can add its own renderer as Api::Platform (renderer_ext.h).
 #pragma once
 #include <cstdint>
 #include <string>
 
 namespace render {
 
-enum class Api : int { Metal = 0, Vulkan = 1 };
-const char* api_name(Api a);      // "Metal", "Vulkan"
-const char* api_key(Api a);       // "metal", "vulkan" (setting / command line value)
+enum class Api : int { Metal = 0, Vulkan = 1, Platform = 2 };
+const char* api_name(Api a);      // "Metal", "Vulkan", the platform backend's name
+const char* api_key(Api a);       // "metal", "vulkan", its key (setting / command line value)
 bool compiled(Api a);             // built into this executable
 bool can_choose();                // more than one renderer built in (the Graphics menu offers the choice)
 
@@ -67,6 +68,12 @@ struct Backend {
     // the GPU for reports (performance report header): name, and for Vulkan the driver and Vulkan
     // version; "" before the renderer started
     std::string (*device)();
+    // optional, null for Metal and Vulkan (a platform backend, renderer_ext.h):
+    // GX2DrawDone for a save state: a full wait for the idle GPU. Null: wait_idle does that.
+    void (*gpu_idle)();
+    // the bits of a register that can change this renderer's shader key (true: `mask` is set; mask 0:
+    // none); false: every change of a shader-relevant register counts. Null: as Metal / Vulkan.
+    bool (*shader_key_mask)(uint32_t reg, uint32_t& mask);
 };
 enum Feature : int { kFeatureAO, kFeatureAOHires, kFeatureAniso, kFeatureFXAA, kFeatureScaleFilter, kFeatureCapture,
                      kFeatureShaderHeadStart };
@@ -90,6 +97,7 @@ void run_main_loop();
 
 Api active();
 inline bool vulkan() { return g_backend && g_backend->api == Api::Vulkan; }
+inline bool platform() { return g_backend && g_backend->api == Api::Platform; }
 Api requested();                  // what was asked for at start-up (differs from active() after a fallback)
 std::string fallback_reason();    // why the requested renderer did not start ("" if it did)
 Api preferred();                  // saved setting: the renderer the next start uses
@@ -124,6 +132,7 @@ inline void set_tv_format(uint32_t f, bool tv) { g_backend->set_tv_format(f, tv)
 inline void invalidate(uint32_t flags, uint32_t addr, uint32_t size) { g_backend->invalidate(flags, addr, size); }
 inline void guest_flush() { g_backend->guest_flush(); }
 inline void wait_idle() { g_backend->wait_idle(); }
+inline void gpu_idle() { if (g_backend->gpu_idle) g_backend->gpu_idle(); else g_backend->wait_idle(); }
 inline void write_back() { if (g_backend->write_back) g_backend->write_back(); }
 inline void ss_reset() { g_backend->ss_reset(); }
 uint64_t frame_count();  // 0 before the renderer started

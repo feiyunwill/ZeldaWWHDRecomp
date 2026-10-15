@@ -1,6 +1,7 @@
 // Internal interfaces between the GX2 layer and the renderer.
 #pragma once
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 
 struct LatteFetchShader;
@@ -28,6 +29,10 @@ void normalize_fetch_shader(LatteFetchShader* fetch);
 // Not saved.
 bool uncapped();
 void set_uncapped(bool on);
+// Paced frame interpolation at 120/240 fps (interp.cpp): the time the next logic step's frame is due
+// on the virtual vsync (its step's slot, gx2/vsync_pacing.h); false if there is none yet
+bool next_step_time(std::chrono::steady_clock::time_point& at);
+void drop_step_slot();  // a logic pass more than a step late: the schedule starts anew
 }  // namespace gx2
 
 // The renderer backend (Metal). All calls come from the thread executing GX2

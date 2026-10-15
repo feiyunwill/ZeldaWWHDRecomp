@@ -4,6 +4,10 @@ Small mods written in C and compiled for the game's CPU (32-bit big-endian Power
 [docs/mod-sdk-v2.md](../../docs/mod-sdk-v2.md) for the design. They contain no game code or data:
 game functions and variables are referenced by address only.
 
+Story mods (letters, quests, charts) live in the mod repository with their content: the required
+`story-notebook` package (the letter that brings the story notebook) and the `rito-letter` and
+`story-chart` examples are in [ZeldaWWHDMods](https://github.com/ZeldaWWHDRecomp/ZeldaWWHDMods).
+
 | Mod | What it shows |
 | --- | --- |
 | `heart-ticker` | entry and return hooks on Link's per-step function (`0240EBB0`), a call of a game function (`cLib_addCalc2`), an option (`every`). Link's hearts tick down a quarter heart every `every` logic steps to half, then refill. |

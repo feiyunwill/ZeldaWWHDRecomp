@@ -2,11 +2,12 @@
 import unittest
 from contextlib import redirect_stdout
 import io
+import json
 from pathlib import Path
 import subprocess
 import tempfile
 
-from display_smoke import primary_preview_clear, capture_timeout_evidence
+from display_smoke import primary_preview_clear, capture_timeout_evidence, capture_metric_trend
 
 
 def dispatcher(region, transform='IDENTITY', rows='', flags='NOT_FOCUSABLE', display=0):
@@ -20,6 +21,20 @@ def dispatcher(region, transform='IDENTITY', rows='', flags='NOT_FOCUSABLE', dis
 
 
 class TimeoutEvidenceTests(unittest.TestCase):
+    def test_metric_trend_records_progress_and_survives_write_failure(self):
+        trend = [{"elapsed": 0, "primary_presented": 10},
+                 {"elapsed": 120, "primary_presented": 10}]
+        with tempfile.TemporaryDirectory() as temp, redirect_stdout(io.StringIO()) as log:
+            output = Path(temp) / 'nested/result.json'
+            capture_metric_trend('blocked secondary', trend, output)
+            self.assertEqual(json.loads(output.with_suffix('.trend.json').read_text()),
+                             {'phase': 'blocked secondary', 'samples': trend})
+            occupied = Path(temp) / 'occupied'
+            occupied.write_text('regular file')
+            capture_metric_trend('blocked secondary', trend, occupied / 'result.json')
+            self.assertIn('Cannot capture metric trend', log.getvalue())
+            self.assertIn('primary_presented', log.getvalue())
+
     def test_records_all_services_before_cleanup(self):
         calls = []
         def adb(*args):

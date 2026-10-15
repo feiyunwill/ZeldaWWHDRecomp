@@ -619,7 +619,7 @@ bytes even when the game writes the range meanwhile):
 `runtime/tools/snapshot_cache_test.cpp` (CTest `snapshot_caches`) poisons every mapped byte right after
 it is written and checks that the caches still find exactly the expected reuse hits. The only read of
 mapped GPU-input memory left is the buffer cache's opt-in diagnostic `WWHD_VK_BUFFER_CACHE_VERIFY=1`.
-Buffers the CPU is meant to read (captures, the GamePad overlay signatures) come from
+Buffers the CPU is meant to read (captures) come from
 `create_readback_buffer`, which prefers host-cached memory.
 
 **Unless it is host-cached.** Where the arena's memory type is both `HOST_CACHED` and `HOST_COHERENT`,
@@ -659,7 +659,7 @@ Since 2026-10-07 every platform uses the two paths that were Android defaults be
 - `WWHD_VK_ASYNC_PRESENT` (default on, `0` restores the drain): the presentation submission goes into
   the submission ring and `swap()` does not wait for the GPU, so the render thread records frame N+1
   while the GPU draws frame N. Both window hosts (SDL and the macOS AppKit host). Captures, frame and
-  present dumps and the automatic GamePad overlay's signatures read back through a waiting flush.
+  present dumps read back through a waiting flush. Auto GamePad mode reads menu state without GPU readback.
 
 The Metal renderer keeps its GX2DrawDone wait: it binds large vertex buffers straight from guest
 memory. See `docs/performance.md` ("Desktop CPU/GPU overlap defaults") for the measurements.

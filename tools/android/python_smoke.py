@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import shlex
 import subprocess
+import adb_util
 import tempfile
 import time
 
@@ -24,10 +25,11 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     prefix = [args.adb, "-s", args.serial]
+    adb_util.wait_until_ready(prefix)
 
     def adb(*command):
         if command[0] == "shell": command = ("shell", shlex.join(command[1:]))
-        return subprocess.check_output(prefix + list(command), timeout=30).decode().strip()
+        return adb_util.check_output(prefix + list(command), timeout=30).decode().strip()
 
     if adb("shell", "getprop", "ro.kernel.qemu") != "1":
         parser.error("synthetic smoke launcher requires an emulator")
@@ -92,7 +94,7 @@ def main():
             actual_names = {name for name in names if Path(name).suffix in (".c", ".h")}
             if actual_names != set(expected): raise AssertionError("Android C/header inventory differs")
             for name, content in expected.items():
-                actual = subprocess.check_output(prefix + ["exec-out", "run-as", PACKAGE,
+                actual = adb_util.check_output(prefix + ["exec-out", "run-as", PACKAGE,
                     "cat", result["output"] + "/gen/" + name], timeout=30)
                 if actual != content: raise AssertionError("Android C/header bytes differ: " + name)
         pid = adb("shell", "pidof", PACKAGE + ":setup")

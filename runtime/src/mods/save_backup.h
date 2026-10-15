@@ -151,7 +151,10 @@ public:
             if (!mod.empty()) meta["mod"] = mod;
             if (!mod_name.empty()) meta["mod_name"] = mod_name.substr(0, 256);
             write_text(temporary / "backup.json", json::dump(meta) + "\n");
-            auto suffix = reason == "before-mod" ? "before-" + mod : reason;
+            // a short folder name (issue #144: save paths stay well below Windows' MAX_PATH); the reason
+            // and the mod are in backup.json. Releases up to v0.2.12 wrote <time>-before-<mod id>.
+            auto suffix = reason == "before-mod" ? "mod-" + mod.substr(0, 7) : reason == "before-restore" ? std::string("restore") : reason;
+            while (suffix.ends_with('.')) suffix.pop_back();  // Windows folder names cannot end with a dot
             auto target = unique(root_ / (stamp(now()) + "-" + suffix));
             fs::rename(temporary, target);  // the backup appears complete or not at all
             temporary.clear();

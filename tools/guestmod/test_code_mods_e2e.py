@@ -120,21 +120,24 @@ def main():
 
     off, original = rebuild(0, 'prepare-off')
     on, _ = rebuild(1, 'prepare-on')  # warm both caches; fresh compilation is recorded separately
-    install = {'WWHD_TEST_MOD_ENABLE': 'heart-ticker', 'WWHD_TEST_CODE_MOD_REBUILD': '1',
-               'WWHD_TEST_OVERLAY': 'open:mods@700'}
+    # One run: install, switch on (the test aid accepts the review), the setup adds code-mod support, the game
+    # relaunches itself into the hook-enabled build, the setup resumes there, builds the code mod and switches it
+    # on (active from the next start).
+    install = {'WWHD_TEST_MOD_ENABLE': 'heart-ticker', 'WWHD_TEST_OVERLAY': 'open:mods@700'}
     if args.catalogue:
         install.update(WWHD_MOD_CATALOGUE=str(catalogue / 'index.json'), WWHD_TEST_CATALOGUE_INSTALL='heart-ticker')
     else:
         install['WWHD_TEST_MOD_INSTALL'] = str(package)
     log = run('install', 0, install)
     if args.catalogue:
-        assert '[catalogue] refreshed ' in log and '[catalogue] installed heart-ticker disabled' in log
-    assert '[code mods] rebuild offer: support on for heart-ticker' in log
+        assert '[catalogue] refreshed ' in log and '[catalogue] installed heart-ticker' in log
+    assert '[code mods] rebuild offer: support on' in log
     assert '[code mods] rebuild ready; restart required' in log
+    assert 'Continuing setup of ' in log and '[setup run] enabled heart-ticker' in log
     profiles = json.loads((manager / 'profiles.json').read_text())
     profile = profiles['profiles'][profiles['active']]
-    assert not profile.get('enabled', {}).get('heart-ticker', False)
-    assert 'heart-ticker' in profile['code_mod_pending']
+    assert profile.get('enabled', {}).get('heart-ticker', False)
+    assert not profile.get('setup_pending', {}) and not profile.get('code_mod_pending', {})
     log = run('active', 1)  # the original launcher must route to the selected hook-enabled executable
     assert '[guestmods] loaded ' in log and 'heart-ticker: first return hook' in log
     assert 'heart-ticker: life (quarter hearts)' in log
@@ -150,7 +153,7 @@ def main():
     removed = run('removed', 0, {'WWHD_TEST_MOD_REMOVE': 'heart-ticker', 'WWHD_TEST_OVERLAY': 'open:mods@700'})
     assert '[mods] removed heart-ticker' in removed
     assert not (manager / 'Mods' / 'heart-ticker').exists()
-    result = {'removed': True, 'catalogue_install': args.catalogue, 'install_offer_rebuild': True, 'disabled_until_restart': True,
+    result = {'removed': True, 'catalogue_install': args.catalogue, 'install_sets_up_with_rebuild': True, 'disabled_until_restart': True,
               'heart_ticker_active_after_restart': True, 'off_again_cached': True,
               'off_code_identical': True, 'prepare_off_seconds': off['seconds'],
               'prepare_on_seconds': on['seconds'], 'cached_off_seconds': final['seconds']}

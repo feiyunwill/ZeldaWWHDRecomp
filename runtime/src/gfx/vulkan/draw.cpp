@@ -8,10 +8,13 @@
 #include "Cafe/HW/Latte/ISA/LatteReg.h"
 #include "Cafe/HW/Latte/ISA/RegDefines.h"
 #include "backend.h"
+#include "stereo.h"
+#include "../stereo_projection.h"
 #include "deferred_dispatch.h"
 #include "buffer_cache.h"
 #include "render_prof.h"
 #include "runtime.h"
+#include "gx2/gx2.h"
 #include "shaders.h"
 #include "stutter_trace.h"
 #include "pipeline_state.h"
@@ -1700,7 +1703,8 @@ VkImageView feedback_view(Surface *source, const uint32_t *textureWords,
 StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
                           VkDescriptorSetLayout layout, bool dynamicUniforms, float sx, float sy,
                           const std::array<Surface *, 8> &colors,
-                          Surface *depth, FeedbackStatsProbe* feedbackProbe) {
+                          Surface *depth, FeedbackStatsProbe* feedbackProbe, float eyeOffset = 0,
+                          bool sunShadow = false) {
   StageResources out;
   auto &m = sh->mapping;
   // Descriptor info pointers must remain stable until this stage's one update.
@@ -1799,7 +1803,7 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
   auto& supportUniforms = supportScratch[sh->vertex ? 0 : 1];
   if (m.uniformVarsBufferBindingPoint >= 0) {
     const size_t capacity=preparation_stats_enabled()?supportUniforms.capacity():0;
-    vk::pack_uniforms_into(r, *sh, supportUniforms, sx, sy);
+    vk::pack_uniforms_into(r, *sh, supportUniforms, sx, sy, eyeOffset, stereo::frame.convergence);
     if(preparation_stats_enabled()) {
       ++R.cpuPreparation.packCalls;
       R.cpuPreparation.packBytes+=supportUniforms.size();
@@ -1818,6 +1822,13 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
                                 supportUniforms.size() - sh->uniforms.offset_remapped);
   // Metal AO mode 2 tiles noise per 960x540 output pixel rather than 640x360.
   const int remapped = sh->uniforms.offset_remapped;
+  if (sunShadow && eyeOffset != 0 && remapped >= 0 &&
+      size_t(remapped) <= supportUniforms.size()) {
+    // Unknown layouts keep their original uniforms. The helper validates
+    // the complete block before writing any stereo adjustments.
+    stereo::shadow_uniforms(supportUniforms.data()+remapped,
+        supportUniforms.size()-remapped,sh->vertex,eyeOffset,stereo::frame.convergence);
+  }
   if (sh->vertex && ao_mode() == 2 &&
       sh->kind == gfx::ProgramKind::OcclusionVertex && remapped >= 0 &&
       size_t(remapped) + 16 <= supportUniforms.size()) {
@@ -1833,7 +1844,12 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
     if (m.uniformBuffersBindingPoint[i] >= 0) {
       uint32_t addr = r[block + i * 7];
       uint32_t size = std::min<uint32_t>(r[block + i * 7 + 1] + 1, 0x10000);
-      uniform(m.uniformBuffersBindingPoint[i], addr ? mem::ptr(addr) : nullptr,
+      if (sh->vertex && eyeOffset != 0 && addr) {
+        static thread_local std::vector<uint8_t> eyeBlock;
+        eyeBlock.resize(size);memcpy(eyeBlock.data(),mem::ptr(addr),size);
+        stereo::project_uniform_block(eyeBlock.data(),size,eyeOffset,stereo::frame.convergence);
+        uniform(m.uniformBuffersBindingPoint[i],eyeBlock.data(),size,size_t(i));
+      } else uniform(m.uniformBuffersBindingPoint[i], addr ? mem::ptr(addr) : nullptr,
               size, size_t(i), addr);
       if (addr) rprof::guest_read(rprof::kUpUbo, addr, size);
     }
@@ -1975,6 +1991,25 @@ UploadSlice vertex_window_smoke_snapshot(uint32_t binding,uint32_t address,
                                 windowLength,data,poisonUnused);
 }
 
+namespace {
+uint32_t stereoOtherAoSource = 0;
+uint64_t stereoOtherAoFrame = ~0ull;
+Surface stereoOtherAoColor, stereoOtherAoDepth;
+}
+void stereo_swap_ao() {
+  std::swap(aoPrivateSource, stereoOtherAoSource);
+  std::swap(aoPrivateFrame, stereoOtherAoFrame);
+  std::swap(aoPrivateColor, stereoOtherAoColor);
+  std::swap(aoPrivateDepth, stereoOtherAoDepth);
+}
+void stereo_release_ao() {
+  destroy_surface_image(&stereoOtherAoColor);
+  destroy_surface_image(&stereoOtherAoDepth);
+  stereoOtherAoColor={};
+  stereoOtherAoDepth={};
+  stereoOtherAoSource=0;
+  stereoOtherAoFrame=~0ull;
+}
 void reset_ao_private_cache() { aoPrivateFrame = ~0ull; aoPrivateSource = 0; }
 void drain_pending_guest_pipelines() {
   for (auto& [key, value] : pipelines) resolve_pending_pipeline(value);
@@ -2008,8 +2043,23 @@ static void trace_pass(const std::array<Surface *, 8> &colors, uint32_t ncolor, 
             (depth->fmt.stencil ? "/stencil" : "");
   LOG("[vulkan pass] %ux%u, %u colour attachment(s)%s", width, height, ncolor, text.c_str());
 }
+void draw_stereo(const uint32_t *r,uint32_t prim,uint32_t count,uint32_t indexType,
+                 uint32_t indexAddr,uint32_t baseVertex,uint32_t instances) {
+  if(stereo::frame.mode==stereo::Off) {
+    stereo_select_eye(0);
+    draw(r,prim,count,indexType,indexAddr,baseVertex,instances);
+    return;
+  }
+  bool shared=false;
+  try {
+    draw(r,prim,count,indexType,indexAddr,baseVertex,instances,&shared);
+    if(shared) return; // keep the light-space render pass open
+    stereo_select_eye(1-stereoEye);
+    draw(r,prim,count,indexType,indexAddr,baseVertex,instances);
+  } catch(...) { stereo_select_eye(0);throw; }
+}
 void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
-          uint32_t indexAddr, uint32_t baseVertex, uint32_t instances) {
+          uint32_t indexAddr, uint32_t baseVertex, uint32_t instances, bool* viewIndependent) {
   if (!count || !instances || ((prim == 0x13 || prim == 0x14) && count < 4))
     return;
   if (r[REGADDR::PA_CL_CLIP_CNTL] & (1 << 22))
@@ -2028,6 +2078,13 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
                              (vs && !vs->ready() ? vs->error
                               : ps               ? ps->error
                                                  : "missing shader"));
+  // Both eyes use the same sun-cascade atlas, rendered from the light's view.
+  // All camera-space passes, including the shadow mask, still draw twice.
+  if(viewIndependent)
+    *viewIndependent = r[mmDB_HTILE_DATA_BASE]==((1024u<<16)|1024u) &&
+      r[gx2::kDepthSlicesReg]==3 &&
+      LatteMRT::GetActiveDepthBufferMask(*reinterpret_cast<const LatteContextRegister*>(r)) &&
+      !LatteMRT::GetActiveColorBufferMask(ps->dec,*reinterpret_cast<const LatteContextRegister*>(r));
   const bool stripRestart = indexAddr &&
       (prim == 3 || prim == 6) &&
       (r[REGADDR::VGT_MULTI_PRIM_IB_RESET_EN] & 1);
@@ -2243,8 +2300,12 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
   if(vertex_window_stats_enabled()) report_vertex_window_stats();
   FeedbackStatsProbe feedbackProbe;
   auto* probe=feedback_stats_enabled()?&feedbackProbe:nullptr;
-  auto vres = bind_stage(r, vs, p.sets[0], p.dynamicUniforms, sx, sy, colors, depth, probe);
-  auto pres = bind_stage(r, ps, p.sets[1], p.dynamicUniforms, sx, sy, colors, depth, probe);
+  const float cameraEye = stereo::frame.mode != stereo::Off && stereo_screen_target(target->width,target->height)
+      ? (stereoEye ? 1.0f : -1.0f)*stereo::frame.depth*stereo::eyeDistanceAtUnitDepth : 0.0f;
+  const bool sunShadow = ps->kind == gfx::ProgramKind::SunShadowMask;
+  auto vres = bind_stage(r, vs, p.sets[0], p.dynamicUniforms, sx, sy, colors, depth, probe, cameraEye,sunShadow);
+  auto pres = bind_stage(r, ps, p.sets[1], p.dynamicUniforms, sx, sy, colors, depth, probe,
+      sunShadow ? cameraEye : 0,sunShadow);
   // Texture uploads, feedback copies, and sampling transitions above may have
   // ended the previous pass. Reuse only its exact active attachment set.
   bool reusePass = R.rendering && R.passTracked && R.passColors == colors &&
@@ -2405,13 +2466,19 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
   }
   uint32_t tl = r[REGADDR::PA_SC_GENERIC_SCISSOR_TL],
            br = r[REGADDR::PA_SC_GENERIC_SCISSOR_BR];
-  auto clamp = [](uint32_t v, float k, uint32_t limit) {
-    return uint32_t(std::clamp(double(v) * k, 0.0, double(limit)));
+  // As the Metal renderer: the scaled edges are rounded with a tolerance, not truncated. 720 * (1200/720)
+  // is just below 1200 in float (16:10 at 1.5x and 3x), which left the bottom row of every full-screen
+  // pass undrawn, and its stale contents spread through the shadow mask's softening.
+  auto lo = [](uint32_t v, float k, uint32_t limit) {
+    return uint32_t(std::clamp(std::floor(double(v) * k + 0.01), 0.0, double(limit)));
   };
-  uint32_t x = clamp(tl & 0x7fff, sx, width),
-           y = clamp((tl >> 16) & 0x7fff, sy, height),
-           ex = clamp(br & 0x7fff, sx, width),
-           ey = clamp((br >> 16) & 0x7fff, sy, height);
+  auto hi = [](uint32_t v, float k, uint32_t limit) {
+    return uint32_t(std::clamp(std::ceil(double(v) * k - 0.01), 0.0, double(limit)));
+  };
+  uint32_t x = lo(tl & 0x7fff, sx, width),
+           y = lo((tl >> 16) & 0x7fff, sy, height),
+           ex = hi(br & 0x7fff, sx, width),
+           ey = hi((br >> 16) & 0x7fff, sy, height);
   float ax, ay;
   if (aspect::content_clip() && target_aspect_factors(r[mmCB_COLOR0_TILE] & 0xFFFF, r[mmCB_COLOR0_FRAG], ax, ay))
     aspect::panes::clip(width, height, ax, ay, x, y, ex, ey);

@@ -17,7 +17,7 @@
 //
 // The modes, the layout of the TV window, the automatic overlay and the overlay's touch mapping are
 // shared with the SDL host (display_modes.cpp, which lists their test variables: WWHD_DRC_MODE,
-// WWHD_DRC_PIP, WWHD_SCALE_FILTER, WWHD_SIM_SCREEN, WWHD_TEST_TOUCH, WWHD_DRC_AUTO, WWHD_DRC_AUTO_LOG).
+// WWHD_DRC_PIP, WWHD_SCALE_FILTER, WWHD_SIM_SCREEN, WWHD_TEST_TOUCH).
 //
 // Debug / test environment:
 //   WWHD_FULLSCREEN=0|1                  TV window starts windowed / in full screen instead of as it was left
@@ -199,7 +199,6 @@ static void load_options() {
     if ([self map:e x:&x y:&y clamp:false]) {
         self.touching = true;
         input::set_touch(true, x, y);
-        gfx::display_touched();
     } else {
         [super mouseDown:e];
     }
@@ -214,7 +213,6 @@ static void load_options() {
     self.touching = false;
     if (![self map:e x:&x y:&y clamp:true]) x = y = 0;
     input::set_touch(false, x, y);
-    gfx::display_touched();
 }
 @end
 
@@ -801,93 +799,6 @@ static void compose_drc(id<MTLTexture> target) {
     [e endEncoding];
 }
 
-// ---------------------------------------------------------------- automatic overlay
-// Every 4th frame both pictures are reduced to 32x18 (mipmapped copy, then a trilinear draw, display-
-// encoded RGBA8) and read back; display_auto_signature (display_modes.cpp) decides.
-namespace {
-const uint32_t kSigW = 32, kSigH = 18, kSigN = kSigW * kSigH;
-struct Sig {
-    id<MTLTexture> mip, small;
-    id<MTLBuffer> buf;
-    // encode the reduction of `src` (on the current command buffer)
-    void encode(id<MTLTexture> src, bool src_linear) {
-        if (!mip || mip.width != src.width || mip.height != src.height || mip.pixelFormat != src.pixelFormat) {
-            MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:src.pixelFormat width:src.width
-                                                                                         height:src.height mipmapped:YES];
-            d.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
-            d.storageMode = MTLStorageModePrivate;
-            mip = [R.device newTextureWithDescriptor:d];
-        }
-        if (!small) {
-            MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:kSigW
-                                                                                         height:kSigH mipmapped:NO];
-            d.usage = MTLTextureUsageRenderTarget;
-            d.storageMode = MTLStorageModePrivate;
-            small = [R.device newTextureWithDescriptor:d];
-            buf = [R.device newBufferWithLength:kSigN * 4 options:MTLResourceStorageModeShared];
-        }
-        static id<MTLSamplerState> trilinear = [] {
-            MTLSamplerDescriptor* sd = [MTLSamplerDescriptor new];
-            sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterLinear;
-            sd.mipFilter = MTLSamplerMipFilterLinear;
-            sd.sAddressMode = sd.tAddressMode = MTLSamplerAddressModeClampToEdge;
-            return [R.device newSamplerStateWithDescriptor:sd];
-        }();
-        id<MTLBlitCommandEncoder> b = [command_buffer() blitCommandEncoder];
-        [b copyFromTexture:src sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
-                sourceSize:MTLSizeMake(src.width, src.height, 1) toTexture:mip destinationSlice:0 destinationLevel:0
-         destinationOrigin:MTLOriginMake(0, 0, 0)];
-        [b generateMipmapsForTexture:mip];
-        [b endEncoding];
-        MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
-        rp.colorAttachments[0].texture = small;
-        rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
-        rp.colorAttachments[0].storeAction = MTLStoreActionStore;
-        id<MTLRenderCommandEncoder> e = [command_buffer() renderCommandEncoderWithDescriptor:rp];
-        float rect[4] = {0, 0, 1, 1};
-        struct { int aa, conv; float sharp, foot; } p = {0, src_linear ? 2 : 0, 1.0f, 1.0f};
-        [e setRenderPipelineState:pipeline(MTLPixelFormatRGBA8Unorm, false, false)];
-        [e setVertexBytes:rect length:sizeof rect atIndex:0];
-        [e setFragmentTexture:mip atIndex:0];
-        [e setFragmentBytes:&p length:sizeof p atIndex:0];
-        [e setFragmentSamplerState:trilinear atIndex:0];
-        [e drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
-        [e endEncoding];
-        b = [command_buffer() blitCommandEncoder];
-        [b copyFromTexture:small sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(kSigW, kSigH, 1)
-                  toBuffer:buf destinationOffset:0 destinationBytesPerRow:kSigW * 4 destinationBytesPerImage:kSigN * 4];
-        [b endEncoding];
-    }
-    std::vector<float> luma() const {
-        std::vector<float> v(kSigN);
-        const uint8_t* px = (const uint8_t*)buf.contents;
-        for (uint32_t i = 0; i < kSigN; i++) v[i] = (0.299f * px[i * 4] + 0.587f * px[i * 4 + 1] + 0.114f * px[i * 4 + 2]) / 255.0f;
-        return v;
-    }
-};
-}  // namespace
-
-// Metal: reduce on the GPU, decide when the command buffer completed
-static void sample_screens() {
-    static std::atomic<bool> busy{false};
-    static Sig drc, tv;
-    if (g_mode != kDrcAuto || !R.drc.tex || R.frame % 4 || busy) {
-        if (g_mode != kDrcAuto) display_auto_signature({}, nullptr, R.frame);  // forgets the last signature
-        return;
-    }
-    drc.encode(R.drc.tex, R.drc.srgb);
-    bool have_tv = R.tv.tex != nil;
-    if (have_tv) tv.encode(R.tv.tex, R.tv.srgb);
-    busy = true;
-    uint64_t frame = R.frame;
-    [command_buffer() addCompletedHandler:^(id<MTLCommandBuffer>) {
-        std::vector<float> t;
-        if (have_tv) t = tv.luma();
-        display_auto_signature(drc.luma(), have_tv ? &t : nullptr, frame);
-        busy = false;
-    }];
-}
-
 // ---------------------------------------------------------------- present
 static id<MTLTexture> offscreen(NSUInteger w, NSUInteger h, bool srgb) {
     MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:srgb ? MTLPixelFormatRGBA8Unorm_sRGB : MTLPixelFormatRGBA8Unorm
@@ -968,7 +879,6 @@ static void take_screenshot(const PresentPlan& P) {
 
 // Metal, called from swap(): compose and present the TV window (with the GamePad overlay) and the GamePad window
 void present_screens() {
-    sample_screens();
     CGSize ls = R.tv.layer ? R.tv.layer.drawableSize : CGSizeMake(0, 0);
     PresentPlan P = display_plan(R.tv.tex != nil, R.tv.tex.width, R.tv.tex.height, R.drc.tex != nil, R.drc.tex.width, R.drc.tex.height,
                                  ls.width, ls.height, R.frame);
@@ -1111,6 +1021,7 @@ bool drc_overlay_hit(void* window, double wx, double wy) {
         if (item.tag == gfx::kDrcWindow) return gfx::g_drc_window != nil;
     }
     if (a == @selector(toggleDrc:)) {
+        item.title = gfx::g_mode == gfx::kDrcAuto ? @"Pin GamePad Picture-in-Picture" : @"Show GamePad Screen";
         on(gfx::drc_window_shown());
         return gfx::g_mode != gfx::kDrcOff && gfx::drc_window_available();
     }
@@ -1163,7 +1074,7 @@ void install_display_menu(NSMenu* bar) {
     add(m, @"    Separate window", @selector(setMode:), kDrcWindow);
     add(m, @"    Picture-in-picture in the TV window", @selector(setMode:), kDrcPip).toolTip = @"Click the overlay to touch";
     add(m, @"    Automatic picture-in-picture", @selector(setMode:), kDrcAuto).toolTip =
-        @"The overlay appears for a few seconds when the GamePad picture changes a lot (a menu opens); Cmd+G keeps it up";
+        @"Shows GamePad menus while open; follows Off-TV Play. Cmd+G pins the overlay";
     add(m, @"    Off", @selector(setMode:), kDrcOff).toolTip = @"Not shown; the game keeps drawing it";
     add(m, @"    GamePad only", @selector(setMode:), kDrcGamePad).toolTip =
         @"Only the GamePad picture in the TV window (click it to touch); in the game, Minus switches to Off-TV Play";

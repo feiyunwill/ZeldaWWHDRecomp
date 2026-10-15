@@ -234,11 +234,18 @@ class Adapter:
                             raise self.setup.SetupError("cannot read the Cemu archive: " + error)
                         title, _ = self.setup.archive_choice(info)
                     else:
-                        if keys is None or not keys.disc or not keys.common:
+                        if keys is None:
                             raise self.setup.SetupError("Disc and common keys are required")
-                        problem, error, info = self.setup.disc_info(str(image), keys)
-                        if problem:
-                            raise self.setup.SetupError("cannot read the disc image: " + error)
+                        request = keys if isinstance(keys, dict) else {
+                            "disc_key_hex": keys.disc.hex(), "common_key_hex": keys.common.hex()}
+                        kwargs = {"info_reader": self.setup.disc_info}
+                        if "_entries" in request:
+                            kwargs["file_reader"] = request["_entries"].get
+                        keys, info, why, notices = self.setup.resolve_disc_keys(str(image), request, **kwargs)
+                        if why:
+                            raise self.setup.SetupError(why[1])
+                        for notice in notices:
+                            self.emit({"stage": "extract", "state": "keys_found", "detail": notice})
                         self.setup.check_title(info.get("title_id", ""))
                     self.boundary()
                     self.setup.extract_game(str(image), keys, info, str(pending), title)

@@ -61,6 +61,28 @@ public final class PickerSmokeReceiver extends BroadcastReceiver {
                         SetupStore.write(new File(job, "host.json"), new JSONObject().put("schema", 1)
                             .put("state", "failed").put("error", "Synthetic invalid disc key file"));
                     result.put("job", job.getName()).put("private_dump_retained", new File(job, "input/dump").isFile());
+                } else if ("seed_legacy_keys".equals(mode) || "complete_legacy_keys".equals(mode)) {
+                    File job = SetupStore.current(context);
+                    JSONObject source = SetupStore.read(new File(job, "source.json"));
+                    if (!source.getString("kind").equals("image") || !source.getString("uri").contains(fixture))
+                        throw new Exception("Legacy fixture belongs to another input");
+                    if (mode.equals("seed_legacy_keys")) {
+                        JSONObject configuration = SetupStore.read(new File(job, "job.json"));
+                        byte[] authored = new byte[16];
+                        java.util.Arrays.fill(authored, (byte)42);
+                        for (String key : new String[] {"disc", "common"}) {
+                            try (java.io.FileOutputStream stream = new java.io.FileOutputStream(new File(job, "input/" + key + ".key"))) {
+                                stream.write(authored);
+                                stream.getFD().sync();
+                            }
+                            configuration.getJSONObject("input").put(key + "_key", "input/" + key + ".key");
+                        }
+                        SetupStore.write(new File(job, "job.json"), configuration);
+                    } else {
+                        SetupStore.write(new File(job, "host.json"), new JSONObject().put("schema", 1).put("state", "complete"));
+                        SetupKeyAccess.cleanupCompleted(job);
+                    }
+                    result.put("job", job.getName());
                 } else if ("revoke_dump".equals(mode) || "revoke_common".equals(mode)) {
                     File job = SetupStore.current(context);
                     JSONObject source = SetupStore.read(new File(job, "source.json"));

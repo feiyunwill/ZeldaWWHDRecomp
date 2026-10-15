@@ -1514,6 +1514,7 @@ public class SDLActivity extends Activity implements View.OnSystemUiVisibilityCh
         int source = event.getSource();
 
         if ((event.getFlags() & KeyEvent.FLAG_FALLBACK) != 0) {
+            SDLControllerManager.logControllerKey(event, "dropped: Android fallback event");
             // If this is a fallback event -- e.g., the mouse is being turned into dpad navigational keys 
             // just eat it, since that's almost never what we actually want to have happen. This will 
             // happen with Logitech mice on Amazon Fire TV devices and some Samsung devices.
@@ -1544,6 +1545,9 @@ public class SDLActivity extends Activity implements View.OnSystemUiVisibilityCh
             // Note that we process events with specific key codes here
             if (event.getAction() == KeyEvent.ACTION_DOWN) {
                 if (SDLControllerManager.onNativePadDown(deviceId, keyCode, event.getScanCode())) {
+                    if (keyCode == KeyEvent.KEYCODE_BACK || keyCode == KeyEvent.KEYCODE_BUTTON_SELECT ||
+                            keyCode == KeyEvent.KEYCODE_MENU || keyCode == KeyEvent.KEYCODE_BUTTON_MODE)
+                        SDLControllerManager.logControllerKey(event, "accepted by SDL gamepad mapping");
                     return true;
                 }
             } else if (event.getAction() == KeyEvent.ACTION_UP) {
@@ -1563,6 +1567,7 @@ public class SDLActivity extends Activity implements View.OnSystemUiVisibilityCh
                     switch (event.getAction()) {
                     case KeyEvent.ACTION_DOWN:
                     case KeyEvent.ACTION_UP:
+                        SDLControllerManager.logControllerKey(event, "dropped: mouse Back/Forward after SDL pad rejection");
                         // mark the event as handled or it will be handled by system
                         // handling KEYCODE_BACK by system will call onBackPressed()
                         return true;
@@ -1572,6 +1577,8 @@ public class SDLActivity extends Activity implements View.OnSystemUiVisibilityCh
         }
 
         if (event.getAction() == KeyEvent.ACTION_DOWN) {
+            SDLControllerManager.logControllerKey(event,
+                    "SDL pad rejected; forwarded as keyboard (game keys disabled unless WWHD_ANDROID_KEYBOARD)");
             onNativeKeyDown(keyCode);
 
             if (isTextInputEvent(event)) {

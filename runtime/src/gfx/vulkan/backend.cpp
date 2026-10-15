@@ -18,6 +18,8 @@
 #include <jni.h>
 #endif
 #include "backend.h"
+#include "stereo.h"
+#include "../hdr.h"
 #include "attachment_view_usage.h"
 #include "../../build_info.h"
 #include "deferred_commands.h"
@@ -46,6 +48,7 @@
 #include "overlay/guest_hud.h"
 #ifdef WWHD_SDL_HOST
 #include "platform/input_sdl.h"
+#include "overlay/window_target.h"
 #include <SDL3/SDL_vulkan.h>
 #endif
 #include "platform/display_rate.h"
@@ -188,31 +191,35 @@ void init_pipeline_cache() try {
     std::copy(std::begin(R.properties.pipelineCacheUUID),std::end(R.properties.pipelineCacheUUID),uuid.begin());
     pipelineCachePath=*pipeline_cache_override(std::nullopt,directoryStorage,
         R.properties.vendorID,R.properties.deviceID,uuid);
+    adopt_legacy_pipeline_cache(pipelineCachePath,*pipeline_cache_override(std::nullopt,directoryStorage,
+        R.properties.vendorID,R.properties.deviceID,uuid,true));
   } else if (const char* shaderPath=shaderStorage ? shaderStorage->c_str() : nullptr;
              !shaderPath || std::strcmp(shaderPath,"0")) {
-    char ids[32];
-    std::snprintf(ids,sizeof ids,"vulkan-%08x-%08x-",R.properties.vendorID,R.properties.deviceID);
+    std::array<uint8_t,16> uuid{};
+    std::copy(std::begin(R.properties.pipelineCacheUUID),std::end(R.properties.pipelineCacheUUID),uuid.begin());
     // a WWHD_SHADER_CACHE file (test runs, separate setups) keeps the pipeline cache next to it,
     // so such runs never write the user's own cache in the config folder
-    pipelineCachePath=shaderPath ? std::string(shaderPath)+"."+ids
-                                 :
+    auto place=[&](const std::string& name) {
+      std::string path=shaderPath ? std::string(shaderPath)+"."+name
+                                  :
 #ifdef __ANDROID__
-                                   drivers::pipeline_directory()+"/"+ids;
+                                    drivers::pipeline_directory()+"/"+name;
 #else
-                                   host::config_dir()+"/shadercache/"+ids;
+                                    host::config_dir()+"/shadercache/"+name;
 #endif
-    for (uint8_t byte : R.properties.pipelineCacheUUID) {
-      char hex[3]; std::snprintf(hex,sizeof hex,"%02x",byte); pipelineCachePath+=hex;
-    }
-    pipelineCachePath+=".bin";
 #ifdef __ANDROID__
-    if (shaderPath) {
-      char key[32];
-      std::snprintf(key,sizeof key,"shaders-%016llx-",static_cast<unsigned long long>(
-          pipeline_cache_checksum(reinterpret_cast<const uint8_t*>(shaderPath),std::strlen(shaderPath))));
-      pipelineCachePath = drivers::pipeline_directory()+"/"+key+std::filesystem::path(pipelineCachePath).filename().string();
-    }
+      if (shaderPath) {
+        char key[32];
+        std::snprintf(key,sizeof key,"shaders-%016llx-",static_cast<unsigned long long>(
+            pipeline_cache_checksum(reinterpret_cast<const uint8_t*>(shaderPath),std::strlen(shaderPath))));
+        path = drivers::pipeline_directory()+"/"+key+std::filesystem::path(path).filename().string();
+      }
 #endif
+      return path;
+    };
+    const auto vendor=R.properties.vendorID, device=R.properties.deviceID;
+    pipelineCachePath=place(device_pipeline_cache_filename(vendor,device,uuid));
+    adopt_legacy_pipeline_cache(pipelineCachePath,place(legacy_device_pipeline_cache_filename(vendor,device,uuid)));
   }
   std::vector<uint8_t> bytes;
   if (!pipelineCachePath.empty()) {
@@ -459,7 +466,7 @@ Buffer create_buffer(VkDeviceSize size, VkBufferUsageFlags usage,
              "map buffer");
   return b;
 }
-// GPU -> CPU copies (captures, overlay signatures): the CPU reads these, so host-cached memory where
+// GPU -> CPU copies (captures): the CPU reads these, so host-cached memory where
 // the device has it (uncached reads of the plain host-visible type are very slow on discrete GPUs).
 Buffer create_readback_buffer(VkDeviceSize size) {
   return create_buffer(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
@@ -1203,6 +1210,22 @@ static void make_swapchain(Screen &s) {
   fs.resize(n);
   if (fs.empty())
     exception_report::raise("No presentation formats");
+  bool wantHdr=false;
+  if(&s==&R.tv) {
+    bool supported=false;
+    for(const auto& f:fs)if(f.format==VK_FORMAT_R16G16B16A16_SFLOAT &&
+        f.colorSpace==VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT) {
+      VkFormatProperties props;vkGetPhysicalDeviceFormatProperties(R.physicalDevice,f.format,&props);
+      supported=(caps.supportedUsageFlags&VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) &&
+        (props.optimalTilingFeatures&VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) &&
+        (props.optimalTilingFeatures&VK_FORMAT_FEATURE_BLIT_DST_BIT);
+    }
+    hdr::formatSupported=supported;
+#if defined(_WIN32) && defined(WWHD_SDL_HOST)
+    hdr::displayEnabled=SDL_GetBooleanProperty(SDL_GetWindowProperties(s.window),SDL_PROP_WINDOW_HDR_ENABLED_BOOLEAN,false);
+#endif
+    wantHdr=hdr::resolve_output();
+  }
   // Presentation uses image blits, so both advertised surface support and
   // optimal-tiling BLIT_DST format support must hold.
   if (fs.size() == 1 && fs[0].format == VK_FORMAT_UNDEFINED)
@@ -1217,6 +1240,9 @@ static void make_swapchain(Screen &s) {
   const VkFormat preferred = s.scanSrgb ? VK_FORMAT_B8G8R8A8_SRGB : VK_FORMAT_B8G8R8A8_UNORM;
 #endif
   for (auto f : fs) {
+    if(wantHdr) {
+      if(f.format!=VK_FORMAT_R16G16B16A16_SFLOAT || f.colorSpace!=VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT)continue;
+    } else if(f.colorSpace!=VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)continue;
     VkFormatProperties props;
     vkGetPhysicalDeviceFormatProperties(R.physicalDevice, f.format, &props);
     if (!(props.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT))
@@ -1351,6 +1377,8 @@ static void make_swapchain(Screen &s) {
   s.swapchain = sc;
   ++s.swapchainGeneration;
   s.swapFormat = format.format;
+  s.hdrOutput = wantHdr;
+  if(&s==&R.tv)LOG("[HDR] output %s; scRGB format %s; Windows HDR %s",wantHdr?"scRGB FP16":"SDR",hdr::formatSupported.load()?"supported":"unavailable",hdr::displayEnabled.load()?"enabled":"disabled");
   s.swapExtent = extent;
   vkGetSwapchainImagesKHR(R.device, sc, &n, nullptr);
   s.images.resize(n);
@@ -1903,7 +1931,8 @@ static bool present(Screen &s) {
 #endif
   // Presentation changed (settings overlay): a new swapchain, as for a resize (also for a window that
   // is not shown right now, so the next frame it shows uses the new mode)
-  if (!workerAcquired && screen_has_window(s) && s.swapchain && s.presentWanted != effective_present_mode())
+  if (!workerAcquired && screen_has_window(s) && s.swapchain &&
+      (s.presentWanted != effective_present_mode() || (&s==&R.tv && s.hdrOutput!=hdr::enabled.load())))
     make_swapchain(s);
   Surface* scan = presentation_source_screen(s).scan.get();
   if (!screen_has_window(s) || !s.visible || s.width <= 0 || s.height <= 0 || !scan ||
@@ -2294,7 +2323,8 @@ void copy_to_scan(uint32_t cb, uint32_t target) {
   Surface *src = surface_from_color_buffer(cb);
   if (!src)
     return;
-  Screen &s = target == 4 ? R.drc : R.tv;
+  if (stereoEye && target == 4) return; // GamePad is a shared 2D device.
+  Screen &s = stereoEye ? stereoRight : (target == 4 ? R.drc : R.tv);
   if (!s.buildingScan || s.buildingScan->extent.width != src->extent.width ||
       s.buildingScan->extent.height != src->extent.height ||
       s.buildingScan->fmt.pixel != src->fmt.pixel) {
@@ -2568,7 +2598,7 @@ void present_completed_frame_while_pipeline_pending() {
 }
 void swap() {
   if(active_deferred_commands)active_deferred_commands->finish_exact();
-  for (Screen* s : {&R.tv, &R.drc}) if (s->buildingScanDirty) {
+  for (Screen* s : {&R.tv, &R.drc, &stereoRight}) if (s->buildingScanDirty) {
     s->scan.swap(s->buildingScan);
     s->scanSrgb = s->buildingScanSrgb;
     s->buildingScanDirty = false;
@@ -2602,7 +2632,7 @@ void swap() {
   gfx::PresentPlan plan = gfx::display_plan(
       tvScan, tvScan ? float(tvScan->extent.width) : 0, tvScan ? float(tvScan->extent.height) : 0,
       drcScan, drcScan ? float(drcScan->extent.width) : 0, drcScan ? float(drcScan->extent.height) : 0,
-      layerW, layerH, R.frame + 1);
+      layerW, layerH, R.frame + 1, stereo::frame.mode!=stereo::FullSBS);
 #ifdef __ANDROID__
   // A physical second display owns the GamePad picture. Keep the requested
   // single-screen mode intact so disconnecting restores its normal fallback.
@@ -2611,7 +2641,6 @@ void swap() {
     plan.pip_on = false;
     plan.pip_wanted = false;
     plan.drc_only = false;
-    plan.sample_auto = false;
     plan.tv = gfx::display_layout(layerW, layerH,
         tvScan ? float(tvScan->extent.width) : 1280,
         tvScan ? float(tvScan->extent.height) : 720);
@@ -2632,16 +2661,51 @@ void swap() {
     plan.button_dot = interp::mode() != 0 ? 1 : 2;
 #endif
   set_present_plan(&plan);
-  // settings overlay: built once, drawn into the TV window and its present dumps
-  if(overlay::guesthud::active())overlay::guesthud::set_tv_region(plan.tv.x,plan.tv.y,plan.tv.w,plan.tv.h,!plan.drc_only);
-  set_overlay_draw(overlay::frame(plan.dw > 0 ? plan.dw : layerW, plan.dh > 0 ? plan.dh : layerH, overlay_renderer_init));
+  // Full SBS uses a half-width logical canvas before placing the two eyes.
+  // Publish that same layout for GamePad hit testing and the software pointer.
+  gfx::PresentPlan inputPlan=plan;
+  if(stereo::frame.mode==stereo::FullSBS) {
+    inputPlan=gfx::display_plan_for(plan,layerW*.5f,layerH,
+        tvScan?float(tvScan->extent.width):0,tvScan?float(tvScan->extent.height):0,
+        drcScan?float(drcScan->extent.width):0,drcScan?float(drcScan->extent.height):0);
+    gfx::display_input_plan(inputPlan);
+  }
+  // Menu and host toasts: built once at the selected window size, including present dumps
+  if(overlay::guesthud::active())overlay::guesthud::set_tv_region(inputPlan.tv.x,inputPlan.tv.y,inputPlan.tv.w,inputPlan.tv.h,!inputPlan.drc_only);
+  const float overlayWidth = (plan.dw > 0 ? plan.dw : layerW) /
+      (stereo::frame.mode == stereo::FullSBS ? 2.0f : 1.0f);
+  using overlay::window_target::Window;
+  Window requested = Window::TV;
+  bool requireDrawable = false;
+  float drcW = 0, drcH = 0;
+#ifdef WWHD_SDL_HOST
+  static const bool gamescopeOverlay = overlay::window_target::gamescope_session();
+  requested = overlay::window_target::selected.load();
+  requireDrawable = gamescopeOverlay && plan.drc_window;
+  drcW = float(R.drc.width.load()); drcH = float(R.drc.height.load());
+#endif
+  const auto drawable = [](const Screen& screen) {
+    return screen.visible && screen.scan && screen.scan->image;
+  };
+  const auto overlayFrame = overlay::window_target::build_frame(
+      requested, plan.drc_window, requireDrawable,
+      {overlayWidth, plan.dh > 0 ? plan.dh : layerH, drawable(R.tv)},
+      {drcW, drcH, drawable(R.drc)},
+      [](float width, float height) { return overlay::frame(width, height, overlay_renderer_init); },
+      [] { overlay::set_open(false); });
+#ifdef WWHD_SDL_HOST
+  static const bool traceOverlay = getenv("WWHD_OVERLAY_TRACE") && std::string(getenv("WWHD_OVERLAY_TRACE")) == "1";
+  static Window previousTarget = Window::None;
+  static bool previousOpen = false;
+  const bool menuOpen = overlay::is_open();
+  if (traceOverlay && (overlayFrame.target != previousTarget || (menuOpen && !previousOpen)))
+    LOG("[overlay] draw window %s, menu %s, frame %llu", overlayFrame.target == Window::TV ? "TV" : overlayFrame.target == Window::GamePad ? "GamePad" : "none",
+        menuOpen ? "open" : "closed", (unsigned long long)(R.frame + 1));
+  previousTarget = overlayFrame.target; previousOpen = menuOpen;
+#endif
+  set_overlay_draw(overlayFrame);
   compose_headless_diagnostic(R.tv);
   take_screenshots(plan);
-  bool sampled[2] = {};
-  if (plan.sample_auto && drcScan) {
-    sampled[0] = record_signature(0, *drcScan, R.drc.scanSrgb);
-    sampled[1] = sampled[0] && tvScan && record_signature(1, *tvScan, R.tv.scanSrgb);
-  }
 #ifdef __ANDROID__
   prepare_secondary_snapshot();
 #endif
@@ -2653,12 +2717,11 @@ void swap() {
   timed_call(swapPhaseTiming[1],[&] { present(R.tv);return VK_SUCCESS; });
   if (plan.drc_window)
     timed_call(swapPhaseTiming[2],[&] { present(R.drc);return VK_SUCCESS; });
-  // asynchronous presentation: queued like GX2Flush work, the ring's fences retire it (the automatic
-  // overlay's signatures are read back right away, so those frames wait; present dumps and captures
-  // read back through flush()). Both window hosts: the AppKit host presents to its CAMetalLayers
+  // Asynchronous presentation is retired by the ring's fences. Present dumps and captures
+  // read back through flush(). Both window hosts: the AppKit host presents to its CAMetalLayers
   // through the same swapchain path.
   timed_call(swapPhaseTiming[3],[&] {
-    if (async_present() && !sampled[0]) flush_async();
+    if (async_present()) flush_async();
     else flush();
     return VK_SUCCESS;
   });
@@ -2683,10 +2746,6 @@ void swap() {
   completedPresentPlanValid = tvScan != nullptr;
   lastNewPresentNs = stutter::now();
   nextPipelineRepeatNs = lastNewPresentNs + 16666667;
-  if (sampled[0]) {
-    std::vector<float> d = read_signature(0), t = sampled[1] ? read_signature(1) : std::vector<float>{};
-    gfx::display_auto_signature(d, sampled[1] ? &t : nullptr, R.frame + 1);
-  }
   for (auto &path : gfx::display_take_present_dumps()) {
     if (!tvScan || plan.dw < 1 || plan.dh < 1)
       continue;
@@ -3127,6 +3186,8 @@ static void init_device(std::vector<const char *> extensions,
     if (!has_extension(ies, e))
       exception_report::raise(std::string("the Vulkan driver lacks instance extension ") + e);
   VkInstanceCreateInfo ci{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
+  if(has_extension(ies,VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME))
+    extensions.push_back(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);
   if (has_extension(ies, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME)) {
     extensions.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
     ci.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
@@ -3605,6 +3666,7 @@ void init() {
   });
   mods::mouse_init(R.tv.window);
   input::set_prompt_window(R.tv.window);
+  input::set_gamepad_window(R.drc.window);
   input::init();
   install_graphics_menu(R.tv.window);
   ::hostui::load_saved_options();  // graphics and GamePad screen options saved by the settings overlay (settings.ini)
@@ -3719,7 +3781,6 @@ bool android_display_touch_event(const SDL_Event& event) {
     }
     if (touchFinger || !hit()) return false;
     touchFinger = f.fingerID;
-    gfx::display_touched();
     input::set_touch(true, tx, ty);
     return true;
   case SDL_EVENT_FINGER_MOTION:
@@ -3739,7 +3800,6 @@ bool android_display_touch_event(const SDL_Event& event) {
     touchFinger = 0;
     if (!hit(true)) tx = ty = 0;
     input::set_touch(false, tx, ty);
-    gfx::display_touched();
     return true;
   default:
     return false;
@@ -3747,6 +3807,12 @@ bool android_display_touch_event(const SDL_Event& event) {
 }
 #endif
 static bool gamepad_touch(const SDL_Event& event) {
+  // In gamescope the GamePad may host the menu. Let SDL overlay input receive its clicks,
+  // including touch-emulated mouse events, before the guest GamePad touch router consumes them.
+  if (overlay::window_target::selected.load() == overlay::window_target::Window::GamePad && overlay::captures()) {
+    if (touchHeld != TouchIn::None) { touchHeld = TouchIn::None; input::set_touch(false, 0, 0); }
+    return false;
+  }
   const SDL_WindowID drcId = R.drc.window ? SDL_GetWindowID(R.drc.window) : 0;
   const SDL_WindowID tvId = SDL_GetWindowID(R.tv.window);
   float tx = 0, ty = 0;
@@ -3784,7 +3850,6 @@ static bool gamepad_touch(const SDL_Event& event) {
       tv_window_point(event.button.x, event.button.y, nx, ny);
       if (!gfx::overlay_hit(nx, ny, &tx, &ty)) return false;  // the game's window: mouse camera etc.
       touchHeld = TouchIn::TvWindow;
-      gfx::display_touched();
     } else {
       return false;
     }
@@ -3807,7 +3872,6 @@ static bool gamepad_touch(const SDL_Event& event) {
       float nx, ny;
       tv_window_point(x, y, nx, ny);
       if (!gfx::overlay_hit(nx, ny, &tx, &ty, true)) tx = ty = 0;
-      gfx::display_touched();
     }
     if (up) touchHeld = TouchIn::None;
     input::set_touch(!up, tx, ty);
@@ -3920,22 +3984,40 @@ void run_main_loop() {
   // Issue #109: the mouse pointer hides after 2 s without mouse use while the game window has focus
   // (not while the settings overlay is open, which needs it; the mouse camera captures it itself).
   auto mouseUsed = std::chrono::steady_clock::now();
-  bool pointerHidden = false;
+  bool pointerHidden = false, pointerKept = false;
   for (;;) {
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
+#ifdef _WIN32
+      if(event.type==SDL_EVENT_WINDOW_HDR_STATE_CHANGED && event.window.windowID==SDL_GetWindowID(R.tv.window)) {
+        const bool enabled=SDL_GetBooleanProperty(SDL_GetWindowProperties(R.tv.window),SDL_PROP_WINDOW_HDR_ENABLED_BOOLEAN,false);
+        // SDL also reports white-level/headroom changes after presentation.
+        // Our explicit nits controls do not require a new swapchain for those.
+        if(hdr::displayEnabled.exchange(enabled)!=enabled)R.tv.resize=true;
+      }
+#endif
       if ((event.type == SDL_EVENT_MOUSE_MOTION && event.motion.which != SDL_TOUCH_MOUSEID) ||
           ((event.type == SDL_EVENT_MOUSE_BUTTON_DOWN || event.type == SDL_EVENT_MOUSE_BUTTON_UP) &&
            event.button.which != SDL_TOUCH_MOUSEID) ||
           event.type == SDL_EVENT_MOUSE_WHEEL) {
         mouseUsed = std::chrono::steady_clock::now();
-        if (pointerHidden) { SDL_ShowCursor(); pointerHidden = false; }
       }
       if (event.type == SDL_EVENT_QUIT) quit_game();
       if (close_request(event)) continue;
       if (fullscreen_key(event)) continue;
       if (drc_key(event)) continue;
-      if (gamepad_touch(event)) continue;
+      if (gamepad_touch(event)) {
+        // Consumed GamePad drags still move the visible stereo pointer.
+        const bool motion=event.type==SDL_EVENT_MOUSE_MOTION;
+        const bool button=event.type==SDL_EVENT_MOUSE_BUTTON_DOWN || event.type==SDL_EVENT_MOUSE_BUTTON_UP;
+        if((motion||button) && overlay::window_target::selected.load()==overlay::window_target::Window::TV &&
+           (motion?event.motion.windowID:event.button.windowID)==SDL_GetWindowID(R.tv.window)) {
+          float nx,ny;
+          tv_window_point(motion?event.motion.x:event.button.x,motion?event.motion.y:event.button.y,nx,ny);
+          overlay::mouse_move(nx,ny);
+        }
+        continue;
+      }
       input::handle_event(event);
       for (Screen *s : {&R.tv, &R.drc})
         if (s->window && event.window.windowID == SDL_GetWindowID(s->window)) {
@@ -3959,10 +4041,18 @@ void run_main_loop() {
     {
       const bool focused = R.tv.window && (SDL_GetWindowFlags(R.tv.window) & SDL_WINDOW_INPUT_FOCUS);
       const bool keep = !focused || overlay::is_open() || mods::mouse_captured();
-      if (pointerHidden && keep) { SDL_ShowCursor(); pointerHidden = false; mouseUsed = std::chrono::steady_clock::now(); }
-      else if (!pointerHidden && !keep && std::chrono::steady_clock::now() - mouseUsed > std::chrono::seconds(2)) {
-        SDL_HideCursor();
-        pointerHidden = true;
+      // A hidden pointer shown again for the overlay (or focus loss) gets a fresh 2 s once that ends.
+      if (keep && !pointerKept && pointerHidden) mouseUsed = std::chrono::steady_clock::now();
+      pointerKept = keep;
+      const bool idle=std::chrono::steady_clock::now()-mouseUsed>std::chrono::seconds(2);
+      const bool stereoPointer=overlay::window_target::selected.load()==overlay::window_target::Window::TV &&
+          stereo::requestedMode!=stereo::Off && SDL_GetMouseFocus()==R.tv.window &&
+          !mods::mouse_captured() && (overlay::captures() || !idle);
+      overlay::set_stereo_pointer_visible(stereoPointer);
+      const bool hide=stereoPointer || (!keep && idle);
+      if(hide!=pointerHidden) {
+        if(hide)SDL_HideCursor();else SDL_ShowCursor();
+        pointerHidden=hide;
       }
     }
 #endif
@@ -4061,6 +4151,7 @@ void init_appkit(void *tvLayer, void *drcLayer) {
     }
   });
   LOG("[vulkan] presenting to the AppKit windows through VK_EXT_metal_surface");
+  load_saved_stereo_hdr();  // as the SDL host's hostui::load_saved_options
 }
 void screen_changed(int screen, bool visible) {
   Screen &s = screen ? R.drc : R.tv;

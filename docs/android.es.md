@@ -2,7 +2,7 @@
 
 [English](android.md) · [Português](android.pt.md) · **Español**
 
-The Wind Waker HD funciona de forma nativa en teléfonos y tabletas Android. No es un emulador: el
+The Wind Waker HD funciona de forma nativa en dispositivos Android. No es un emulador: el
 propio código del juego se recompila para procesadores ARM y dibuja con Vulkan. Necesitas tu propia
 copia del juego de Wii U; este proyecto nunca proporciona archivos del juego.
 
@@ -12,8 +12,8 @@ copia del juego de Wii U; este proyecto nunca proporciona archivos del juego.
 |---|---|
 | **Controles en pantalla** | Los dos sticks, la cruceta, A B X Y, L R ZL ZR y + −. El botón 🎮 debajo del botón de vista (esquina superior izquierda) los muestra u oculta. Se ocultan mientras hay un mando conectado y vuelven con el siguiente toque. Un mando Bluetooth o USB también funciona. |
 | **La pantalla del GamePad al pausar** | Pulsa + y la imagen cambia a la pantalla del GamePad (mapa y objetos), como el menú de pausa de la versión de GameCube. Pulsa + otra vez para volver. |
-| **60 fps sin que el juego vaya lento** | En los teléfonos rápidos el juego muestra 60 imágenes por segundo. Cuando el teléfono se calienta, pasa solo a 30 estables, y el juego nunca se ralentiza. |
-| **Teléfonos antiguos** | Si el driver de tu GPU Adreno es demasiado antiguo, la pantalla de error ofrece instalar un driver como Mesa Turnip. |
+| **60 fps sin que el juego vaya lento** | En los dispositivos Android rápidos el juego muestra 60 imágenes por segundo. Cuando el dispositivo Android se calienta, pasa solo a 30 estables, y el juego nunca se ralentiza. |
+| **Dispositivos Android antiguos** | Si el driver de tu GPU Adreno es demasiado antiguo, la pantalla de error ofrece instalar un driver como Mesa Turnip. |
 | **Partidas guardadas** | Exporta e importa tus partidas y guárdalas en la copia de seguridad de Android. Las partidas de una Wii U real (de EE. UU. o de Europa) también funcionan. |
 
 ## Teléfonos probados
@@ -30,7 +30,7 @@ segundo: 30 es la velocidad completa.
 | OnePlus 8 Pro | Snapdragon 865, Adreno 650 (Mesa Turnip) | 30 fps | 26–30 / 30 | funciona; un cierre de la GPU todavía en estudio |
 | Galaxy Tab S6 Lite | Snapdragon 720G, Adreno 618 (Mesa Turnip), 4 GB | 15–24 fps | 15–24 / 30 | funciona lento: más o menos a media velocidad en Outset |
 
-Necesitas un teléfono de 64 bits con Android 13 o posterior y Vulkan 1.3 (o un driver
+Necesitas un dispositivo Android de 64 bits con Android 13 o posterior y Vulkan 1.3 (o un driver
 personalizado en Adreno), y unos pocos GB libres.
 
 ## Cómo jugar
@@ -39,8 +39,8 @@ personalizado en Adreno), y unos pocos GB libres.
 
 La app de instalación viene en todas las versiones oficiales: descarga el `WindWakerHD-<versión>-android-arm64.apk`
 en la página de [Releases](https://github.com/ZeldaWWHDRecomp/ZeldaWWHDRecomp/releases) (el APK `android-x86_64` es para emuladores y Chromebooks). No lleva
-código del juego: prepara el juego en tu teléfono a partir de tu propia copia. Las versiones siguientes
-se instalan encima y conservan tus partidas y tus ajustes (el teléfono vuelve a preparar el juego
+código del juego: prepara el juego en tu dispositivo Android a partir de tu propia copia. Las versiones siguientes
+se instalan encima y conservan tus partidas y tus ajustes (el dispositivo Android vuelve a preparar el juego
 cuando una actualización lo necesita).
 
 1. Instala el APK. Si ya tienes una versión preparada en tu PC, exporta antes tu partida (mantén
@@ -48,7 +48,7 @@ cuando una actualización lo necesita).
 2. Abre la app y elige tu juego: **Choose extracted game folder** (carpeta extraída), **Choose WUA
    archive** (archivo `.wua`) o **Choose WUD / WUX disc image** (imagen de disco; después también
    **Choose disc key file** y **Choose common key file**, las claves).
-3. Pulsa **Start / resume / retry setup**. El teléfono extrae y compila el juego una sola vez; la
+3. Pulsa **Start / resume / retry setup**. El dispositivo Android extrae y compila el juego una sola vez; la
    pantalla muestra el progreso, por ejemplo "Compiling: 30/80 · about 12 min left". Puedes salir
    de la app mientras tanto, y **Pause setup** lo detiene de forma segura.
 4. Cuando indique que la instalación terminó, pulsa **Play current build**.
@@ -65,7 +65,7 @@ Los pasos completos están en el README, sección *Android (build it yourself)*.
 ## Juego limpio
 
 - Usa tu propia copia del juego, extraída de tu propio disco o consola.
-- Un APK preparado en tu PC contiene tu juego recompilado. Úsalo solo en tu teléfono y no lo
+- Un APK preparado en tu PC contiene tu juego recompilado. Úsalo solo en tu dispositivo Android y no lo
   compartas nunca.
 - Si alguien ofrece un APK listo con el juego dentro, no es de este proyecto.
 
@@ -79,13 +79,13 @@ botones táctiles mientras está conectado.
 La versión de Wii U de The Wind Waker HD, de EE. UU. o de Europa. Las partidas de una Wii U real
 también funcionan.
 
-**Mi teléfono se calienta. ¿Es normal?**
-El juego es exigente. Cuando el teléfono se calienta, el juego baja solo de 60 a 30 fps estables
+**Mi dispositivo Android se calienta. ¿Es normal?**
+El juego es exigente. Cuando el dispositivo Android se calienta, el juego baja solo de 60 a 30 fps estables
 y sigue a velocidad completa.
 
 **Algo no funciona.**
 Abre una [issue](https://github.com/ZeldaWWHDRecomp/ZeldaWWHDRecomp/issues) con el modelo del
-teléfono, la versión de Android y lo que pasó (en inglés si puedes). Después de un cierre
+dispositivo Android, la versión de Android y lo que pasó (en inglés si puedes). Después de un cierre
 inesperado, la siguiente vez que abras el juego te ofrecerá el informe para compartirlo.
 
 ---

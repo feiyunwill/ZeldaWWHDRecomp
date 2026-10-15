@@ -2,7 +2,8 @@
 // frame loop: a frame starts when the previous flip has executed, is ready `cost` later, and flips
 // at its vsync or, if it is late, as soon as it is ready. Checks that frames on time keep the exact
 // 59.94 Hz grid (also with late wake-ups), that a computer slightly slower than the limit gets its
-// own rate instead of half of it (issue #125), and that the grid never runs ahead in a burst.
+// own rate instead of half of it (issue #125), and that the grid never runs ahead in a burst; and
+// the step slots of paced frame interpolation (issue #164; their pass loop: interp_pacing_test).
 #include "../src/gx2/vsync_pacing.h"
 
 #include <algorithm>
@@ -155,8 +156,38 @@ static void test_flip_executed() {
     CHECK(flip_executed(kClock, shift, 40, kClock.time(40, 0) + 17 * kMs, 1) == 45 && shift > 0);
 }
 
+
+// Step slots (issue #164): a slot rounds up to the next vsync at the drawn rate, a step's logic frame
+// waits for its slot, and the next slot is two vsyncs after this one unless the frame was two steps
+// late.
+static void test_step_slots() {
+    const int64_t step = 2 * kClock.period, tick = kClock.granule_ns(1);
+    // a slot on a tick is that tick; between ticks the next one (at 240 fps: quarter vsyncs; at 120
+    // fps: half vsyncs)
+    CHECK(slot_tick(kClock, kClock.time(40, 0), 0, 1) == 40);
+    CHECK(slot_tick(kClock, kClock.time(40, 0) + 1, 0, 1) == 41);
+    CHECK(slot_tick(kClock, kClock.time(40, 0) - 1, 0, 1) == 40);
+    CHECK(slot_tick(kClock, kClock.time(41, 0), 0, 2) == 42);
+    // with the grid moved (shift), on the moved grid
+    const int64_t shift = 3 * kMs;
+    CHECK(kClock.time(slot_tick(kClock, kClock.time(40, 0), shift, 1), shift) >= kClock.time(40, 0));
+    CHECK(kClock.time(slot_tick(kClock, kClock.time(40, 0), shift, 1), shift) < kClock.time(40, 0) + tick);
+    // a logic frame is due on its slot when the frame before it flipped earlier; an in-between
+    // frame, or no slot: one interval after the previous flip
+    CHECK(step_due(kClock, 35, kClock.time(40, 0), 0, 1) == 40);
+    CHECK(step_due(kClock, 45, kClock.time(40, 0), 0, 1) == 45);
+    CHECK(step_due(kClock, 35, -1, 0, 1) == 35);
+    // two vsyncs = 8 ticks at 240 fps: the next slot is exactly the tick 8 later
+    const int64_t slot = kClock.time(40, 0);
+    CHECK(next_slot(slot, slot + 100'000, step, tick) == kClock.time(48, 0));
+    CHECK(next_slot(slot, slot + step - 1, step, tick) == slot + step);  // late, but less than a step
+    CHECK(next_slot(slot, slot + 2 * step - 1, step, tick) == slot + step);  // (the GPU queue's lag at the flip)
+    CHECK(next_slot(slot, slot + 2 * step, step, tick) == slot + 2 * step + tick);  // two steps late: a new schedule
+}
+
 int main() {
     test_flip_executed();
+    test_step_slots();
     test_on_time();
     test_slightly_slow();
     test_hitch();

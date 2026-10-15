@@ -38,6 +38,24 @@ inline FILE* open_utf8_file(const std::string& path, const char* mode) {
   return std::fopen(path.c_str(),mode);
 #endif
 }
+// Staged files are named <destination>.t<8 hex> (issue #144: short, so cache paths stay far below
+// Windows' MAX_PATH; releases up to v0.2.12 used <destination>.tmp-<pid>-<clock>-<n>).
+inline bool atomic_temporary_suffix(std::u8string_view suffix) {
+  auto hex=[](char8_t c) { return (c>=u8'0'&&c<=u8'9')||(c>=u8'a'&&c<=u8'f'); };
+  if(suffix.size()==10&&suffix.starts_with(u8".t")) {
+    for(auto c:suffix.substr(2)) if(!hex(c)) return false;
+    return true;
+  }
+  // The earlier form: exactly decimal PID-clock-sequence, no extension.
+  if(!suffix.starts_with(u8".tmp-")) return false;
+  unsigned fields=1;bool digit=false;
+  for(auto c:suffix.substr(5)) {
+    if(c>=u8'0'&&c<=u8'9') { digit=true; continue; }
+    if(c!=u8'-'||!digit||fields==3) return false;
+    ++fields;digit=false;
+  }
+  return digit&&fields==3;
+}
 // Remove only this destination's own uniquely named, regular staged files.
 // Best effort: permissions/clock/filesystem errors cannot fail a cache write.
 inline void remove_stale_atomic_temporaries(const std::string& destination) noexcept {
@@ -45,22 +63,13 @@ inline void remove_stale_atomic_temporaries(const std::string& destination) noex
     const auto target=std::filesystem::u8path(destination);
     auto directory=target.parent_path();
     if(directory.empty()) directory=".";
-    const auto prefix=target.filename().u8string()+u8".tmp-";
+    const auto prefix=target.filename().u8string();
     std::error_code error;
     std::filesystem::directory_iterator entries(directory,error), end;
     const auto cutoff=std::filesystem::file_time_type::clock::now()-std::chrono::hours(24);
     for(;!error && entries!=end;entries.increment(error)) {
       const auto name=entries->path().filename().u8string();
-      if(!name.starts_with(prefix)) continue;
-      // Generated suffix is exactly decimal PID-clock-sequence, no extension.
-      auto suffix=std::u8string_view(name).substr(prefix.size());
-      unsigned fields=1;bool digit=false,valid=true;
-      for(auto c:suffix) {
-        if(c>=u8'0'&&c<=u8'9') { digit=true; continue; }
-        if(c!=u8'-'||!digit||fields==3) { valid=false;break; }
-        ++fields;digit=false;
-      }
-      if(!valid||!digit||fields!=3) continue;
+      if(!name.starts_with(prefix)||!atomic_temporary_suffix(std::u8string_view(name).substr(prefix.size()))) continue;
       std::error_code itemError;
       if(entries->symlink_status(itemError).type()!=std::filesystem::file_type::regular||itemError) continue;
       const auto written=entries->last_write_time(itemError);
@@ -78,9 +87,14 @@ inline FILE* open_atomic_temporary(const std::string& destination, std::string& 
 #else
   const auto pid = getpid();
 #endif
-  const auto epoch = std::chrono::steady_clock::now().time_since_epoch().count();
+  const auto epoch = uint64_t(std::chrono::steady_clock::now().time_since_epoch().count());
   for (unsigned attempt=0; attempt<64; ++attempt) {
-    path = destination + ".tmp-" + std::to_string(pid) + "-" + std::to_string(epoch) + "-" + std::to_string(sequence.fetch_add(1));
+    // process, time and sequence mixed into 32 bits; a collision only means another attempt
+    uint64_t x = (uint64_t(uint32_t(pid))<<32) ^ epoch ^ (sequence.fetch_add(1)*0x9e3779b97f4a7c15ull);
+    x ^= x>>30; x *= 0xbf58476d1ce4e5b9ull; x ^= x>>27; x *= 0x94d049bb133111ebull; x ^= x>>31;
+    char suffix[16];
+    std::snprintf(suffix,sizeof suffix,".t%08x",unsigned(uint32_t(x)));
+    path = destination + suffix;
     FILE* file = open_utf8_file(path,"wbx");
     if (file) return file;
     if (errno != EEXIST) break;

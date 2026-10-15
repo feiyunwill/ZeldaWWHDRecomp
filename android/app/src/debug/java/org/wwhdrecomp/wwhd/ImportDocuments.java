@@ -61,6 +61,11 @@ public final class ImportDocuments extends DocumentsProvider {
     }
     @Override public boolean isChildDocument(String parent, String child) { return child.startsWith(parent + "/"); }
     @Override public ParcelFileDescriptor openDocument(String id, String mode, CancellationSignal signal) throws FileNotFoundException {
+        if (id.equals("key") || id.equals("replacementkey")) {
+            android.content.SharedPreferences recovery = getContext().getSharedPreferences("key-recovery-fixture", 0);
+            if (recovery.getBoolean("revoked", false)) throw new SecurityException("Synthetic revoked key grant");
+            if (recovery.getBoolean("moved", false)) throw new FileNotFoundException("Synthetic moved key document");
+        }
         if (!mode.equals("r") || directory(id)) throw new FileNotFoundException();
         OPENS.computeIfAbsent(id, key -> new AtomicInteger()).incrementAndGet();
         try {

@@ -1,4 +1,5 @@
 #pragma once
+#include "overlay/window_target.h"
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -33,10 +34,6 @@ bool record_screenshot(Screen& screen,Buffer& buffer,uint32_t& width,uint32_t& h
 // the gameplay mod HUDs (climb's stamina wheel, the run/swim boost's bar), drawn into the TV scan
 // image (as mods/mod_hud.mm does on Metal)
 void draw_mod_overlay(Surface& scan);
-// automatic GamePad overlay (display.mm): 32x18 signatures of the pictures (slot 0 GamePad, 1 TV)
-bool record_signature(int slot,Surface& source,bool sourceLinear);
-std::vector<float> read_signature(int slot);
-void reset_signatures();
 // capture.cpp: a colour surface read back as RGBA8 (encodeSrgb: linear values to display encoding)
 std::vector<uint8_t> read_surface_rgba(Surface& source,bool encodeSrgb);
 // Swapchain replacement calls reset only after the device is idle. Views and
@@ -49,7 +46,8 @@ void prepare_present_screen(Screen& screen, bool colorAttachmentSupported, bool 
 bool draw_present_screen(Screen& screen, uint32_t imageIndex);
 struct PresentImageParams {
  int32_t aa=0,conv=0;
- float sharp=1,foot=1,alpha=1,pad[3]{};
+ float sharp=1,foot=1,alpha=1;
+ float hdrWhite=0,hdrPeak=0,hdrExposure=0,hdrHighlights=0,pad[3]{};
 };
 // Prepared on the renderer thread. Recording reads only these copied handles
 // and values; the caller retains all referenced objects through GPU completion.
@@ -101,12 +99,13 @@ void record_present_capture(Screen& screen, uint32_t imageIndex);
 void finish_present_capture(Screen& screen);
 void write_rgba_png(const std::string& path, uint32_t width, uint32_t height,
                     const std::vector<uint8_t>& rgba);
-// settings overlay (overlay.cpp): this frame's Dear ImGui draw data, drawn on top of the TV window's
-// composition (swap image and present dumps); null when the overlay shows nothing
-void set_overlay_draw(ImDrawData* draw);
+// This frame's menu and host messages, on the selected window's composition and present dumps.
+// Default target is TV; null draw data when the overlay shows nothing.
+void set_overlay_draw(overlay::window_target::DrawFrame frame);
 void overlay_renderer_init();
 void overlay_prepare(ImDrawData* draw);  // texture uploads (outside rendering)
-void overlay_draw(ImDrawData* draw,VkCommandBuffer cmd,VkFormat format,VkExtent2D extent,bool linear);
+void overlay_draw(ImDrawData* draw,VkCommandBuffer cmd,VkFormat format,VkExtent2D extent,bool linear,int stereoEye=-1,float whiteScale=1);
+void test_hdr_presentation();
 void reset_overlay_resources();
 // Device shutdown/recreation only: drain submissions before destroying these.
 void reset_present_resources();

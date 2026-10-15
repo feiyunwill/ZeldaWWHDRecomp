@@ -57,9 +57,17 @@ int main() {
   const auto foreign=staged("-other.tmp-123-456-789",true);
   const auto malformed=staged(".tmp-123-456-789.extra",true);
   const auto incomplete=staged(".tmp-123-456",true);
+  // the current short form (issue #144): <destination>.t<8 hex>
+  const auto shortOrphan=staged(".t0123abcd",true);
+  const auto shortRecent=staged(".t0123abce",false);
+  const auto shortMalformed=staged(".t0123abcx",true);
+  const auto shortLonger=staged(".t0123abcd0",true);
   std::string fresh;FILE* opened=gfxvk::open_atomic_temporary(path,fresh);std::fclose(opened);
-  assert(!std::filesystem::exists(orphan));
-  for(const auto& kept:{recent,foreign,malformed,incomplete})assert(std::filesystem::exists(kept));
+  assert(fresh.size()==path.size()+10 && fresh.compare(0,path.size()+2,path+".t")==0);
+  assert(!std::filesystem::exists(orphan) && !std::filesystem::exists(shortOrphan));
+  for(const auto& kept:{recent,foreign,malformed,incomplete,shortRecent,shortMalformed,shortLonger})
+    assert(std::filesystem::exists(kept));
+  std::filesystem::remove(std::filesystem::u8path(fresh));
   assert(read(path)==next); // Never remove the committed destination.
   std::filesystem::remove_all(dir);
 }

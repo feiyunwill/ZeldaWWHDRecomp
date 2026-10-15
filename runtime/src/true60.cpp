@@ -68,6 +68,8 @@ void after_execute(uint32_t proc, uint32_t fn, bool is_link, float dt);
 void before_execute_link(uint32_t proc);
 uint64_t origin_step();
 bool dumping();
+bool digesting();                  // WWHD_PROC_DIGEST (comparisons of two builds)
+void proc_digest(uint32_t proc);
 }
 namespace interp {
 bool hold_pass();          // interp.cpp: this is a half pass (no 30 Hz logic)
@@ -682,6 +684,7 @@ extern "C" void hook_025DF940(Cpu* c) {
         uint32_t fn = true60_test::dumping() ? actor_execute_fn(proc) : 0;
         if (fn == kDaPyExecute) true60_test::before_execute_link(proc);
         f_025DF940_orig(c);
+        if (true60_test::digesting()) true60_test::proc_digest(proc);
         if (fn) true60_test::after_execute(proc, fn, fn == kDaPyExecute, 1.0f);
         if (is_cam) trace_camera(proc, 1.0f);
         g_st.full++;
@@ -1136,6 +1139,7 @@ extern "C" void hook_025D6800(Cpu* c) {
 
 // fpcM_Draw(process): remembers which process is drawing (nested: the play scene draws the actors),
 // so interpolation leaves the models of 60 Hz processes alone
+namespace interp { void reticle_keep_draw(uint32_t owner); }
 static uint32_t g_draw_stack[8];
 static int g_draw_depth = 0;
 static int g_force_draw_60 = 0;  // drawing that follows 60 Hz state although its process is 30 Hz
@@ -1246,6 +1250,7 @@ extern "C" void hook_025DF904(Cpu* c) {
         for (uint32_t i = 0; i < size / 4; i++)
             if (cur[i] != before[i] && std::find(keep.begin(), keep.end(), i) == keep.end()) cur[i] = before[i];
         if (cull_mtx) memcpy(ppc_ptr(cull_mtx), cull_before, 0x30);
+        interp::reticle_keep_draw(proc);
     }
     watch_link("draw", proc, wv);
     g_draw_depth--;

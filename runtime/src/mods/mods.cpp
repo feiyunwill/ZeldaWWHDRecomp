@@ -414,6 +414,11 @@ extern "C" void hook_023DE788(Cpu* c) {
         c->f[1].ps0 = (float)(c->f[1].ps0 * factor);
     } else {
         anim_forget(c->r[4]);
+        // faster ladders / sidling (traversal.cpp): clips started in those procedures play faster
+        if (traversal_anim()) {
+            const float traversal = traversal_anim_factor(ld32(c->r[3] + 0x65F0));
+            if (traversal != 1.f) c->f[1].ps0 = (float)(c->f[1].ps0 * traversal);
+        }
     }
     f_023DE788_orig(c);
 }

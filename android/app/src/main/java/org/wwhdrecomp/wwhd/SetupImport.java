@@ -34,37 +34,82 @@ public final class SetupImport {
         return new File(job, "replace-" + key + "-key.json");
     }
 
-    /** Queue only the key URI; the worker atomically copies it at its next safe start. */
-    public static void selectKey(File job, String key, Uri uri) throws Exception {
+    /** Imported images can recover key selections even if their original source record is absent. */
+    static JSONObject keySource(File job) throws Exception {
+        File source = new File(job, "source.json");
+        if (source.isFile()) return SetupStore.read(source);
+        JSONObject input = SetupStore.read(new File(job, "job.json")).getJSONObject("input");
+        if (!input.getString("kind").equals("image")) throw new IOException("Keys are only needed for disc images");
+        return new JSONObject().put("schema", 1).put("kind", "image");
+    }
+
+    private static String selectedKeyUri(File job, JSONObject source, String key) throws Exception {
         File pending = keyReplacement(job, key);
-        JSONObject source = SetupStore.read(new File(job, "source.json"));
+        return pending.isFile() ? SetupStore.read(pending).getString("uri") : source.optString(key + "_uri");
+    }
+
+    private static boolean lostKey(Context context, File job, String key, String uri) throws Exception {
+        if (SetupKeyAccess.failed(job, key) || uri.isEmpty()) return true;
+        for (android.content.UriPermission permission : context.getContentResolver().getPersistedUriPermissions())
+            if (permission.isReadPermission() && permission.getUri().toString().equals(uri)) return false;
+        return true;
+    }
+
+    /** A multi-key selection repairs linked or lost roles together, using only URI metadata on disk. */
+    public static void selectKey(Context context, File job, String key, Uri uri) throws Exception {
+        JSONObject source = keySource(job);
+        String other = SetupKeyRecoveryPolicy.other(key);
+        String oldUri = selectedKeyUri(job, source, key), otherUri = selectedKeyUri(job, source, other);
+        boolean multiKey;
+        try (InputStream input = context.getContentResolver().openInputStream(uri)) {
+            if (input == null) throw new IOException("Cannot read selected key file; choose the key again");
+            multiKey = SetupKeyRecoveryPolicy.isMultiKeyDocument(input);
+        }
+        String[] keys = SetupKeyRecoveryPolicy.replacementKeys(key, multiKey, oldUri, otherUri,
+            lostKey(context, job, key, oldUri), lostKey(context, job, other, otherUri));
+        selectKeys(job, keys, uri);
+    }
+
+    /** Queue only the key URI; single-role callers retain their existing behaviour. */
+    public static void selectKey(File job, String key, Uri uri) throws Exception {
+        selectKeys(job, new String[] {key}, uri);
+    }
+
+    private static void selectKeys(File job, String[] keys, Uri uri) throws Exception {
+        JSONObject source = keySource(job);
         if (!source.getString("kind").equals("image")) throw new IOException("Keys are only needed for disc images");
         if (new File(job, "job.json").isFile()) {
             String state = SetupStore.read(new File(job, "host.json")).optString("state");
             if (!state.equals("failed") && !(state.equals("paused") && new File(job, "manual-pause.json").isFile()))
                 throw new IOException("Pause setup and wait for its checkpoint before changing keys");
-            SetupStore.write(pending, new JSONObject().put("schema", 1).put("uri", uri.toString()));
+            for (String key : keys)
+                SetupStore.write(keyReplacement(job, key), new JSONObject().put("schema", 1).put("uri", uri.toString()));
         } else {
-            source.put(key + "_uri", uri.toString());
+            for (String key : keys) source.put(key + "_uri", uri.toString());
             SetupStore.write(new File(job, "source.json"), source);
         }
+        SetupKeyAccess.clearFailures(job, keys);
     }
 
     private static void replaceKeys(Context context, File job, JSONObject configuration, Control control) throws Exception {
-        JSONObject input = configuration.getJSONObject("input");
         for (String key : new String[] {"disc", "common"}) {
             File pending = keyReplacement(job, key);
-            if (!pending.isFile()) continue;
-            if (!input.getString("kind").equals("image") || !input.getString(key + "_key").equals("input/" + key + ".key"))
-                throw new IOException("Invalid private key destination");
-            JSONObject selection = SetupStore.read(pending);
-            if (selection.getInt("schema") != 1) throw new IOException("Unsupported key selection version");
-            control.checkpoint();
-            copy(context, Uri.parse(selection.getString("uri")), inside(job, input.getString(key + "_key")),
-                new File(job, "import-partial/" + key), -1, -1, true, control, count -> {});
-            // A crash before removal safely repeats the bounded atomic copy.
-            SetupStore.remove(pending);
+            if (pending.isFile()) {
+                // Private snapshots need source metadata only when a new key was selected.
+                JSONObject source = keySource(job);
+                JSONObject selection = SetupStore.read(pending);
+                if (selection.getInt("schema") != 1) throw new IOException("Unsupported key selection version");
+                control.checkpoint();
+                source.put(key + "_uri", selection.getString("uri"));
+                configuration.getJSONObject("input").remove(key + "_key");
+                SetupStore.write(new File(job, "source.json"), source);
+                SetupStore.write(new File(job, "job.json"), configuration);
+                SetupStore.remove(pending);
+            }
+            // Keep legacy copies and references through pause, failure and process death.
+            // A deliberate replacement changes only its role; old bytes remain until completion.
         }
+        SetupStore.write(new File(job, "job.json"), configuration);
     }
 
     public static JSONObject prepare(Context context, File job, Control control) throws Exception {
@@ -73,7 +118,8 @@ public final class SetupImport {
         if (configuration.isFile()) {
             JSONObject existing = SetupStore.read(configuration);
             replaceKeys(context, job, existing, control);
-            return existing;
+            SetupKeyAccess.cleanupCompleted(job);
+            return SetupStore.read(configuration);
         }
         JSONObject source = SetupStore.read(new File(job, "source.json"));
         if (source.getInt("schema") != 1) throw new IOException("Unsupported input selection version");
@@ -128,15 +174,9 @@ public final class SetupImport {
             control.progress(copied, total, index + 1, files.length());
         }
         JSONObject input = new JSONObject().put("kind", kind).put("path", kind.equals("folder") ? "input/game" : "input/dump");
-        if (kind.equals("image")) {
-            for (String key : new String[] {"disc", "common"}) {
-                control.checkpoint();
-                String relative = "input/" + key + ".key";
-                // Never put key bytes or key digests into progress/checkpoint records.
-                copy(context, Uri.parse(source.getString(key + "_uri")), inside(job, relative), new File(job, "import-partial/" + key), -1, -1,
-                    true, control, count -> {});
-                input.put(key + "_key", relative);
-            }
+        // An older release may have been killed after copying keys, before publishing job.json.
+        if (kind.equals("image")) for (String key : new String[] {"disc", "common"}) {
+            if (new File(job, "input/" + key + ".key").isFile()) input.put(key + "_key", "input/" + key + ".key");
         }
         control.checkpoint();
         JSONObject result = new JSONObject().put("schema", 1).put("input", input);

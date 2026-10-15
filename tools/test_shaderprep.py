@@ -1,5 +1,6 @@
 """Synthetic-only schema, conversion, archive resolution and merge tests."""
 import copy
+import os
 import pathlib
 import struct
 import tempfile
@@ -193,6 +194,235 @@ class CodefreeTemplate(unittest.TestCase):
             for bad in (data[:-1],data[:11],data+b'x'):
                 path.write_bytes(bad)
                 with self.assertRaises(ValueError):list(prep.read_records(path))
+
+
+def vulkan_local(p, code=(0x07230203,0x00010300,0,1,0,0x00010000)):
+    """the local (code-carrying) recipe of code-free pipeline p, as the runtime records it"""
+    raw=fmt.vulkan_payload(p)
+    words=list(struct.unpack('<%dI'%((len(raw)-8)//4),raw[8:]))
+    at=210
+    for _ in range(2):
+        words[at:at+1]=[len(code),*code]
+        at+=1+len(code)
+        at+=1+4*words[at]
+    return struct.pack('<%dI'%len(words),*words)
+
+
+def vulkan_db(recipes, fingerprint=b'\x11'*48):
+    body=b''.join(struct.pack('<I',len(r))+r for r in recipes)
+    return b'WWVKPR01'+fingerprint+struct.pack('<II',len(recipes),zlib.crc32(body))+body
+
+
+def legacy_fetch():
+    words=[1|(160<<8),5|(1<<9)|(2<<12)|(3<<15)|(4<<18)|(1<<22),8|(2<<16),0]
+    return struct.pack('<4I',*words)
+
+
+class PlayerCaches(unittest.TestCase):
+    """Issue #162: every record kind the runtime writes, damaged caches, export and merge."""
+    def setUp(self):
+        self.tmp=tempfile.TemporaryDirectory();self.root=pathlib.Path(self.tmp.name)
+
+    def tearDown(self):self.tmp.cleanup()
+
+    def stream(self, name, records):
+        path=self.root/name
+        with path.open('wb') as f:
+            for t,raw in records:prep.write_record(f,t,raw)
+        return path
+
+    def every_kind(self):
+        vk=vulkan();vk2=copy.deepcopy(vk);vk2['shader_hashes']=[4,5,6]
+        return [
+            (1,prep.shader_record(1,b'vertex program A',compact([(0,0,0,0)]),[(0xa216,1),(0xa21a,2)])),
+            (1,prep.shader_record(1,b'vertex program B',legacy_fetch(),[(0xa21a,3)])),  # oldest fetch format
+            (1,prep.shader_record(0,b'pixel program',b'',[(0xa214,4),(0xc000,5)])),
+            (2,fmt.metal_payload(metal())),
+            (3,prep.shader_record(0,b'speculative',b'',[(0xa214,6)])),
+            (4,vulkan_db([vulkan_local(vk)])),
+            (5,fmt.vulkan_payload(vk2)),
+            (6,prep.linked_shader_record(b'linked pixel',compact([(0,0,0,0)]),b'linked vertex',[(0xa214,7)])),
+        ]
+
+    def test_every_record_kind(self):
+        path=self.stream('shaders.bin',self.every_kind())
+        b=prep.TemplateBuilder();b.add_cache(str(path))
+        doc=b.document()
+        self.assertEqual(len(doc['states']),4)        # 3 recorded shaders + 1 linked; speculative skipped
+        self.assertEqual(len(doc['pipelines']),3)     # Metal + Vulkan database + code-free Vulkan
+        self.assertEqual(sorted(b.report.renderers),['metal','vulkan'])
+        self.assertEqual(sum(b.report.skipped.values()),1)
+        data=fmt.encode(doc)
+        for code in (b'vertex program A',b'pixel program',b'linked vertex'):
+            self.assertNotIn(code,zlib.decompress(data[8:]))
+        prep.guard_template(data)
+
+    def test_vulkan_recipes_file_any_count(self):
+        # *.bin.recipes is a whole database (not a record stream); runtime allows 16384 recipes (512 earlier)
+        recipes=[]
+        for i in range(600):
+            p=vulkan();p['shader_hashes']=[i,i+1,i+2];recipes.append(vulkan_local(p))
+        path=self.root/'vk-0123456789ab.bin.recipes';path.write_bytes(vulkan_db(recipes))
+        self.assertEqual(len(fmt.vulkan_database(path.read_bytes())),600)
+        b=prep.TemplateBuilder();b.add_cache(str(path))
+        self.assertEqual(len(b.document()['pipelines']),600)
+        # a damaged recipe is skipped, the others kept; a bad checksum is reported, not fatal
+        data=bytearray(vulkan_db(recipes[:3]));data[64+4+4*5+1]^=0xff  # first recipe's key: a byte > 255
+        path.write_bytes(bytes(data))
+        b=prep.TemplateBuilder();b.add_cache(str(path))
+        self.assertEqual(len(b.document()['pipelines']),2)
+        self.assertEqual(sum(b.report.skipped.values()),2)
+
+    def test_more_records_than_the_old_limit(self):
+        # the original #162 failure: the Metal recorder appends forever (real caches: 181,208 records)
+        path=self.root/'shaders.bin'
+        comp=zlib.compress(fmt.metal_payload(metal()),6)
+        path.write_bytes((struct.pack('<III',2,168,len(comp))+comp)*100001)
+        self.assertEqual(len(list(prep.read_records(path))),100001)  # head starts: up to HEADSTART_MAX_RECORDS
+        b=prep.TemplateBuilder();b.add_cache(str(path))
+        self.assertEqual(b.report.records[2],100001)
+        self.assertEqual(len(b.document()['pipelines']),1)
+
+    def test_truncated_and_damaged_records_are_skipped(self):
+        kinds=self.every_kind()
+        path=self.stream('shaders.bin',kinds)
+        whole=path.read_bytes()
+        # cut inside the last record (a crash while writing)
+        path.write_bytes(whole[:-5])
+        b=prep.TemplateBuilder();b.add_cache(str(path))
+        self.assertEqual(sum(b.report.records.values()),len(kinds)-1)
+        self.assertTrue(any('end' in r for r in b.report.skipped))
+        # garbage and a partial record in the middle, then a later session appended more
+        first=self.stream('a',kinds[:2]).read_bytes();rest=self.stream('b',kinds[2:]).read_bytes()
+        partial=self.stream('c',kinds[5:6]).read_bytes()[:30]
+        path.write_bytes(first+partial+b'\x00garbage\x78\x9c'+rest)
+        b=prep.TemplateBuilder();b.add_cache(str(path))
+        self.assertEqual(sum(b.report.records.values()),len(kinds))
+        self.assertEqual(sum(b.report.skipped.values()),2)  # the damaged span + the speculative record
+        self.assertGreater(b.report.ignored_bytes,0)
+        # a record whose payload does not parse (decodes, wrong layout) is skipped by itself
+        path=self.stream('shaders.bin',[(1,b'\x01'*20)]+kinds[:1])
+        b=prep.TemplateBuilder();b.add_cache(str(path))
+        self.assertEqual(len(b.document()['states']),1)
+        # nothing readable at all: nothing aborts, nothing is found
+        path.write_bytes(b'\xff'*100)
+        b=prep.TemplateBuilder();b.add_cache(str(path))
+        self.assertEqual(b.document(),{'version':3,'states':[],'pipelines':[]})
+
+    def test_full_game_sizes_and_consistent_limits(self):
+        # a full-game merge (89,242 states, 39,119 pipelines, 300 MB of JSON) passed the old 100,000-entry
+        # and 256 MiB limits nowhere consistently; every reader now shares the writers' limits
+        import re, sys
+        sys.path.insert(0,str(pathlib.Path(prep.HERE)/'release'))
+        import guard
+        self.assertEqual((guard.TEMPLATE_MAX_BYTES,guard.TEMPLATE_MAX_ENTRIES),(fmt.MAX_BYTES,fmt.MAX_ENTRIES))
+        self.assertEqual(prep.TEMPLATE_MAX,fmt.MAX_ENTRIES)
+        self.assertGreaterEqual(fmt.MAX_BYTES,1024*1024*1024)
+        header=(pathlib.Path(prep.ROOT)/'runtime/src/gfx/headstart_limits.h').read_text()
+        value=lambda name:eval(re.search(name+r' = ([^;]+);',header).group(1).replace('ull',''))
+        self.assertEqual(value('kHeadstartMaxFileBytes'),prep.HEADSTART_MAX_FILE_BYTES)
+        self.assertEqual(value('kHeadstartMaxRecords'),prep.HEADSTART_MAX_RECORDS)
+        self.assertEqual(value('kHeadstartMaxRawBytes'),prep.HEADSTART_MAX_RAW_BYTES)
+        self.assertGreaterEqual(prep.HEADSTART_MAX_RECORDS,2*fmt.MAX_ENTRIES)
+        # more entries than the old limit: written, guarded, read back (full and compact decode)
+        states=[{'hash':i,'vertex':0,'fetch':None,'registers':[[0xa214,i&0xffff]]} for i in range(100001)]
+        doc={'version':3,'states':states,'pipelines':[metal()]}
+        out=self.root/'big.bin'
+        data=prep.write_template(doc,out,guarded=True)
+        self.assertEqual(len(fmt.decode(data)['states']),100001)
+        compact,_=prep.read_template(str(out))
+        self.assertEqual(len(compact),100001)
+        self.assertEqual(dict(compact[7][3]),{0xa214:7})
+        self.assertEqual(prep._codefree_state(*compact[7]),states[7])
+
+    def test_compact_decode_is_as_strict(self):
+        doc={'version':3,'states':[{'hash':1,'vertex':1,'fetch':None,'registers':[[0xa214,2]]}],'pipelines':[metal()]}
+        data=fmt.encode(doc)
+        c=fmt.decode(data,compact=True)
+        self.assertEqual(prep._codefree_state(*c['states'][0]),doc['states'][0])
+        raw=lambda d:fmt.MAGIC+zlib.compress(__import__('json').dumps(d).encode())
+        for bad in ([[0xa210,1]],[[0xa214,1],[0xa214,2]],[[0x1000,1]],[[1]]):
+            d=copy.deepcopy(doc);d['states'][0]['registers']=bad
+            with self.assertRaises(ValueError):fmt.decode(raw(d),compact=True)
+        d=copy.deepcopy(doc);d['pipelines'].append(doc['states'][0])  # a state where a pipeline belongs
+        with self.assertRaises(ValueError):fmt.decode(raw(d),compact=True)
+        d=copy.deepcopy(doc);d['states'][0]['microcode']=[1]
+        with self.assertRaises(ValueError):fmt.decode(raw(d),compact=True)
+
+    def test_template_command_on_both_cache_kinds(self):
+        metal_cache=self.stream('shaders.bin',self.every_kind()[:4])
+        vk=self.root/'vulkan-x.bin.recipes';vk.write_bytes(vulkan_db([vulkan_local(vulkan())]))
+        for cache in (metal_cache,vk):
+            out=self.root/'t.bin';prep.cmd_template(str(cache),str(out))
+            self.assertTrue(fmt.decode(out.read_bytes()))
+
+    def player_folder(self, config):
+        live=config/'shader-prebuild'/'live';live.mkdir(parents=True)
+        self.stream('shaders.bin',self.every_kind()[:4]).replace(live/'shaders.bin')
+        (live/'vk-0123456789ab.bin.recipes').write_bytes(vulkan_db([vulkan_local(vulkan())]))
+        (live/'vk-0123456789ab.bin').write_bytes(b'driver cache bytes')
+        (live/'vulkan-shaders').mkdir();(live/'vulkan-shaders'/'spirv.bin').write_bytes(b'\x03\x02\x23\x07spirv')
+        return live
+
+    def test_cache_folders_per_platform(self):
+        home=self.root/'home';release=self.root/'release'
+        mac=prep.user_config_dirs({'HOME':str(home)},'darwin',str(release))
+        self.assertIn(str(home/'Library'/'Application Support'/'WWHD'),mac)
+        self.assertEqual(mac[0],str(release/'data'/'user'))  # a portable release first
+        win=prep.user_config_dirs({'HOME':str(home),'APPDATA':str(self.root/'AppData')},'win32',str(release))
+        self.assertEqual(win[-1],str(self.root/'AppData'/'WWHD'))
+        self.assertEqual(prep.user_config_dirs({'HOME':str(home)},'linux',str(release))[-1],str(home/'.config'/'wwhd'))
+        xdg=prep.user_config_dirs({'HOME':str(home),'XDG_CONFIG_HOME':str(self.root/'x')},'linux',str(release))
+        self.assertEqual(xdg[-1],str(self.root/'x'/'wwhd'))
+        self.assertEqual(prep.user_config_dirs({'HOME':str(home),'WWHD_USER_DIR':str(self.root/'u')},'linux',str(release))[0],str(self.root/'u'))
+        # found: the live folder; only shaders.bin and *.recipes, never the driver cache or SPIR-V
+        live=self.player_folder(home/'.config'/'wwhd')
+        folder,files=prep.find_player_caches(None,{'HOME':str(home)},'linux',str(release))
+        self.assertEqual(folder,str(live))
+        self.assertEqual(sorted(os.path.basename(f) for f in files),['shaders.bin','vk-0123456789ab.bin.recipes'])
+        # legacy macOS location, when there is no live folder
+        legacy=home/'Library'/'Caches'/'wwhd';legacy.mkdir(parents=True)
+        (legacy/'shaders.bin').write_bytes((live/'shaders.bin').read_bytes())
+        self.assertEqual(prep.find_player_caches(None,{'HOME':str(home)},'darwin',str(release))[0],str(legacy))
+        # --from: the live folder itself, the settings folder above it, or one file
+        self.assertEqual(prep.find_player_caches(str(home/'.config'/'wwhd'))[0],str(live))
+        self.assertEqual(prep.find_player_caches(str(live/'shaders.bin'))[1],[str(live/'shaders.bin')])
+
+    def export(self, source, out):
+        with patch('sys.stdout'):return prep.cmd_export(str(out),str(source))
+
+    def test_export_and_merge(self):
+        live=self.player_folder(self.root/'a')
+        first=self.root/'first.bin'
+        self.assertEqual(self.export(live,first),0)
+        data=first.read_bytes();self.assertTrue(data.startswith(b'WWHT0003'))
+        prep.guard_template(data)
+        doc=fmt.decode(data)
+        self.assertEqual((len(doc['states']),len(doc['pipelines'])),(3,2))
+        for raw in (b'driver cache bytes',b'spirv',b'vertex program A',b'pixel program'):
+            self.assertNotIn(raw,data);self.assertNotIn(raw,zlib.decompress(data[8:]))
+        # a second player, partly overlapping
+        other=self.root/'b'/'shader-prebuild'/'live';other.mkdir(parents=True)
+        p=vulkan();p['shader_hashes']=[7,8,9]
+        self.stream('s',[(1,prep.shader_record(0,b'other pixel',b'',[(0xa214,9)])),(2,fmt.metal_payload(metal()))]).replace(other/'shaders.bin')
+        (other/'vk.bin.recipes').write_bytes(vulkan_db([vulkan_local(p)]))
+        second=self.root/'second.bin';self.assertEqual(self.export(other,second),0)
+        merged=self.root/'merged.bin'
+        with patch('sys.stdout'):self.assertEqual(prep.cmd_merge(str(merged),[str(first),str(second)]),0)
+        doc=fmt.decode(merged.read_bytes())
+        self.assertEqual((len(doc['states']),len(doc['pipelines'])),(4,3))
+        prep.guard_template(merged.read_bytes())
+        # merge accepts only code-free templates: never a raw cache
+        with patch('sys.stdout'):self.assertEqual(prep.cmd_merge(str(self.root/'bad.bin'),[str(first),str(live/'shaders.bin')]),1)
+        self.assertFalse((self.root/'bad.bin').exists())
+
+    def test_export_writes_nothing_the_guard_rejects(self):
+        live=self.player_folder(self.root/'a');out=self.root/'out.bin'
+        with patch.object(prep,'guard_template',side_effect=ValueError('rejected')):
+            self.assertEqual(self.export(live,out),1)
+        self.assertFalse(out.exists());self.assertFalse(pathlib.Path(str(out)+'.tmp').exists())
+        empty=self.root/'empty';empty.mkdir()
+        self.assertEqual(self.export(empty,out),1);self.assertFalse(out.exists())
 
 
 def sharcfb(programs):

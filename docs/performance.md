@@ -240,6 +240,56 @@ worst flip interval at 60 fps fell from 33.4 to 17.7 ms. Metal at 240 fps withou
 (this computer draws ~150) now draws 149 instead of 119 frames a second at 30.0 instead of 29.8
 logic steps/s.
 
+## 240 fps micro-stutter: step slots (issue #164, 2026-10-12)
+
+At 240 fps with "Keep game speed" on, v0.2.13 hitched every step for seconds at a time and skipped
+an in-between frame every few seconds. Two clocks disagreed: paced interpolation scheduled logic
+steps on a wall clock of its own (33.333 ms, 30.000 steps a second, a late step keeping the
+schedule since #125), while the virtual vsync draws 8 frames a step on the 59.94 Hz grid (33.367
+ms). The schedule drifted 0.034 ms a step against the grid. Where it ran ahead, a logic pass slept
+past its frame's vsync, that frame flipped late ("flips when ready", #125, keeping the grid) and the
+step's in-between frames bunched up behind it at ~3 ms to catch up: one 10-12 ms interval and
+several short ones every step, until the drift had crossed a whole vsync (~8 s on and ~8 s off in a
+cycle of ~16 s). Where it ran behind, the 2 ms planning slack ran out every few seconds and the rest
+of a step's blended frames were skipped. 120 fps has the same cycle at a smaller scale.
+
+Now the schedule is the grid (`gx2/vsync_pacing.h`, step slots): a step's logic frame is due two
+vsyncs after the previous step's (the game's swap interval, 29.97 steps a second as on the
+console), and the logic pass starts one drawn frame before that slot (`interp_pacing.h`
+`slot_step_start`). A logic frame less than a step late keeps the schedule and the next step plans
+fewer in-between frames (the #125 behaviour); later than a step starts a new schedule. Two smaller
+changes go with it: a logic pass that ran late keeps the in-between frames that still fit instead
+of skipping all blended frames of the step (`skip_to`), and an in-between pass probe that
+hits a hitch (at the start the first in-between pass is a probe, and it measured 75-112 ms in four
+of six boots at 240 fps here) counts twice the old estimate and is retried after a second instead of
+keeping in-between frames out for 10 s. `WWHD_TRACE_FLIPS=file` and `WWHD_TRACE_STEPS=file` write
+per-flip and per-step traces.
+
+Measurements (Apple M3 Max, Windfall, Vulkan, hidden windows, `WWHD_DISPLAY_HZ=240`, three runs per build, v0.2.12 /
+v0.2.13 / the fix interleaved; 1-minute load 30-45 from other work, so the rates are noisy): at 240 fps, uneven flip
+intervals (over 1.4 or under 0.6 frames) per second 13.5 / 21.0 / 8.3; at 120 fps 6.9 / 11.2 / 6.8; with 15 ms of
+extra render work per frame (the #125 case) 44 / 51 / 51 fps; with 2.5 ms of extra game work 99 / 147 / 155 fps;
+"Keep game speed" off unchanged. At boot, v0.2.13 measured its first in-between pass at ~85 ms and drew no in-between
+frames; the fix retries that probe and draws ~90 % of them a second later. The late-step rule is `skip_to` (it
+skips as few blended passes as make the rest of the step fit). Full table (three runs per build, interleaved, median; Windfall, Vulkan unless noted, hidden windows,
+`WWHD_DISPLAY_HZ=240`, 36 s per run; 1-minute load 30-46 for every row, so absolute rates are depressed, the
+comparison between builds is fair). Cells: fps, frame-time p50 / p99, uneven intervals per second, logic steps/s.
+
+| Case | v0.2.12 | v0.2.13 | fix |
+|---|---|---|---|
+| 240 fps | 229.1, 4.17 / 8.34 ms, 7.99/s, 29.61 | 239.2, 4.17 / 10.61 ms, 19.05/s, 30.00 | 238.8, 4.17 / 5.24 ms, 1.85/s, 29.97 |
+| 120 fps | 119.9, 8.34 / 8.34 ms, 0.08/s, 29.96 | 119.7, 8.34 / 14.30 ms, 6.56/s, 29.97 | 119.8, 8.34 / 8.34 ms, 0.08/s, 29.97 |
+| 240, render +15 ms (#125 case) | 47.9, 20.85 / 20.86 ms, 23.95 | 56.6, 17.60 / 19.36 ms, 30.00 | 56.6, 17.62 / 18.99 ms, 29.97 |
+| 240, game +2.5 ms | 119.6, 8.34 / 8.34 ms, 29.93 | 180.7, 5.01 / 23.50 ms, 10.7/s, 30.00 | 191.4, 5.08 / 8.15 ms, 11.8/s, 29.97 |
+| Metal 240 | 109.3, 8.35 / 16.70 ms, 29.09 | 127.0, 7.66 / 13.36 ms, 30.00 | 126.3, 7.76 / 11.77 ms, 29.97 |
+| 60 paced, render +15 ms | 29.8, 33.37 / 33.37 ms, 15.27 | 51.3, 17.44 / 33.37 ms, 28.65 | 51.4, 17.40 / 33.37 ms, 28.72 |
+| 240, "Keep game speed" off | 235.2, 4.17 / 8.34 ms, 4.68/s, 29.41 | 239.4, 4.17 / 5.07 ms, 1.37/s, 29.93 | 239.5, 4.17 / 5.37 ms, 1.79/s, 29.94 |
+| Boot at 240: in-between frames in the first 10 s | 2 / 1 / 1 % | 0 / 0 / 0 % | 91 / 85 / 81 % |
+
+Uneven/s is left out where every interval exceeds 1.4 frames. v0.2.12 is tag 5c39d489 and v0.2.13 devel d7d96991,
+each with only the trace and load aids added.
+
+
 ## Desktop CPU/GPU overlap and CPU path defaults (2026-10-07)
 
 Apple M3 Max, MoltenVK, Vulkan renderer, `tools/bench/run_bench.py`, Outset (slot 3) and Windfall

@@ -8,8 +8,15 @@
 #include <utility>
 #include <vector>
 namespace mods::packages {
-inline constexpr const char* kGameId="wwhd-usa";
-inline constexpr const char* kManagerVersion="1.4.0"; // 1.4: "experimental" flag
+// The manifest's game: "wwhd", any region (the build is checked where it matters: the title ID of
+// Cemu/SDCafiine packs, the game build of code mods). Manifests written before 1.5 say "wwhd-usa" and keep
+// loading. New manifests that say "wwhd" also require 1.5.0, so older builds explain what they need.
+inline constexpr const char* kGameId="wwhd";
+inline constexpr const char* kLegacyGameId="wwhd-usa";
+inline bool game_id_supported(const std::string& id){return id==kGameId||id==kLegacyGameId;}
+// The game ID native mods (SDK v1) receive in their host table: unchanged, so libraries comparing it keep working.
+inline constexpr const char* kNativeHostGameId="wwhd-usa";
+inline constexpr const char* kManagerVersion="1.5.0"; // 1.4: "experimental" flag; 1.5: game_id "wwhd"
 struct Option {
     std::string id,name,description,type;
     json::Value value,default_value;
@@ -31,15 +38,19 @@ struct View {
 };
 // Supplied from the running executable marker, never from a saved preference.
 void set_code_mod_support(bool built);
+bool has_code_mod_support(); // this executable was built with code-mod support
 bool needs_code_mod_support(const std::string& id); // includes package dependencies
 void initialize(); // metadata only; before the game starts
 std::string directory();
 std::vector<View> list();
 bool install(const std::string& source,std::string& error,std::string* installed_id=nullptr); // directory or ZIP/.wwhdmod
-bool remove(const std::string& id,std::string& error);
+bool remove(const std::string& id,std::string& error); // also deletes the files its setup prepared
+// Bytes on disk: the package and the files its setup prepared (what Remove frees).
+uint64_t disk_use(const std::string& id);
 bool enable_after_code_rebuild(const std::string& id,std::string& error); // requires the same trust confirmation
 // switch_conflicts is the confirmed Switch action: disable conflicting Cemu packs atomically.
 bool enable(const std::string& id,bool on,std::string& error,bool switch_conflicts=false); // refuses unconfirmed native code
+void refresh_guest_startup(); // after a required package was installed or enabled at startup (required.h)
 // Native packages that enabling `id` would newly turn on (itself and disabled dependencies) whose
 // code the player has not confirmed yet, as {id, name}. Empty: enable() needs no confirmation.
 std::vector<std::pair<std::string,std::string>> unconfirmed_native(const std::string& id);
@@ -92,6 +103,7 @@ struct GuestPackage {
     std::string id, version, path, data_path, fingerprint;
     json::Value options;
     uint32_t heap_size=256*1024;
+    std::string name;  // the manifest's display name (the story notebook names the quest's mod)
 };
 using GuestInspect = std::function<uint32_t(const GuestPackage&)>; // reserved bytes, 64 KiB aligned
 using GuestLoad = std::function<void(const GuestPackage&, uint32_t base)>;

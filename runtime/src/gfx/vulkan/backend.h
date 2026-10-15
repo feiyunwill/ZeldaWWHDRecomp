@@ -54,6 +54,7 @@ struct Screen {
 #endif
  VkSurfaceKHR surface=VK_NULL_HANDLE; VkSwapchainKHR swapchain=VK_NULL_HANDLE;
  VkFormat swapFormat=VK_FORMAT_UNDEFINED; VkExtent2D swapExtent{};
+ bool hdrOutput=false;
  std::vector<VkImage> images; std::vector<VkImageLayout> layouts;
  std::vector<ResourceUse> imageUses;
  VkSemaphore acquired=VK_NULL_HANDLE,finished=VK_NULL_HANDLE;
@@ -198,6 +199,8 @@ struct Renderer {
  std::vector<Surface*> linearTargets; // linear-aligned colour surfaces (never removed, like surfaces): GX2DrawDone write-back
 };
 extern Renderer R;
+void invalidate_surface_cache(decltype(Renderer::surfaces)& surfaces,
+                              uint32_t flags, uint32_t addr, uint32_t size);
 // Render-thread checkpoint; failures leave the cache dirty for a later retry.
 void save_pipeline_cache(bool shutdown = true);
 void present_completed_frame_while_pipeline_pending();

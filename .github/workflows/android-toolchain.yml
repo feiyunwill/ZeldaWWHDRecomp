@@ -5,6 +5,7 @@ on:
   pull_request:
     paths:
       - tools/android/build_toolchain.py
+      - tools/android/adb_util.py
       - tools/android/package_toolchain.py
       - tools/android/package_extractor.py
       - tools/android/extraction_fixture.cpp
@@ -14,6 +15,55 @@ on:
       - tools/android/setup_import_smoke.py
       - tools/android/picker_smoke.py
       - tools/android/SetupPolicyTest.java
+      - tools/android/SetupKeyRecoveryPolicyTest.java
+      - tools/android/TgaImageTest.java
+      - tools/android/ResourceVerifierTest.java
+      - tools/android/ResourceCacheCleanupTest.java
+      - tools/wudextract/**
+      - tools/android/test_*.py
+      - tools/recomp/**
+      - tools/rpx.py
+      - tools/installer/setup.py
+      - runtime/include/**
+      - runtime/src/**
+      - CMakeLists.txt
+      - cmake/**
+      - tools/android/setup_adapter.py
+      - tools/android/prepare_python.py
+      - tools/android/embedding_smoke.py
+      - tools/android/python_smoke.py
+      - tools/android/package_runtime.py
+      - tools/android/runtime_smoke.py
+      - tools/android/service_fixture.py
+      - tools/android/debug_fixture_build.py
+      - tools/android/setup_build_smoke.py
+      - tools/android/package_update_fixture.py
+      - tools/android/setup_rebuild_smoke.py
+      - tools/android/resource_recovery_smoke.py
+      - tools/android/resource_pause_smoke.py
+      - tools/android/resource_sampler.py
+      - tools/android/display_smoke.py
+      - tools/release/package.py
+      - tools/release/guard.py
+      - android/**
+      - .github/workflows/android-toolchain.yml
+      - .github/actions/android-compiler/**
+
+  push:
+    branches: [devel]
+    paths:
+      - tools/android/build_toolchain.py
+      - tools/android/adb_util.py
+      - tools/android/package_toolchain.py
+      - tools/android/package_extractor.py
+      - tools/android/extraction_fixture.cpp
+      - tools/android/native_process.py
+      - tools/android/ondevice_setup.py
+      - tools/android/setup_service_smoke.py
+      - tools/android/setup_import_smoke.py
+      - tools/android/picker_smoke.py
+      - tools/android/SetupPolicyTest.java
+      - tools/android/SetupKeyRecoveryPolicyTest.java
       - tools/android/TgaImageTest.java
       - tools/android/ResourceVerifierTest.java
       - tools/android/ResourceCacheCleanupTest.java

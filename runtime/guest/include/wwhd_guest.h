@@ -171,3 +171,83 @@ s32 wwhd_audio_submit(u32 handle,const short* samples,u32 frames,u32 channels);
 s32 wwhd_audio_available(u32 handle);
 s32 wwhd_audio_close(u32 handle);
 unsigned long long wwhd_audio_epoch(void);
+
+/* Letters v1: a letter from the mod, delivered by the Rito postbox like the game's own mail.
+ * letter_id: 1..32 of a-z 0-9 - _ . (unique within the mod). sender: up to 48 bytes, one line.
+ * text: up to 1200 bytes of UTF-8 plain text, '\n' for line breaks, no other control codes.
+ * The first call in a session keeps the text; the save file records whether the letter was
+ * delivered and read, so calling again (every logic step is fine) never sends it twice.
+ * Returns the letter's state in the current save file, or a negative error. */
+#define WWHD_MAIL_API_VERSION 1
+#define WWHD_MAIL_NONE 0     /* never sent to this save file */
+#define WWHD_MAIL_WAITING 1  /* waiting in the postbox (handed out once Link has the Delivery Bag) */
+#define WWHD_MAIL_READ 2     /* handed out and read */
+#define WWHD_MAIL_INVALID (-1)
+#define WWHD_MAIL_NO_ROOM (-2)  /* no save loaded, or its story record is full (19 entries) */
+s32 wwhd_mail_send(const char* letter_id, const char* sender, const char* text);
+s32 wwhd_mail_state(const char* letter_id);
+
+/* Charts and markers v1: a chart from the mod with marked places, treated like the game's treasure
+ * charts. The save file records whether Link owns the chart (give) and whether it is finished
+ * (finish). The markers are session state: the mod places them (mark adds or moves). While the chart
+ * is only owned, the sea chart shows nothing for it (like an owned treasure chart); once it is
+ * finished, the game's red circle (the mark of a salvaged treasure) marks each marker's spot.
+ * chart_id, marker_id: 1..32 of a-z 0-9 - _ . (chart IDs unique within the mod, marker IDs within the
+ * chart). x, z: Great Sea world units (one square = 100000, square D4's center = 0, 0; x east, z
+ * south). label: one line of UTF-8, up to 64 bytes, or NULL;
+ * it names the marker for lists (a notebook, a minimap); the sea chart shows the circle only.
+ * Results: the chart's state in the current save file, or a negative error. */
+#define WWHD_CHART_API_VERSION 1
+#define WWHD_CHART_NONE 0     /* not given to this save file */
+#define WWHD_CHART_OWNED 1    /* Link has it: nothing on the sea chart yet */
+#define WWHD_CHART_DONE 2     /* finished: the red circle marks its markers' spots */
+#define WWHD_CHART_INVALID (-1)
+#define WWHD_CHART_NO_ROOM (-2)  /* no save loaded or its record is full; or too many markers */
+#define WWHD_CHART_ICON_STORY 0  /* the only icon for now */
+#define WWHD_CHART_COLUMN_X(letter) ((f32)((letter) - 'D') * 100000.0f) /* column 'A'..'G' */
+#define WWHD_CHART_ROW_Z(row) ((f32)((row) - 4) * 100000.0f)            /* row 1..7 */
+s32 wwhd_chart_give(const char* chart_id);
+s32 wwhd_chart_finish(const char* chart_id);
+s32 wwhd_chart_state(const char* chart_id);
+s32 wwhd_chart_mark(const char* chart_id, const char* marker_id, f32 x, f32 z, u32 icon, const char* label);
+s32 wwhd_chart_unmark(const char* chart_id, const char* marker_id); /* NULL marker_id: all of the chart */
+
+/* The story notebook v1: the port's quest journal. Link gets it with the Story Notebook package's letter
+ * (wwhd_mail_send); it is kept in the Delivery Bag, and selecting it opens its page: one row per
+ * quest with its next step, where, and status, and one quest the player may show on the sea chart.
+ * Register the quest in every session (wwhd_quest_define, then the texts of its current step); the
+ * save file records only the step reached, whether it is done and which quest is shown on the chart.
+ * quest_id: 1..32 of a-z 0-9 - _ . (unique within the mod). Texts are UTF-8, one line unless noted;
+ * NULL is empty. title: 1..48 bytes. reward: up to 96. condition: up to 96, NULL when the quest can
+ * be started now (else the notebook says "Not yet available: <condition>"). next: up to 120 bytes,
+ * one sentence. where: up to 48, the island or place. known: up to 600 bytes, '\n' allowed.
+ * Results: the quest's state in the current save file, or a negative error. */
+#define WWHD_QUEST_API_VERSION 1
+#define WWHD_QUEST_NEW 0       /* not started in this save file (new, or not yet available) */
+                               /* 1..254: the step reached ("in progress") */
+#define WWHD_QUEST_DONE 255
+#define WWHD_QUEST_INVALID (-1)
+#define WWHD_QUEST_NO_ROOM (-2)   /* no save loaded or its story record is full; or too many quests */
+s32 wwhd_quest_define(const char* quest_id, const char* title, const char* reward, const char* condition);
+s32 wwhd_quest_step(const char* quest_id, u32 step, const char* next, const char* where); /* step 0: texts only */
+s32 wwhd_quest_place(const char* quest_id, f32 x, f32 z);  /* the next step's place (wwhd_chart_* coordinates) */
+s32 wwhd_quest_no_place(const char* quest_id);             /* the next step has no place on the chart */
+s32 wwhd_quest_known(const char* quest_id, const char* known);
+s32 wwhd_quest_portrait(const char* quest_id, const char* png_path); /* assets/ or textures/, up to 256 x 256 */
+s32 wwhd_quest_done(const char* quest_id);
+s32 wwhd_quest_state(const char* quest_id);
+/* The quest's 8 flags (n 1..8), saved with the story progress: set_flag returns the new value (0/1),
+ * flag the current one; WWHD_QUEST_INVALID / WWHD_QUEST_NO_ROOM as above. */
+s32 wwhd_quest_set_flag(const char* quest_id, u32 n, s32 on);
+s32 wwhd_quest_flag(const char* quest_id, u32 n);
+/* A letter Link carries for the quest (shown in the Delivery Bag, never in the game's inventory):
+ * carried 1 gives it, 0 takes it away. */
+s32 wwhd_quest_carry(const char* quest_id, s32 carried);
+/* Talking to a game resident: at `step`, while this quest is at that step and Link carries its
+ * letter, talking to `resident` shows `lines` (UTF-8, up to three lines, 240 bytes) instead of the
+ * resident's own line, takes the letter, gives `reward` (a rupee item 0x01..0x06, 0 none, through the
+ * game's get-item scene) and the quest is done. When several quests want the resident, the one shown on the
+ * chart talks first, else the one started first. `resident` is a
+ * name from the NPC catalogue (docs/mod-sdk-v2.md), e.g. "windfall-um1"; an unknown name is
+ * refused (WWHD_QUEST_INVALID). */
+s32 wwhd_quest_talk(const char* quest_id, u32 step, const char* resident, const char* lines, u32 reward);

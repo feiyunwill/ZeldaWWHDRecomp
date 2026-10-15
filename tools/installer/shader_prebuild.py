@@ -17,6 +17,19 @@ import time
 SCHEMA = 1
 
 
+def longpath(path):
+    """setup.longpath (issue #144): an extended-length \\\\?\\ path with backslashes, so a cache folder is
+    deleted on Windows whatever its depth; unchanged elsewhere and with a Python that joins paths with "/"
+    (MSYS2's). This module also runs on its own (no setup import)."""
+    if os.name != 'nt' or os.path.join('a', 'b') != 'a\\b':
+        return path
+    path = os.fspath(path)
+    if path.startswith('\\\\?\\') or path.startswith('\\\\.\\'):
+        return path
+    path = os.path.abspath(path).replace('/', '\\')
+    return '\\\\?\\UNC\\' + path[2:] if path.startswith('\\\\') else '\\\\?\\' + path
+
+
 def file_hash(path):
     h = hashlib.sha256()
     with Path(path).open('rb') as stream:
@@ -69,7 +82,8 @@ def opted_out(marker, wanted):
 def atomic_json(path, value):
     path = Path(path)
     # Different setup/startup processes must never share a temporary filename.
-    descriptor, name = tempfile.mkstemp(prefix=path.name + '.new-', dir=path.parent)
+    # short (issue #144: cache paths stay far below Windows' MAX_PATH): manifest.json.t<8 random>
+    descriptor, name = tempfile.mkstemp(prefix=path.name + '.t', dir=path.parent)
     temporary = Path(name)
     try:
         with os.fdopen(descriptor, 'w') as stream:
@@ -174,7 +188,7 @@ def cleanup_generations(root, selected):
                 # ownership is established. Publication lock excludes new selection.
                 if os.name == 'nt':
                     stream.close()
-                shutil.rmtree(directory)
+                shutil.rmtree(longpath(directory))
         except OSError:
             pass
 
@@ -498,7 +512,7 @@ def prepare(game, template, executable, cache_root, package, renderer='vulkan',
         return done
     except Exception as error:
         if staging:
-            shutil.rmtree(staging, ignore_errors=True)
+            shutil.rmtree(longpath(staging), ignore_errors=True)
         if isinstance(error, InterruptedError) and wanted is not None:
             try:
                 with activation_lock(root):

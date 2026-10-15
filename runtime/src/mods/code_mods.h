@@ -8,7 +8,8 @@ struct Status {
     std::string mod; // package queued to be enabled after the rebuild ("" for none)
 };
 bool enabled();
-void startup(int argc, char** argv);
+// fixed_build: this executable is never replaced by a cached code-mod build (the decomp version)
+void startup(int argc, char** argv, bool fixed_build = false);
 bool restart(std::string& error);
 void request(bool on, const std::string& pending_mod = {}); // confirmation is shown in the Mods page
 Status status();

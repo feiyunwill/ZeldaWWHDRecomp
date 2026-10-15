@@ -1,4 +1,5 @@
 #include "pipeline_worker.h"
+#include "../headstart_limits.h"
 #include "pipeline_identity.h"
 #include "recipe_persistence.h"
 #include "headstart.h"
@@ -192,7 +193,7 @@ std::vector<std::shared_ptr<PipelineRecipe>> read_recipes(Worker& w, bool headst
   std::error_code ec;
   const auto size = std::filesystem::file_size(std::filesystem::u8path(path), ec);
   if (ec) return {};
-  if (size > kPipelineRecipeMaxBytes) throw std::runtime_error("recipe file size limit");
+  if (size > (headstart ? kHeadstartMaxFileBytes : kPipelineRecipeMaxBytes)) throw std::runtime_error("recipe file size limit");
   std::unique_ptr<FILE, decltype(&std::fclose)> file(open_utf8_file(path, "rb"), &std::fclose);
   if (!file) return {};
   if (!headstart) {
@@ -205,16 +206,16 @@ std::vector<std::shared_ptr<PipelineRecipe>> read_recipes(Worker& w, bool headst
     return uint32_t(p[0]) | uint32_t(p[1]) << 8 | uint32_t(p[2]) << 16 | uint32_t(p[3]) << 24;
   };
   std::vector<std::shared_ptr<PipelineRecipe>> result;
-  size_t consumed = 0, rawBytes = 0, records = 0;
+  uint64_t consumed = 0, rawBytes = 0, records = 0;
   while (consumed < size) {
     uint8_t header[12];
     if (size - consumed < 12 || std::fread(header, 1, 12, file.get()) != 12)
       throw std::runtime_error("truncated head-start header");
     consumed += 12;
     auto type = word(header), rawSize = word(header + 4), compressed = word(header + 8);
-    if (++records > 100000 || type < 1 || type > 6 || !rawSize || rawSize > 16 * 1024 * 1024 ||
-        !compressed || compressed > 16 * 1024 * 1024 || compressed > size - consumed ||
-        rawSize > 256 * 1024 * 1024 - rawBytes) throw std::runtime_error("head-start record bounds");
+    if (++records > kHeadstartMaxRecords || type < 1 || type > 6 || !rawSize || rawSize > kHeadstartMaxRecordBytes ||
+        !compressed || compressed > kHeadstartMaxRecordBytes || compressed > size - consumed ||
+        rawSize > kHeadstartMaxRawBytes - rawBytes) throw std::runtime_error("head-start record bounds");
     rawBytes += rawSize; consumed += compressed;
     if (type != 4) {
       if (std::fseek(file.get(), compressed, SEEK_CUR)) throw std::runtime_error("head-start seek failed");

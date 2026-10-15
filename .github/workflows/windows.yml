@@ -51,3 +51,17 @@ jobs:
         run: |
           python tools/test_shaderprep.py
           python -m unittest discover -s tools/bench -p "test_*.py"
+
+      # Issue #144: setup unpacks the compiler with \\?\ paths and stops early in a folder too deep for the
+      # game. MSYS2's Python joins paths with "/" and keeps ordinary paths (setup.NATIVE_WINDOWS_PATHS);
+      # the release's kind of Python (python.org, backslashes) really crosses MAX_PATH in the deep unpack test.
+      - name: Installer long path unit tests (MSYS2 Python)
+        run: python tools/installer/test_setup.py LongPaths
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+
+      - name: Installer long path unit tests (python.org Python, as in the release)
+        shell: pwsh
+        run: python tools/installer/test_setup.py LongPaths

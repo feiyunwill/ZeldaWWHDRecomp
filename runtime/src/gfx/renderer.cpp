@@ -1,5 +1,7 @@
-// Renderer selection, start-up with fallback, and restart (see renderer.h).
+// Renderer selection, start-up with fallback, and restart (see renderer.h); the platform backend
+// registry (renderer_ext.h).
 #include "renderer.h"
+#include "renderer_ext.h"
 #include "../screenshot.h"
 #include "../audio_out.h"
 
@@ -72,6 +74,41 @@ void scale_bloom_uniforms(void* remapped, size_t size) {
 
 const Backend* g_backend = nullptr;
 
+// ---------------------------------------------------------------- platform backend (renderer_ext.h)
+namespace ext {
+namespace {
+std::atomic<bool> g_sealed{false};
+PlatformBackend g_platform;
+bool g_have_platform = false;
+}  // namespace
+
+void register_backend(const PlatformBackend& backend) {
+    const char* name = backend.name ? backend.name : "?";
+    if (g_sealed.load(std::memory_order_acquire)) {
+        LOG("[gfx] renderer backend registered too late (%s): register at start-up, before render::choose()", name);
+        return;
+    }
+    if (g_have_platform) {
+        LOG("[gfx] a platform renderer backend is already registered (%s); %s ignored", g_platform.name, name);
+        return;
+    }
+    if (!backend.name || !backend.key || !*backend.key || !backend.table || backend.table->api != Api::Platform) {
+        LOG("[gfx] renderer backend %s ignored: it needs a name, a key and a table with api Api::Platform", name);
+        return;
+    }
+    g_platform = backend;
+    g_have_platform = true;
+}
+const PlatformBackend* registered() { return g_have_platform ? &g_platform : nullptr; }
+void seal() { g_sealed.store(true, std::memory_order_release); }
+bool sealed() { return g_sealed.load(std::memory_order_acquire); }
+void reset_for_test() {
+    g_platform = PlatformBackend{};
+    g_have_platform = false;
+    g_sealed.store(false, std::memory_order_release);
+}
+}  // namespace ext
+
 namespace {
 Api g_requested = Api::Metal;
 std::string g_reason;            // why the requested renderer did not start
@@ -83,6 +120,7 @@ bool parse(const char* s, Api& out) {
     if (!s) return false;
     if (!strcasecmp(s, "metal")) { out = Api::Metal; return true; }
     if (!strcasecmp(s, "vulkan") || !strcasecmp(s, "vk") || !strcasecmp(s, "moltenvk")) { out = Api::Vulkan; return true; }
+    if (const ext::PlatformBackend* p = ext::registered(); p && !strcasecmp(s, p->key)) { out = Api::Platform; return true; }
     return false;
 }
 
@@ -93,10 +131,12 @@ const Backend* backend_for(Api a) {
 #ifdef WWHD_HAS_VULKAN
     if (a == Api::Vulkan) return &vulkan_backend();
 #endif
+    if (a == Api::Platform && ext::registered()) return ext::registered()->table;
     return nullptr;
 }
 
 Api default_api() {
+    if (const ext::PlatformBackend* p = ext::registered(); p && p->make_default) return Api::Platform;
 #ifdef WWHD_HAS_METAL
     return Api::Metal;
 #else
@@ -105,8 +145,14 @@ Api default_api() {
 }
 }  // namespace
 
-const char* api_name(Api a) { return a == Api::Vulkan ? "Vulkan" : "Metal"; }
-const char* api_key(Api a) { return a == Api::Vulkan ? "vulkan" : "metal"; }
+const char* api_name(Api a) {
+    if (a == Api::Platform) return ext::registered() ? ext::registered()->name : "platform";
+    return a == Api::Vulkan ? "Vulkan" : "Metal";
+}
+const char* api_key(Api a) {
+    if (a == Api::Platform) return ext::registered() ? ext::registered()->key : "platform";
+    return a == Api::Vulkan ? "vulkan" : "metal";
+}
 bool compiled(Api a) { return backend_for(a) != nullptr; }
 bool can_choose() { return compiled(Api::Metal) && compiled(Api::Vulkan); }
 Api active() { return g_backend ? g_backend->api : g_requested; }
@@ -134,6 +180,7 @@ void set_preferred(Api a) {
 }
 
 void choose(int argc, char** argv) {
+    ext::seal();
     Api a = preferred();
     const char* why = "default";
 #ifdef WWHD_HAS_METAL
@@ -147,6 +194,7 @@ void choose(int argc, char** argv) {
         else if (!strcmp(argv[i], "--renderer") && i + 1 < argc) v = argv[i + 1];
         if (v) {
             if (parse(v, a)) why = "command line";
+            else if (ext::registered()) LOG("[gfx] unknown renderer '%s' (metal, vulkan or %s)", v, ext::registered()->key);
             else LOG("[gfx] unknown renderer '%s' (metal or vulkan)", v);
         }
     }

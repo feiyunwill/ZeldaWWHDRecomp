@@ -1,7 +1,9 @@
-// Production setup loop, also driven by the game-free offscreen integration fixture.
+// Production setup loop (the Mods tab's install flow drives it: mods_tab.h), also driven by the game-free
+// offscreen integration fixture.
 #pragma once
-#include "setup_widgets.h"
-#include "experimental_ui.h"
+#include "../mods/packages.h"
+#include "../mods/setup_run.h"
+#include "imgui.h"
 #include "../mods/code_mods.h"
 #include <algorithm>
 #include <cstdio>
@@ -35,34 +37,11 @@ inline bool start_setup(const std::string& id,const mods::catalogue::Step& step)
     return true;
 }
 inline mods::setup::Run setup_run;
-inline setupui::Confirmation setup_confirm;
 inline double resume_notice_until=0;
 inline std::string resume_name;
 inline bool setup_open(const std::string& id) {
     auto steps=mods::packages::setup_steps(id);
     return std::any_of(steps.begin(),steps.end(),[](const auto& s){return !s.satisfied&&!s.step.optional;});
-}
-inline void request_setup(const mods::packages::View& mod) {
-    if(!setup_run.id.empty()||!mod.game_source_warning.empty()||(mod.kind=="guest"&&mods::packages::platform_key().starts_with("android")))return;
-    {auto& worker=setup_work();std::lock_guard guard(worker.mutex);if(worker.running)return;}
-    // An experimental mod warns (and backs up the saves) before its setup, which ends by enabling it.
-    if(experimental::gate(mod,[mod]{request_setup(mod);}))return;
-    auto steps=mods::packages::setup_steps(mod.id);
-    if(mods::setup::offer(steps,!mod.game_source_warning.empty())==mods::setup::Action::Blocked)return;
-    setup_confirm={mod.id,mod.name,std::move(steps),{},true};
-    setup_confirm.native=mods::packages::unconfirmed_native(mod.id);
-    setup_confirm.identity=mods::packages::setup_identity(mod.id);
-    for(const auto& status:setup_confirm.steps)if(status.step.type=="choice"&&!status.satisfied&&!status.step.choices.empty())
-        setup_confirm.choices[status.step.option]=status.step.choices.front();
-}
-inline bool enable_checkbox(const mods::packages::View& mod,bool& on) {
-    ImGui::BeginDisabled(!on&&!mod.game_source_warning.empty());
-    bool changed=ImGui::Checkbox("##package_enabled",&on);
-    ImGui::EndDisabled();return changed;
-}
-inline bool handle_setup_enable(const mods::packages::View& mod,bool on) {
-    if(!on||!setup_open(mod.id))return false;
-    request_setup(mod);return true;
 }
 inline void stop_failed_setup() {
     auto& run=setup_run;
@@ -114,46 +93,5 @@ inline void setup_run_tick() {
     if(!enable(run.id,true,run.error))return;
     if(!save_setup_run(run.id,false,run.error))return;
     fprintf(stderr,"[setup run] enabled %s\n",run.id.c_str());run={};
-}
-inline bool setup_confirmation_dialog(std::string& error,bool back) {
-    using namespace mods::packages;auto& c=setup_confirm;
-    auto answer=setupui::confirmation(c,needs_code_mod_support(c.id),!unconfirmed_native(c.id).empty(),back);
-    bool accept=answer==setupui::Answer::Accept;
-
-    if(accept) {
-        if(begin_setup_run(c.id,c.identity,c.choices,error))
-            setup_run={c.id,c.name,"Starting setup...", "", "",false,false,ImGui::GetTime(),current_profile(),c.identity};
-    }
-    if(answer!=setupui::Answer::None)c={};
-    return answer==setupui::Answer::Cancel;
-}
-inline void setup_run_controls(const mods::packages::View& mod) {
-    auto& run=setup_run;
-    if(run.id!=mod.id) {
-        bool busy=false,same_worker=false;
-        {auto& worker=setup_work();std::lock_guard guard(worker.mutex);busy=worker.running;same_worker=worker.id==mod.id;}
-        if(busy&&same_worker)ImGui::TextUnformatted("Finishing the current step...");
-        if(setup_open(mod.id)) {
-            ImGui::BeginDisabled(busy||!run.id.empty()||!mod.game_source_warning.empty()||(mod.kind=="guest"&&mods::packages::platform_key().starts_with("android")));
-            if(ImGui::Button("Set up"))request_setup(mod);
-            ImGui::EndDisabled();
-        }
-        return;
-    }
-    if(ImGui::GetTime()<resume_notice_until)ImGui::Text("Continuing setup of %s...",resume_name.c_str());
-    bool retry=false;
-    bool cancel=setupui::progress(run,ImGui::GetTime(),retry);
-    if(retry) {
-        std::string error;
-        if(run.profile!=mods::packages::current_profile()||run.identity!=mods::packages::setup_identity(run.id))
-            run.error="Package or profile changed; cancel and confirm setup again.";
-        else if(!mods::packages::save_setup_run(run.id,true,error))run.error=error;
-        else {bool restart=run.rebuilding&&mods::code::status().ready;run.retry();run.rebuilding=restart;}
-    }
-    if(cancel) {
-        if(run.rebuilding){mods::code::cancel();mods::code::dismiss();}
-        // A running tool finishes safely; its receipt is retained.
-        std::string error;if(!mods::packages::save_setup_run(run.id,false,error)){run.error=error;return;}run={};
-    }
 }
 }

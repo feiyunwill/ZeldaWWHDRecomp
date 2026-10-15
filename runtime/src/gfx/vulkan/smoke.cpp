@@ -1,9 +1,15 @@
+#ifdef __ANDROID__
+#include "overlay/overlay.h"
+#include "platform/input_sdl.h"
+#endif
 #include "deferred_dispatch.h"
 #include "../../exception_report.h"
 #include "bc_decode.h"
 #include "bc_reference.h"
 // No game assets: assertions inspect data returned by the actual Vulkan device.
 #include "backend.h"
+#include "stereo.h"
+#include "../stereo_projection.h"
 #include "android_shared_image.h"
 #include "pipeline_trace.h"
 #include "present.h"
@@ -17,6 +23,7 @@
 #include "runtime.h"
 #include "Cafe/HW/Latte/LatteAddrLib/LatteAddrLib.h"
 #include "input.h"
+#include "input_map.h"
 #include "gfx/display_modes.h"
 #include "platform/dual_display.h"
 #include "overlay/hostui.h"
@@ -430,7 +437,7 @@ void volume_target_check() {
  require(other&&other!=s&&other->imageType==VK_IMAGE_TYPE_2D,"a 2D sampled view got the rendered volume");
  fprintf(stderr,"[renderer smoke] volume render target slice, clear isolation and 3D sampling passed\n");
 }
-void triangle(Surface& s) {
+float triangle(Surface& s, float eyeOffset=0, float clipW=1) {
  struct Resources {
   VkShaderModule vs=VK_NULL_HANDLE,ps=VK_NULL_HANDLE;VkPipelineLayout layout=VK_NULL_HANDLE;VkPipeline pipeline=VK_NULL_HANDLE;
   ~Resources(){if(pipeline)vkDestroyPipeline(R.device,pipeline,nullptr);if(layout)vkDestroyPipelineLayout(R.device,layout,nullptr);if(vs)vkDestroyShaderModule(R.device,vs,nullptr);if(ps)vkDestroyShaderModule(R.device,ps,nullptr);}
@@ -439,9 +446,14 @@ void triangle(Surface& s) {
   std::string error;auto words=vk::compile_glsl(glsl,vertex,&error);if(words.empty())exception_report::raise("smoke GLSL compilation: "+error);
   VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};ci.codeSize=words.size()*4;ci.pCode=words.data();vk_check(vkCreateShaderModule(R.device,&ci,nullptr,&result),"smoke shader module");
  };
- module("#version 450\nvoid main(){vec2 p[3]=vec2[3](vec2(-0.8,-0.8),vec2(0.8,-0.8),vec2(0,0.8));gl_Position=vec4(p[gl_VertexIndex],0,1);}",true,objects.vs);
+ float projection[16]={1,0,0,0, 0,1,0,0, 0,0,-1.01f,-.1f, 0,0,-1,0};
+ if (clipW==1) { projection[11]=0;projection[14]=0;projection[15]=1; }
+ stereo::project_eye(projection,eyeOffset,4);
+ std::string vertexSource="#version 450\nlayout(push_constant) uniform Camera { vec4 row; } camera; void main(){vec2 p[3]=vec2[3](vec2(-0.8,-0.8),vec2(0.8,-0.8),vec2(0,0.8));float w="+std::to_string(clipW)+";vec4 view=vec4(p[gl_VertexIndex]*w,-w,1);gl_Position=vec4(dot(camera.row,view),view.y,0,w);}";
+ module(vertexSource.c_str(),true,objects.vs);
  module("#version 450\nlayout(location=0) out vec4 color;void main(){color=vec4(1,0,0,1);}",false,objects.ps);
- VkPipelineLayoutCreateInfo layout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};vk_check(vkCreatePipelineLayout(R.device,&layout,nullptr,&objects.layout),"smoke pipeline layout");
+ VkPushConstantRange stereoRange{VK_SHADER_STAGE_VERTEX_BIT,0,16};
+ VkPipelineLayoutCreateInfo layout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};layout.pushConstantRangeCount=1;layout.pPushConstantRanges=&stereoRange;vk_check(vkCreatePipelineLayout(R.device,&layout,nullptr,&objects.layout),"smoke pipeline layout");
  VkPipelineShaderStageCreateInfo stages[2]{};
  for(auto& stage:stages){stage.sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;stage.pName="main";}
  stages[0].stage=VK_SHADER_STAGE_VERTEX_BIT;stages[0].module=objects.vs;stages[1].stage=VK_SHADER_STAGE_FRAGMENT_BIT;stages[1].module=objects.ps;
@@ -461,7 +473,7 @@ void triangle(Surface& s) {
  transition_image(&s,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
  VkRenderingAttachmentInfo target{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};target.imageView=layer_view(&s,0);target.imageLayout=s.layout;target.loadOp=VK_ATTACHMENT_LOAD_OP_CLEAR;target.storeOp=VK_ATTACHMENT_STORE_OP_STORE;target.clearValue.color.float32[3]=1;
  VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};ri.renderArea=scissor;ri.layerCount=1;ri.colorAttachmentCount=1;ri.pColorAttachments=&target;
- auto cmd=command_buffer();record::vkCmdBeginRendering(cmd,&ri);R.rendering=true;record::vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,objects.pipeline);record::vkCmdDraw(cmd,3,1,0,0);end_encoder();mark_gpu_written(&s);flush();
+ auto cmd=command_buffer();record::vkCmdBeginRendering(cmd,&ri);R.rendering=true;record::vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,objects.pipeline);record::vkCmdPushConstants(cmd,objects.layout,VK_SHADER_STAGE_VERTEX_BIT,0,16,projection);record::vkCmdDraw(cmd,3,1,0,0);end_encoder();mark_gpu_written(&s);flush();
  auto pixels=read_image(s,VK_IMAGE_ASPECT_COLOR_BIT,4);
  size_t center=(size_t(s.extent.height/2)*s.extent.width+s.extent.width/2)*4;
  require(pixels[center]==255&&pixels[center+1]==0&&pixels[center+2]==0&&pixels[center+3]==255,"triangle center pixel differs");
@@ -469,6 +481,108 @@ void triangle(Surface& s) {
  size_t red=0;for(size_t i=0;i<pixels.size();i+=4)if(pixels[i]==255)++red;
  require(red>size_t(s.extent.width)*s.extent.height/5&&red<size_t(s.extent.width)*s.extent.height/2,"triangle rasterized area differs");
  fprintf(stderr,"[renderer smoke] generated GLSL triangle/readback passed (%zu red pixels)\n",red);
+ double sum=0;for(size_t i=0;i<pixels.size();i+=4)if(pixels[i]==255)sum+=(i/4)%s.extent.width;
+ return float(sum/red);
+}
+void stereo_geometry_check() {
+ // Exercise the real remapped-uniform path, including a stale HUD register
+ // range beside a world projection. Each eye must get an immutable snapshot.
+ std::vector<uint32_t> regs(0x10000);
+ const uint32_t base=mmSQ_ALU_CONSTANT0_0+0x400;
+ const float camera[16]={2,0,0,0, 0,3,0,0, 0,0,-1.01f,-20, 0,0,-1,0};
+ memcpy(regs.data()+base,camera,64);
+ memcpy(regs.data()+base+32,camera,64);
+ const auto oldTag=stereo::layoutProjection;
+ const auto oldStart=stereo::layoutProjectionStart;
+ stereo::tag_layout(base+32,regs.data()+base+32);
+ LatteDecompilerShader metadata(LatteConst::ShaderType::Vertex);
+ metadata.list_remappedUniformEntries_register={{0,16},{16,0},{32,48},{48,32},{128,64}};
+ vk::Shader shader;shader.vertex=true;shader.dec=&metadata;
+ shader.uniforms.offset_remapped=0;shader.uniforms.offset_endOfBlock=80;
+ std::vector<uint8_t> leftUniforms,rightUniforms;
+ vk::pack_uniforms_into(regs.data(),shader,leftUniforms,1,1,-8,600);
+ vk::pack_uniforms_into(regs.data(),shader,rightUniforms,1,1,8,600);
+ float leftRow[4],rightRow[4];
+ memcpy(leftRow,leftUniforms.data()+16,16);memcpy(rightRow,rightUniforms.data()+16,16);
+ require(leftRow[3]==16 && rightRow[3]==-16,"stereo remapped world projection not applied");
+ require(!memcmp(leftUniforms.data()+64,camera,16)&&!memcmp(rightUniforms.data()+64,camera,16),"stereo moved tagged HUD projection");
+ require(!memcmp(regs.data()+base,camera,64),"stereo modified shared guest uniforms");
+ stereo::layoutProjection=oldTag;stereo::layoutProjectionStart=oldStart;
+ SurfaceDesc desc;desc.addr=0x3E000000;desc.width=64;desc.height=64;desc.pitch=64;desc.format=0x1a;
+ Surface* left=find_or_create_surface(desc,true);
+ const float nearLeft=triangle(*left,-.4f,2);
+ auto leftPixels=read_image(*left,VK_IMAGE_ASPECT_COLOR_BIT,4);
+ stereo_select_eye(1);
+ Surface* right=find_or_create_surface(desc,true);
+ require(right!=left && right->image!=left->image,"stereo surfaces alias between eyes");
+ const float nearRight=triangle(*right,.4f,2);
+ require(nearLeft>nearRight+4,"near geometry lacks stereo disparity");
+ require(read_image(*left,VK_IMAGE_ASPECT_COLOR_BIT,4)==leftPixels,"right eye overwrote left eye");
+ float zeroRight=triangle(*right,.4f,4),farRight=triangle(*right,.4f,8);
+ float hudRight=triangle(*right,.4f,1);
+ stereo_select_eye(0);
+ require(find_or_create_surface(desc,false)==left,"eye surface namespace not restored");
+ float zeroLeft=triangle(*left,-.4f,4),farLeft=triangle(*left,-.4f,8);
+ float hudLeft=triangle(*left,-.4f,1);
+ require(std::fabs(zeroLeft-zeroRight)<.01f,"convergence plane has disparity");
+ require(farRight>farLeft+2,"far geometry has wrong disparity sign");
+ require(std::fabs(hudLeft-hudRight)<.01f,"orthographic HUD has disparity");
+ std::vector<int> order;
+ stereo_pair([&]{order.push_back(stereoEye);},true);
+ stereo_pair([&]{order.push_back(stereoEye);},true);
+ require(order==std::vector<int>({0,1,1,0}),"stereo eye scheduling changed per-eye order");
+ left->gpuWritten=right->gpuWritten=false;
+ left->dirty=right->dirty=false;
+ left->lastCheckedFrame=right->lastCheckedFrame=R.frame;
+ const bool wasRendering=R.rendering;
+ stereo_invalidate(2,desc.addr,64*64*4);
+ require(left->dirty&&right->dirty,"stereo invalidation missed an eye cache");
+ require(stereoEye==0&&R.rendering==wasRendering,"CPU invalidation changed active render context");
+ SurfaceDesc atlas;atlas.addr=mem::host_alloc(6*1024*1024,256);
+ atlas.width=atlas.height=atlas.pitch=1024;atlas.slices=3;atlas.dim=5;atlas.format=5;atlas.isDepth=true;
+ auto* sun=find_or_create_surface(atlas,true);
+ transition_image(sun,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_WRITE_BIT);
+ VkClearDepthStencilValue shadowClear{0.375f,0};
+ VkImageSubresourceRange shadowRange{VK_IMAGE_ASPECT_DEPTH_BIT,0,1,0,3};
+ record::vkCmdClearDepthStencilImage(command_buffer(),sun->image,sun->layout,&shadowClear,1,&shadowRange);
+ mark_gpu_written(sun);
+ stereo_select_eye(1);
+ require(find_or_create_surface(atlas,true)==sun,"sun atlas duplicated for the second eye");
+ require(&stereo_copy_cache(atlas.addr,1024,1024,3)==&stereo_surface_cache(atlas),"shadow copy missed shared atlas");
+ auto shadowPixels=read_image(*sun,VK_IMAGE_ASPECT_DEPTH_BIT,2,0,2);
+ uint16_t shadowValue;memcpy(&shadowValue,shadowPixels.data(),2);
+ require(std::abs(int(shadowValue)-24576)<=1,"second eye cannot read shared sun depth");
+ atlas.slices=1;
+ require(find_or_create_surface(atlas,true)!=sun,"ordinary depth unexpectedly shared");
+ stereo_select_eye(0);
+ // Turning stereo off must release the second eye while retaining eye 0.
+ const auto oldFrame=stereo::frame;
+ const int oldMode=stereo::requestedMode.load();
+ stereo::frame.mode=stereo::HalfSBS;
+ for(auto* scan : {&stereoRight.scan,&stereoRight.buildingScan}) {
+  *scan=std::make_unique<Surface>();
+  (*scan)->width=(*scan)->height=16;(*scan)->format=0x1a;
+  (*scan)->fmt=format_info(0x1a,false);create_surface_image(scan->get(),false);
+ }
+ stereoRight.buildingScanDirty=true;
+ stereo_select_eye(1);
+ stereo::set_mode(stereo::Off);stereo_latch();
+ require(stereoEye==0 && find_or_create_surface(desc,false)==left,"stereo disable lost the primary eye");
+ require(!stereoRight.scan && !stereoRight.buildingScan && !stereoRight.buildingScanDirty,"stereo disable retained scan buffers");
+ stereo_select_eye(1);
+ require(R.surfaces.empty() && R.linearTargets.empty() && R.mainDepthAddr==0,"stereo disable retained second-eye surfaces");
+ stereo_select_eye(0);
+ // Re-enable twice: shared shadows survive, and the released namespace is recreated.
+ for(int cycle=0;cycle<2;++cycle) {
+  stereo::set_mode(stereo::HalfSBS);stereo_latch();
+  stereo_select_eye(1);
+  require(find_or_create_surface(desc,true)->image!=left->image,"re-enabled stereo aliases the primary eye");
+  atlas.slices=3;require(find_or_create_surface(atlas,true)==sun,"stereo toggle lost the shared shadow atlas");
+  stereo::set_mode(stereo::Off);stereo_latch();
+ }
+ stereo::frame=oldFrame;stereo::requestedMode=oldMode;
+ flush();
+ fprintf(stderr,"[renderer smoke] stereo geometry, convergence, HUD, eye isolation and toggle cleanup PASS\n");
 }
 void vertex_window_check(Surface& s) {
  struct Resources {
@@ -690,6 +804,7 @@ int android_display_smoke_test() {
          SDL_GetWindowID(R.tv.window), event.tfinger.x, event.tfinger.y, int(touchHandled),
          int(gfx::g_has_drc_window), int(dual_display::active_swap.load()));
     }
+    if (!touchHandled) input::handle_event(event);
     if (event.type == SDL_EVENT_WINDOW_FOCUS_GAINED || event.type == SDL_EVENT_WINDOW_FOCUS_LOST)
      LOG("[display smoke input] focus type=%u window=%u", unsigned(event.type), event.window.windowID);
     if (event.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED &&
@@ -701,10 +816,23 @@ int android_display_smoke_test() {
      R.tv.visible = true;
     if (event.type == SDL_EVENT_WINDOW_MINIMIZED) R.tv.visible = false;
    }
+   hostui::run_posted();
+   input::update();
    const auto commandPath = std::filesystem::path(internal) / "display-smoke-command";
    if (std::ifstream command{commandPath}; command) {
     std::string value;
     command >> value;
+    if (value == "overlay1") overlay::set_open(true);
+    if (value == "overlay0") overlay::set_open(false);
+    if (value == "faceauto" || value == "faceposition") {
+      auto mapping=input_map::current();
+      if(value=="faceauto") input_map::set_face_auto(mapping,true);
+      else input_map::apply_face_layout(mapping,input_map::FaceLayout::kPosition);
+      input_map::set_current(mapping,false);
+    }
+    if (value == "touchauto") { gfx::g_touch_buttons = 0; hostui::set("touchButtons", "0"); }
+    if (value == "touchshow") { gfx::g_touch_buttons = 1; hostui::set("touchButtons", "1"); }
+    if (value == "touchhide") { gfx::g_touch_buttons = 2; hostui::set("touchButtons", "2"); }
     if (value == "swap1") hostui::set_displays_swapped(true);
     if (value == "swap0") hostui::set_displays_swapped(false);
     if (value == "filter0") hostui::set_scale_filter(0);
@@ -769,7 +897,11 @@ int android_display_smoke_test() {
       out << "{\"stage\":\"" << secondaryStageNames[i] << "\",\"ns\":" << R.secondaryStageNs[i].load() << ",\"calls\":" << R.secondaryStageCalls[i].load() << '}';
     }
     out << "]";
-    out << ",\"primary_presented\":" << R.tv.presented.load()
+    out << ",\"pad_family\":" << int(input_map::pad_family())
+        << ",\"settings_open\":" << (overlay::is_open() ? "true" : "false")
+        << ",\"touch_buttons\":" << (gfx::touch_buttons_visible() ? "true" : "false")
+        << ",\"pad_buttons\":" << pad.buttons
+        << ",\"primary_presented\":" << R.tv.presented.load()
         << ",\"primary_surface_losses\":" << R.primarySurfaceLosses.load()
         << ",\"primary_swapchains\":" << R.tv.swapchainGeneration
         << ",\"secondary_presented\":" << R.drc.presented.load()
@@ -984,6 +1116,7 @@ int renderer_smoke_test() {
     R.mainDepthAddr=previousDepth;destroy_surface_image(surface);R.surfaces.erase(entry);
     fprintf(stderr,"[renderer smoke] asynchronous GPU depth peeks passed\n");
    }
+   stereo_geometry_check();
    Image rendered(64,64,0x1a);dynamic_uniform_check(rendered.s);vertex_window_check(rendered.s);triangle(rendered.s);
    if(R.tv.scan)destroy_surface_image(R.tv.scan.get());R.tv.scan=std::make_unique<Surface>();auto& scan=*R.tv.scan;scan.width=64;scan.height=64;scan.format=0x1a;scan.fmt=format_info(scan.format,false);create_surface_image(&scan,false);resample(&rendered.s,&scan,1);mark_gpu_written(&scan);
    auto capturePath=std::filesystem::temp_directory_path()/("wwhd-vulkan-smoke-"+std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())+".png");
@@ -1040,6 +1173,7 @@ int renderer_smoke_test() {
     LOG("[renderer smoke] overlay timestamp writes: hidden 0, on %llu, hidden again 0",
         (unsigned long long)(measured.timestamp_writes - before.timestamp_writes));
   }
+  test_hdr_presentation();
   save_pipeline_cache();
   LOG("[renderer smoke] PASS: actual device upload/clear/blit/depth/triangle/present");return 0;
  }catch(const std::exception& e){LOG("[renderer smoke] FAIL: %s",e.what());try {command_buffer();flush();}catch(...){}return 1;}

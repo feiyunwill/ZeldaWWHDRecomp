@@ -40,7 +40,7 @@ def process_resources():
             "reaped_children_cpu_seconds": children.ru_utime + children.ru_stime}
 
 
-def run(configuration, package=None, native_run=None, adapter_factory=Adapter):
+def run(configuration, package=None, native_run=None, adapter_factory=Adapter, key_files=None):
     configuration = Path(configuration).resolve()
     root = configuration.parent
     package = Path(package).resolve() if package else Path(__file__).resolve().parents[2]
@@ -56,6 +56,8 @@ def run(configuration, package=None, native_run=None, adapter_factory=Adapter):
         def publish(event):
             with state_lock:
                 state["last_event"] = event
+                if event.get("state") == "keys_found":
+                    state.setdefault("key_sources", []).append(event["detail"])
                 state["resources_latest"] = process_resources()
                 if event.get("stage") and event.get("state") in ("complete", "reused") and "source" not in event:
                     state.setdefault("stages", {})[event["stage"]] = {
@@ -87,20 +89,39 @@ def run(configuration, package=None, native_run=None, adapter_factory=Adapter):
                 extractor = job["extractor"]
                 keys = None
                 if source["kind"] == "image":
-                    keys = adapter.setup.Keys()
+                    request = {}
+                    entries = {}
                     for name in ("disc", "common"):
-                        key_path = private_input(root, source[name + "_key"])
-                        with key_path.open("rb") as stream:
-                            data = stream.read(4097)
-                        value = adapter.setup.parse_key(data) if len(data) <= 4096 else None
-                        if value is None:
-                            raise ValueError("Invalid " + name + " key file")
-                        setattr(keys, name, value)
+                        key_path = (key_files or {}).get(name)
+                        if key_path is None and source.get(name + "_key"):
+                            key_path = str(private_input(root, source[name + "_key"]))  # legacy test/host inputs
+                        if key_path is not None:
+                            if isinstance(key_path, bytes):
+                                values = (adapter.setup.parse_key_entries(key_path)
+                                          if len(key_path) <= adapter.setup.KEY_FILE_LIMIT else [])
+                            else:
+                                values = adapter.setup.read_key_entries(key_path)
+                            if not values:
+                                raise ValueError("Invalid " + name + " key file: no valid keys (16 raw bytes or 32 hex digits / Cemu keys.txt)")
+                            request[name + "_key_file"] = name + "-keys.txt" if isinstance(key_path, bytes) else key_path
+                            if isinstance(key_path, bytes):
+                                request.setdefault("_entries", {})[name + "-keys.txt"] = values
+                                request[name + "_key_label"] = "selected file"
+                            entries[name] = values
+                    if entries and all(len(entries.get(name, [])) == 1 for name in ("disc", "common")):
+                        keys = adapter.setup.Keys()
+                        keys.disc, keys.common = entries["disc"][0], entries["common"][0]
+                    else:
+                        keys = request
                 if native_run is None:
                     import wwhd_native
                     native_run = wwhd_native.run
                 game = adapter.extract(path, source["kind"], extractor["path"],
                                        extractor["identity"], native_run, keys)
+                if source["kind"] == "image":
+                    keys = request = entries = key_path = values = None
+                    if key_files is not None:
+                        key_files.clear()
             else:
                 raise ValueError("Unsupported imported input kind")
             generated = adapter.translate(game)
@@ -169,8 +190,26 @@ def run(configuration, package=None, native_run=None, adapter_factory=Adapter):
             raise
 
 
+def read_key_descriptors(descriptors):
+    """Read SAF regular files or pipes into bounded memory; never create a key copy."""
+    from contextlib import ExitStack
+    with ExitStack() as stack:
+        files = {}
+        for name, fd in descriptors.items():
+            if fd is not None:
+                stream = stack.enter_context(os.fdopen(os.dup(fd), "rb"))
+                data = stream.read(1024 * 1024 + 1)
+                if len(data) > 1024 * 1024:
+                    raise ValueError("The selected %s key file exceeds 1 MiB." % name)
+                files[name] = data
+        return files
+
+
 def main(argv):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--job", required=True, type=Path)
+    parser.add_argument("--disc-key-fd", type=int)
+    parser.add_argument("--common-key-fd", type=int)
     args = parser.parse_args(argv)
-    return run(args.job)
+    return run(args.job, key_files=read_key_descriptors({
+        "disc": args.disc_key_fd, "common": args.common_key_fd}))

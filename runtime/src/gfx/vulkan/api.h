@@ -10,7 +10,9 @@ void peek_z(const uint32_t*, uint32_t);
 void init();                     // SDL host: windows + device; AppKit host: see init_appkit
 void run_main_loop();            // SDL host only (the AppKit host runs [NSApp run])
 void draw(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexType, uint32_t indexAddr,
-          uint32_t baseVertex, uint32_t instances);
+          uint32_t baseVertex, uint32_t instances, bool* viewIndependent = nullptr);
+void draw_stereo(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t indexType, uint32_t indexAddr,
+                 uint32_t baseVertex, uint32_t instances);
 void clear_color(const uint32_t* regs, uint32_t colorBuffer, const float rgba[4]);
 void clear_depth_stencil(const uint32_t* regs, uint32_t depthBuffer, float depth, uint32_t stencil, uint32_t flags);
 void copy_surface(uint32_t src, uint32_t srcMip, uint32_t srcSlice, uint32_t dst, uint32_t dstMip, uint32_t dstSlice);

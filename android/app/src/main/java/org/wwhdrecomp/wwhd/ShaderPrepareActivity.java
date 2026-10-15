@@ -7,7 +7,7 @@ import org.json.JSONObject;
 
 /** One isolated SDL/GPU lifetime. Never loads or starts the guest game threads. */
 public final class ShaderPrepareActivity extends WwhdActivity {
-    private static final String NOTE = "Preparing shaders for this phone. Back skips this step; shaders can compile during play.";
+    private static final String NOTE = "Preparing shaders for this Android device. Back skips this step; shaders can compile during play.";
     private final android.os.Handler handler = new android.os.Handler(android.os.Looper.getMainLooper());
     private android.widget.TextView note;
 
@@ -28,7 +28,7 @@ public final class ShaderPrepareActivity extends WwhdActivity {
                     java.nio.charset.StandardCharsets.UTF_8).trim().split(" ", 3);
                 long done = Long.parseLong(line[0]), total = Long.parseLong(line[1]);
                 if (total > 0 && note != null)
-                    note.setText("Preparing shaders for this phone: " + (100 * done / total) + "%" +
+                    note.setText("Preparing shaders for this Android device: " + (100 * done / total) + "%" +
                         (line.length > 2 ? " (" + line[2] + ")" : "") + ". Back skips this step; shaders can compile during play.");
             } catch (Exception notYet) { /* no progress reported yet */ }
             handler.postDelayed(this, 500);

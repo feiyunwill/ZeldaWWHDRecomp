@@ -5,6 +5,7 @@ attribute count, u32 compact provenance (0 legacy/1 WWFS), u64 Metal hash,
 then 13 words per attribute (last word signed divisor).
 No executable instructions, shader source or arbitrary byte/string fields exist.
 """
+import array
 import math
 import json
 import struct
@@ -12,7 +13,10 @@ import zlib
 
 MAGIC = b'WWHT0003'
 FETCH_MAGIC = b'WWFA0001'
-MAX_BYTES = 256 * 1024 * 1024
+# A full-game template (about 90,000 states, 40,000 pipelines) decodes to about 300 MiB of JSON.
+# tools/release/guard.py keeps its own copy of these limits; change both together.
+MAX_BYTES = 1024 * 1024 * 1024  # decoded JSON
+MAX_ENTRIES = 1000000           # states, and pipelines
 ATTR_FIELDS = ('buffer', 'semantic', 'format', 'fetch_type', 'numeric', 'signed',
                'endian', 'x', 'y', 'z', 'w', 'offset', 'divisor')
 RAW_FORMATS = (1,2,5,6,7,13,14,15,16,22,26,25,29,30,31,32,47,48,34,35)
@@ -122,26 +126,51 @@ def parse_fetch(data, regs, program_hash):
             attrs.append(dict(zip(ATTR_FIELDS,vals)))
     return validate_fetch({'hash':metal_fetch_hash(data),'metal_hash':metal_fetch_hash(data),'compact':int(data.startswith(b'WWFS')),'attributes':attrs})
 
+STATE_KEYS = frozenset(('hash','vertex','fetch','registers'))
+
+def validate_state(s):
+    keys(s,('hash','vertex','fetch','registers') + (('linked_vertex',) if 'linked_vertex' in s else ()))
+    linked=s.get('linked_vertex')
+    if linked is not None:
+        keys(linked,('hash','fetch'));integer(linked['hash'],hi=0xffffffffffffffff)
+        validate_fetch(linked['fetch'])
+        if s['vertex']: raise ValueError('vertex companion on vertex state')
+    integer(s['hash'],hi=0xffffffffffffffff);integer(s['vertex'],0,1)
+    if s['fetch'] is not None: validate_fetch(s['fetch'])
+    if not s['vertex'] and s['fetch'] is not None: raise ValueError('pixel fetch state')
+    seen=set()
+    for pair in vector(s['registers'],maximum=16384):
+        vector(pair,2); a,v=pair;integer(a,0,65535);integer(v)
+        if a in seen or a in (0xa210,0xa216,0xa225) or not (0x2000<=a<0x4000 or 0xa000<=a<0xc000 or 0xe000<=a<0x10000):
+            raise ValueError('invalid/duplicate/pointer register')
+        seen.add(a)
+    return s
+
+class CompactState(tuple):
+    """A validated state as decode(compact=True) keeps it: (hash, vertex, fetch, registers, linked_vertex),
+    registers as Registers (8 bytes a pair instead of ~130 for JSON lists)."""
+    __slots__ = ()
+
+class Registers:
+    """(register, value) pairs in one array; iterates as 2-tuples, so dict(Registers) works."""
+    __slots__ = ('words',)
+    def __init__(self, pairs):
+        self.words = array.array('I')
+        for a, v in pairs: self.words.append(a); self.words.append(v)
+    def __len__(self): return len(self.words) // 2
+    def __iter__(self):
+        it = iter(self.words)
+        return zip(it, it)
+    def __eq__(self, other): return isinstance(other, Registers) and self.words == other.words
+    __hash__ = None
+    def __repr__(self): return 'Registers(%r)' % list(self)
+
 def validate_document(doc):
     keys(doc,('version','states','pipelines'))
     if doc['version']!=3: raise ValueError('unsupported template version')
-    for s in vector(doc['states'],maximum=100000):
-        keys(s,('hash','vertex','fetch','registers') + (('linked_vertex',) if 'linked_vertex' in s else ()))
-        linked=s.get('linked_vertex')
-        if linked is not None:
-            keys(linked,('hash','fetch'));integer(linked['hash'],hi=0xffffffffffffffff)
-            validate_fetch(linked['fetch'])
-            if s['vertex']: raise ValueError('vertex companion on vertex state')
-        integer(s['hash'],hi=0xffffffffffffffff);integer(s['vertex'],0,1)
-        if s['fetch'] is not None: validate_fetch(s['fetch'])
-        if not s['vertex'] and s['fetch'] is not None: raise ValueError('pixel fetch state')
-        seen=set()
-        for pair in vector(s['registers'],maximum=16384):
-            vector(pair,2); a,v=pair;integer(a,0,65535);integer(v)
-            if a in seen or a in (0xa210,0xa216,0xa225) or not (0x2000<=a<0x4000 or 0xa000<=a<0xc000 or 0xe000<=a<0x10000):
-                raise ValueError('invalid/duplicate/pointer register')
-            seen.add(a)
-    for p in vector(doc['pipelines'],maximum=100000):
+    for s in vector(doc['states'],maximum=MAX_ENTRIES):
+        if type(s) is not CompactState: validate_state(s)  # compact ones were validated while decoding
+    for p in vector(doc['pipelines'],maximum=MAX_ENTRIES):
         if type(p) is dict and p.get('backend')=='vulkan':
             validate_vulkan(p);continue
         keys(p,('backend','shader_hashes','formats','blend','color_control','target_mask','strides'))
@@ -157,7 +186,8 @@ def encode(doc):
     validate_document(doc)
     return MAGIC+zlib.compress(json.dumps(doc,sort_keys=True,separators=(',',':')).encode('ascii'),9)
 
-def decode(data):
+def decode(data, compact=False):
+    """compact: states come back as CompactState tuples (validated), see pack below."""
     if not data.startswith(MAGIC): raise ValueError('not a code-free template')
     dec=zlib.decompressobj();raw=dec.decompress(data[8:],MAX_BYTES+1)
     if len(raw)>MAX_BYTES or dec.unconsumed_tail or not dec.eof or dec.unused_data: raise ValueError('invalid template compression')
@@ -167,7 +197,19 @@ def decode(data):
             if k in result: raise ValueError('duplicate JSON field')
             result[k]=v
         return result
-    return validate_document(json.loads(raw,object_pairs_hook=unique))
+    if not compact:
+        return validate_document(json.loads(raw,object_pairs_hook=unique))
+    # Each state is validated and packed as soon as the parser finishes it, so a full-game template
+    # (about 15 million register pairs) never exists as JSON lists all at once.
+    def pack(items):
+        obj=unique(items)
+        if STATE_KEYS <= obj.keys() and obj.keys() <= STATE_KEYS | {'linked_vertex'}:
+            validate_state(obj)
+            return CompactState((obj['hash'],obj['vertex'],obj['fetch'],Registers(obj['registers']),obj.get('linked_vertex')))
+        return obj
+    del dec
+    doc=json.loads(raw,object_pairs_hook=pack)
+    return validate_document(doc)
 
 def metal_pipeline(raw):
     if len(raw)!=168 or raw[164:]!=b'\0'*4: raise ValueError('unsupported Metal pipeline layout/padding')
@@ -267,10 +309,13 @@ def vulkan_recipe(data, codefree=False):
     if w.at!=len(w.words): raise ValueError('trailing recipe')
     return validate_vulkan(p)
 
+VK_DATABASE_MAX = 16384
+
 def vulkan_database(data):
     if len(data)<64 or data[:8]!=b'WWVKPR01': raise ValueError('unsupported Vulkan database')
     n,crc=struct.unpack_from('<II',data,56)
-    if n>512 or zlib.crc32(data[64:])!=crc: raise ValueError('invalid Vulkan database')
+    # runtime kPipelineRecipeMaxCount (the first recipe databases allowed 512)
+    if n>VK_DATABASE_MAX or zlib.crc32(data[64:])!=crc: raise ValueError('invalid Vulkan database')
     out=[];at=64
     for _ in range(n):
         if at+4>len(data): raise ValueError('truncated database')

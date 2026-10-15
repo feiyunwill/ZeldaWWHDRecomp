@@ -7,6 +7,7 @@ import re
 from pathlib import Path
 import shlex
 import subprocess
+import adb_util
 import sys
 import zipfile
 
@@ -28,10 +29,11 @@ def main():
     if args.compiler_only and (args.require_isolated_device or args.exercise_lifecycle):
         parser.error("display checks cannot be combined with --compiler-only")
     prefix = [args.adb, "-s", args.serial]
+    adb_util.wait_until_ready(prefix)
 
     def adb(*command, data=None, check=True):
         if command[0] == "shell": command = ("shell", shlex.join(command[1:]))
-        return subprocess.run(prefix + list(command), input=data, stdout=subprocess.PIPE,
+        return adb_util.run(prefix + list(command), input=data, stdout=subprocess.PIPE,
                               stderr=subprocess.PIPE, timeout=40, check=check)
 
     if adb("shell", "getprop", "ro.kernel.qemu").stdout.strip() != b"1":

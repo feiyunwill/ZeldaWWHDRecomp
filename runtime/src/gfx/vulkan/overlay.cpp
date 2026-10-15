@@ -5,6 +5,7 @@
 // for every target format (swap images in any encoding, offscreen present dumps).
 #include "../../exception_report.h"
 #include "backend.h"
+#include "../stereo.h"
 #include "pipeline_trace.h"
 #include "present.h"
 #include "shaders.h"
@@ -22,7 +23,7 @@ const char* kVertex = R"glsl(#version 450
 layout(location=0) in vec2 pos;
 layout(location=1) in vec2 uv;
 layout(location=2) in vec4 col;
-layout(push_constant) uniform Params { vec2 scale; vec2 translate; int linear; int linear_texture; } p;
+layout(push_constant) uniform Params { vec2 scale; vec2 translate; int linear; int linear_texture; float whiteScale; } p;
 layout(location=0) out vec4 color;
 layout(location=1) out vec2 tc;
 void main() {
@@ -38,15 +39,16 @@ layout(set=0,binding=0) uniform sampler2D image;
 layout(location=0) in vec4 color;
 layout(location=1) in vec2 tc;
 layout(location=0) out vec4 result;
-layout(push_constant) uniform Params { vec2 scale; vec2 translate; int linear; int linear_texture; } p;
+layout(push_constant) uniform Params { vec2 scale; vec2 translate; int linear; int linear_texture; float whiteScale; } p;
 void main() {
  vec4 sampleColor=texture(image,tc);
  if(p.linear_texture!=0)sampleColor.rgb=mix(pow((sampleColor.rgb+0.055)/1.055,vec3(2.4)),sampleColor.rgb/12.92,lessThanEqual(sampleColor.rgb,vec3(0.04045)));
  result=color*sampleColor;
+ result.rgb*=p.whiteScale;
 }
 )glsl";
 
-struct Params { float scale[2], translate[2]; int32_t linear, linear_texture, pad[2]; };
+struct Params { float scale[2], translate[2]; int32_t linear, linear_texture; float whiteScale; int32_t pad; };
 
 struct Texture {
     ResourceUse use;
@@ -276,10 +278,16 @@ void overlay_prepare(ImDrawData* d) {
         if (tex->Status != ImTextureStatus_OK) update_texture(cmd, tex);
 }
 
-void overlay_draw(ImDrawData* d, VkCommandBuffer cmd, VkFormat format, VkExtent2D extent, bool linear) {
+void overlay_draw(ImDrawData* d, VkCommandBuffer cmd, VkFormat format, VkExtent2D extent, bool linear, int eye,float whiteScale) {
     if (!d || d->TotalVtxCount <= 0 || d->DisplaySize.x <= 0 || d->DisplaySize.y <= 0) return;
     // the draw data is laid out for the TV window; a target of another size (present dump) gets it scaled
-    const float sx = extent.width / d->DisplaySize.x, sy = extent.height / d->DisplaySize.y;
+    const bool packed = eye >= 0;
+    const bool tab = packed && stereo::frame.mode == stereo::TAB;
+    const float vw = extent.width / (packed && !tab ? 2.0f : 1.0f);
+    const float vh = extent.height / (tab ? 2.0f : 1.0f);
+    const float ox = packed && !tab ? eye * vw : 0;
+    const float oy = tab ? eye * vh : 0;
+    const float sx = vw / d->DisplaySize.x, sy = vh / d->DisplaySize.y;
     UploadSlice vtx = allocate_upload(size_t(d->TotalVtxCount) * sizeof(ImDrawVert), 16);
     UploadSlice idx = allocate_upload(size_t(d->TotalIdxCount) * sizeof(ImDrawIdx), 16);
     auto* vp = (ImDrawVert*)vtx.mapped;
@@ -293,7 +301,7 @@ void overlay_draw(ImDrawData* d, VkCommandBuffer cmd, VkFormat format, VkExtent2
     record::vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline(format));
     record::vkCmdBindVertexBuffers(cmd, 0, 1, &vtx.buffer, &vtx.offset);
     record::vkCmdBindIndexBuffer(cmd, idx.buffer, idx.offset, sizeof(ImDrawIdx) == 2 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
-    VkViewport viewport{0, 0, float(extent.width), float(extent.height), 0, 1};
+    VkViewport viewport{ox, oy, vw, vh, 0, 1};
     record::vkCmdSetViewport(cmd, 0, 1, &viewport);
     Params p{};
     p.scale[0] = 2.0f / d->DisplaySize.x;
@@ -301,6 +309,7 @@ void overlay_draw(ImDrawData* d, VkCommandBuffer cmd, VkFormat format, VkExtent2
     p.translate[0] = -1.0f - d->DisplayPos.x * p.scale[0];
     p.translate[1] = -1.0f - d->DisplayPos.y * p.scale[1];
     p.linear = linear ? 1 : 0;
+    p.whiteScale = whiteScale;
     record::vkCmdPushConstants(cmd, res.layout, VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof p, &p);
     std::unordered_map<Texture*, VkDescriptorSet> sets;
     VkDescriptorSet bound = VK_NULL_HANDLE;
@@ -316,9 +325,10 @@ void overlay_draw(ImDrawData* d, VkCommandBuffer cmd, VkFormat format, VkExtent2
             float x1 = (c.ClipRect.z - d->DisplayPos.x) * sx, y1 = (c.ClipRect.w - d->DisplayPos.y) * sy;
             x0 = std::max(x0, 0.0f);
             y0 = std::max(y0, 0.0f);
-            x1 = std::min(x1, float(extent.width));
-            y1 = std::min(y1, float(extent.height));
+            x1 = std::min(x1, vw);
+            y1 = std::min(y1, vh);
             if (x1 <= x0 || y1 <= y0) continue;
+            x0 += ox; x1 += ox; y0 += oy; y1 += oy;
             Texture* t = (Texture*)(uintptr_t)c.GetTexID();
             if (!t || !t->view) continue;
             int linear_texture=linear&&overlay::guesthud::image_texture(uint64_t(c.GetTexID()));

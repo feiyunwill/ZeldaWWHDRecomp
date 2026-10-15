@@ -5,10 +5,11 @@ import json
 from pathlib import Path
 import re
 import shlex
-import subprocess
+import adb_util
 import tempfile
 import time
 import uuid
+from urllib.parse import unquote
 import xml.etree.ElementTree as ET
 
 
@@ -26,6 +27,7 @@ def main():
     package = "org.wwhdrecomp.wwhd"
     fixture = "wwhd-picker-fixture-" + uuid.uuid4().hex
     prefix = [args.adb, "-s", args.serial]
+    adb_util.wait_until_ready(prefix)
     pointer = "no_backup/ondevice/setup.json"
     ui_path = "/data/local/tmp/wwhd-picker-smoke.xml"
     jobs = set()
@@ -33,7 +35,7 @@ def main():
 
     def adb(*command, check=True, data=None):
         if command[0] == "shell": command = ("shell", shlex.join(command[1:]))
-        return subprocess.run(prefix + list(command), check=check, input=data, capture_output=True, timeout=30)
+        return adb_util.run(prefix + list(command), check=check, input=data, capture_output=True, timeout=30)
 
     def shell(*command, **kwargs):
         return adb("shell", *command, **kwargs)
@@ -158,7 +160,7 @@ def main():
                 if find("ALLOW", nodes=nodes) is not None: tap("ALLOW")
             else: raise AssertionError("Folder access confirmation did not close")
 
-    def selected(kind=None, key=None):
+    def selected(kind=None, key=None, document=None):
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             raw = private(pointer)
@@ -169,7 +171,11 @@ def main():
                     if source and fixture in source.decode():
                         jobs.add(identity)
                         value = json.loads(source)
-                        if (kind is None or value["kind"] == kind) and (key is None or key in value):
+                        # Picker results arrive asynchronously. An earlier image job from
+                        # this fixture must not satisfy a wait for a different document.
+                        matches_document = document is None or unquote(value.get("uri", "")).endswith(
+                            "/" + fixture + "/" + document)
+                        if matches_document and (kind is None or value["kind"] == kind) and (key is None or key in value):
                             return identity, value
             time.sleep(0.1)
         raise AssertionError("Picker did not publish the selected input")
@@ -218,10 +224,12 @@ def main():
         with tempfile.TemporaryDirectory(prefix="wwhd-picker-") as temporary:
             root = Path(temporary) / fixture
             for directory in ("game/code", "game/content", "game/meta"): (root / directory).mkdir(parents=True)
-            for path in ("game/code/cking.rpx", "game/content/asset", "game/meta/meta.xml", "dump.wua", "dump.wux"):
+            for path in ("game/code/cking.rpx", "game/content/asset", "game/meta/meta.xml", "dump.wua", "dump.wux", "dump-multikey.wux"):
                 (root / path).write_bytes(b"authored unsupported synthetic picker input\n")
             for path in ("disc.key", "common.key"): (root / path).write_bytes(b"*" * 16)
             (root / "replacement.key").write_bytes(b"+" * 16)
+            # Authored Cemu-style list, deliberately distinct from the raw single-key files.
+            (root / "keys.txt").write_text("01" * 16 + "\n" + "02" * 16 + "\n")
             shell("mkdir", "-p", "/sdcard/Documents")
             adb("push", str(root), "/sdcard/Documents/" + fixture)
         shell("am", "force-stop", package)
@@ -248,12 +256,37 @@ def main():
             selected(kind="archive")
             observations.append(probe("verify"))
             home()
+        choose(KINDS["image"], "dump-multikey.wux")
+        selected(kind="image", document="dump-multikey.wux")
+        choose(DISC, "keys.txt")
+        _, multi_source = selected(key="common_uri", document="dump-multikey.wux")
+        if multi_source.get("disc_uri") != multi_source["common_uri"]:
+            raise AssertionError("Multi-key document did not supply both roles")
+        if start_control().get("enabled") != "true":
+            raise AssertionError("Multi-key document did not enable start")
+        observations.append({"multikey_document_supplied_both_roles": True, **probe("verify")})
+        home()
         choose(KINDS["image"], "dump.wux")
-        identity, source = selected(kind="image")
+        identity, source = selected(kind="image", document="dump.wux")
+        if any(key + "_uri" in source for key in ("disc", "common")):
+            raise AssertionError("Independent single-key image inherited a key selection")
         if source["kind"] != "image": raise AssertionError("Wrong image kind")
         if start_control().get("enabled") != "false": raise AssertionError("Missing keys did not block start")
         choose(DISC, "disc.key")
-        selected(key="disc_uri")
+        _, disc_source = selected(key="disc_uri")
+        if "common_uri" in disc_source:
+            raise AssertionError("Disc-only file also selected the common key")
+        if start_control().get("enabled") != "false":
+            raise AssertionError("Disc-only file enabled start without a common key")
+        if find(COMMON) is None:
+            raise AssertionError("Disc-only file hid the common-key prompt")
+        shell("am", "force-stop", package)
+        home()
+        _, restarted_source = selected(key="disc_uri")
+        if "common_uri" in restarted_source or start_control().get("enabled") != "false" or find(COMMON) is None:
+            raise AssertionError("Restart lost the separate common-key requirement")
+        observations.append({"disc_only_requires_common_before_and_after_restart": True,
+                             "single_key_image": "dump.wux", "multi_key_image": "dump-multikey.wux"})
         choose(COMMON, "common.key")
         selected(key="common_uri")
         if start_control().get("enabled") != "true": raise AssertionError("Complete input cannot start")
@@ -272,9 +305,9 @@ def main():
             if selected()[0] != identity or preservation(identity) != preserved: raise AssertionError("Image access repair discarded private state")
             observations.append({"image_access_repaired": probe("verify"), "wrong_document_rejected": True, "private_state_preserved": True})
             probe("revoke_common")
-            wait_text("Common key: choose it again")
+            wait_text("Common key: choose the key again")
             if start_control().get("enabled") != "false": raise AssertionError("Lost key access did not block start")
-            choose("Common key: choose it again", "common.key")
+            choose("Common key: choose the key again", "common.key")
             wait_text("Common key chosen (change)")
             if selected()[0] != identity: raise AssertionError("Key access repair replaced the job")
             observations.append({"key_access_repaired": probe("verify")})
@@ -289,17 +322,7 @@ def main():
             print("Rebooting the emulator to verify persisted grants", flush=True)
             before_boot = shell("cat", "/proc/sys/kernel/random/boot_id").stdout.strip()
             # Exercise Android's framework shutdown/reboot path.
-            shell("svc", "power", "reboot", check=False)
-            deadline = time.monotonic() + 120
-            while time.monotonic() < deadline:
-                state = adb("get-state", check=False)
-                if state.stdout.strip() == b"device":
-                    boot = shell("getprop", "sys.boot_completed", check=False)
-                    identity_result = shell("cat", "/proc/sys/kernel/random/boot_id", check=False)
-                    if (boot.returncode == 0 and boot.stdout.strip() == b"1" and identity_result.returncode == 0
-                            and identity_result.stdout.strip() and identity_result.stdout.strip() != before_boot): break
-                time.sleep(1)
-            else: raise AssertionError("Emulator did not finish rebooting")
+            adb_util.reboot_and_wait(prefix, previous_boot_id=before_boot)
             shell("wm", "dismiss-keyguard")
             home()
             if selected(kind="image")[0] != identity: raise AssertionError("Reboot lost input selection")
@@ -317,29 +340,54 @@ def main():
         wait_text("Private dump retained")
         job_root = "no_backup/ondevice/jobs/" + identity
         before_key_retry = {name: private(job_root + "/" + name) for name in
-                            ("source.json", "job.json", "input/dump", "input/common.key", "import-checkpoints/0.json")}
-        old_disc = private(job_root + "/input/disc.key")
-        if any(value is None for value in before_key_retry.values()) or old_disc != b"*" * 16:
-            raise AssertionError("Private image/key correction fixture is incomplete")
+                            ("source.json", "job.json", "input/dump", "import-checkpoints/0.json")}
+        def no_private_keys():
+            if any(private(job_root + "/input/" + key + ".key") is not None for key in ("disc", "common")):
+                raise AssertionError("New job saved private key copies")
+            configured = json.loads(private(job_root + "/job.json"))["input"]
+            if any(key + "_key" in configured for key in ("disc", "common")):
+                raise AssertionError("New job retained private key destinations")
+        if any(value is None for value in before_key_retry.values()):
+            raise AssertionError("Private image correction fixture is incomplete")
+        no_private_keys()
+        before_source = json.loads(before_key_retry["source.json"])
         choose("Disc key chosen (change)", "replacement.key")
-        wait_text("Replacement key selected")
+        wait_text("Replacement key file selected")
         pending = private(job_root + "/replace-disc-key.json")
         if not pending or "replacement.key" not in json.loads(pending)["uri"]:
             raise AssertionError("Picker did not queue correction for the imported job")
-        if private(job_root + "/input/disc.key") != old_disc:
-            raise AssertionError("UI replaced a private key before the worker checkpoint")
+        no_private_keys()
+        if private(job_root + "/source.json") != before_key_retry["source.json"]:
+            raise AssertionError("UI applied replacement before the worker checkpoint")
         shell("am", "force-stop", package)
         home()
         if private(job_root + "/replace-disc-key.json") != pending:
             raise AssertionError("App restart lost the pending key correction")
         observations.append({"key_replacement_after_restart": probe("apply_key_replacement")})
-        if private(job_root + "/input/disc.key") != b"+" * 16 or private(job_root + "/replace-disc-key.json") is not None:
-            raise AssertionError("Worker did not consume the corrected private key")
-        if any(private(job_root + "/" + name) != value for name, value in before_key_retry.items()):
-            raise AssertionError("Key correction changed private dump, manifest or other key")
+        no_private_keys()
+        if private(job_root + "/replace-disc-key.json") is not None:
+            raise AssertionError("Worker did not consume the corrected key URI")
+        after_source = json.loads(private(job_root + "/source.json"))
+        expected_source = {**before_source, "disc_uri": json.loads(pending)["uri"]}
+        if after_source != expected_source:
+            raise AssertionError("Key correction changed more than the selected key URI")
+        if any(private(job_root + "/" + name) != value for name, value in before_key_retry.items() if name != "source.json"):
+            raise AssertionError("Key correction changed private dump or manifest")
         if selected()[0] != identity: raise AssertionError("Key correction selected another job")
         observations.append({"imported_key_corrected_same_job": True,
-                             "dump_manifest_and_other_key_unchanged": True})
+                             "dump_manifest_and_other_key_unchanged": True, "no_private_key_copies": True})
+        observations.append({"legacy_keys_seeded": probe("seed_legacy_keys")})
+        for key in ("disc", "common"):
+            if private(job_root + "/input/" + key + ".key") != b"*" * 16:
+                raise AssertionError("Legacy key fixture is incomplete")
+        shell("am", "force-stop", package)
+        home()
+        observations.append({"legacy_keys_resumed": probe("apply_key_replacement")})
+        for key in ("disc", "common"):
+            if private(job_root + "/input/" + key + ".key") != b"*" * 16:
+                raise AssertionError("Interrupted legacy job lost a key")
+        observations.append({"legacy_keys_completed": probe("complete_legacy_keys")})
+        no_private_keys()
         home()
         open_picker(KINDS["archive"])
         for attempt in range(6):

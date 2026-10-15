@@ -6,13 +6,16 @@
 // mouse and controller. Tabs: Saves, Graphics, Display, Audio, Mods, Controls, Language / About. Every option
 // calls the same functions as the macOS menu bar (which stays in sync) or the SDL host's shortcuts.
 // When the game asks for text, the overlay shows its text prompt (text_entry.h) with the same input rules.
+// Ports add or hide tabs, and plug in fonts, shortcuts, a system keyboard and layers over the game,
+// through extensions.h (registered at start-up).
 //
 // Threads: hosts feed input on their main thread; the renderer builds and draws the UI on its render
 // thread once per TV present (frame()); option changes go back to the main thread (hostui::post).
 //
 // Test switches:
 //   WWHD_TEST_OVERLAY=open[:<tab>][@<frame>]   open the overlay (tab: saves, graphics, display, audio, mods,
-//                                              controls, about) at TV frame <frame> (default 1)
+//                                              controls, about, or an added tab's id) at TV frame <frame>
+//                                              (default 1)
 //   WWHD_TEST_MOD_DISABLE/WWHD_TEST_MOD_REMOVE=<id>  normal package actions in headless runs
 //   WWHD_TEST_CATALOGUE_INSTALL=<id>         refresh and install through the normal catalogue UI worker
 //                                              (headless tests only; open the Mods tab separately)
@@ -29,9 +32,19 @@ struct ImDrawData;
 
 namespace overlay {
 
+// Host input thread, every input poll (the AppKit host: the overlay's frame): the settings shortcut
+// (Home, Select held) and the platform's shortcuts (extensions.h).
+void poll_controller_shortcuts(const float* values);
+// A platform shortcut took the input since the last call (and clears that). Hosts count such a poll as
+// captured, as the press that opens or closes the menu: the inputs held stay from the game until each one
+// is released (release_gate.h). Always false without platform shortcuts.
+bool shortcut_took_input();
 bool is_open();             // any thread
-void set_open(bool open);   // any thread
-// the game sees no input: the overlay is open, or was just closed and buttons are still held
+enum class OpenReason { API, F1, Esc, Home, View, B, CloseButton, LoadSlot, Focus };
+struct KeyOrigin { uint32_t window = 0; uint64_t timestamp = 0; const char* name = "host"; };
+void set_open(bool open, OpenReason reason = OpenReason::API, KeyOrigin origin = {});   // any thread
+// the game sees no input: the overlay has it (captures()). Controller inputs held when it closes stay
+// from the game until each is released (the hosts' input pumps, release_gate.h).
 bool blocks_input();
 // the overlay has keyboard, mouse and controller: the menu is open or the game's text prompt shows
 // (text_entry.h); hosts route the pointer by this
@@ -44,8 +57,10 @@ void set_perf_shown(bool on);
 // ---- host input (main thread)
 // Key codes are macOS virtual key codes (kVK_*); the SDL host maps to them (platform/keycodes.h).
 enum Mods : int { kShift = 1, kCtrl = 2, kAlt = 4, kSuper = 8 };
-// returns true when the overlay used the key: F1 toggles, and every key while it is open
-bool key(int code, bool down, bool repeat, int mods);
+// Release UI keys on host focus loss without changing the menu or shortcut latch.
+void focus_lost();
+// Returns true when the overlay used the key: F1 toggles, and every key while it is open.
+bool key(int code, bool down, bool repeat, int mods, KeyOrigin origin = {});
 // pointer in the TV window, normalised to its content area (0..1 from the top left); return true while
 // the overlay is open (the event is the overlay's, not the game's or the mouse camera's)
 // typed characters (UTF-8, after the key event that produced them); true while the overlay is open
@@ -54,9 +69,11 @@ bool text(const char* utf8);
 void set_clipboard_text(const char* utf8);
 // a text field of the overlay has the keyboard (hosts turn on text input / the on-screen keyboard)
 bool wants_text();
-bool mouse_move(float nx, float ny);
-bool mouse_button(int button, bool down);  // 0 left, 1 right, 2 middle
+bool mouse_move(float nx, float ny, bool touch = false);
+bool mouse_button(int button, bool down, bool touch = false);  // 0 left, 1 right, 2 middle
+void set_stereo_pointer_visible(bool visible); // host: pointer is inside the TV window
 bool mouse_wheel(float dx, float dy);      // in lines, +y = away from the user
+void set_android_screen_dpi(float dpi);  // physical Android display DPI
 void set_density(float pixels_per_point);  // TV window backing scale (HiDPI)
 
 // ---- render thread, once per TV present

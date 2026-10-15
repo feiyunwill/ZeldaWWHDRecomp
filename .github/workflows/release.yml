@@ -157,6 +157,22 @@ jobs:
             -DVulkan_LIBRARY="$RUNNER_TEMP/vk/prefix/lib/libvulkan.1.dylib"
           cmake --build build/rel
 
+      - name: Decomp version parts (development builds; setup's experimental option, docs/decomp-build.md)
+        # the same runtime built for the decomp build, without game units and without the game
+        # (WWHD_DECOMP_RUNTIME_ONLY); package.py --decomp-build takes the objects that differ, how setup compiles
+        # the units, and the commit and SHA-256 of the decompilation's source (submodule decomp), which setup
+        # downloads; the source itself is not in the release
+        if: needs.version.outputs.devel == 'true'
+        run: |
+          git submodule update --init decomp
+          cmake -S . -B build/rel-decomp -G Ninja -DCMAKE_BUILD_TYPE=Release -DWWHD_VERSION="$VERSION" -DWWHD_RENDERER=BOTH \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 -DGEN_DIR="$PWD/build/gen-stub" \
+            -DWWHD_BUNDLED_DEPS=ON -DWWHD_BUNDLED_ZSTD=ON \
+            -DVulkan_INCLUDE_DIR="$RUNNER_TEMP/vk/prefix/include" \
+            -DVulkan_LIBRARY="$RUNNER_TEMP/vk/prefix/lib/libvulkan.1.dylib" \
+            -DWWHD_DECOMP=ON -DWWHD_DECOMP_RUNTIME_ONLY=ON
+          cmake --build build/rel-decomp --target wwhd
+
       - name: Unit tests
         run: |
           ctest --test-dir build/rel --output-on-failure
@@ -167,8 +183,10 @@ jobs:
       - name: Package
         run: |
           VK="$RUNNER_TEMP/vk"
+          DECOMP=()
+          if [ -d build/rel-decomp ]; then DECOMP=(--decomp-build build/rel-decomp); fi
           python3 tools/release/package.py --build build/rel --platform macos-arm64 --version "$VERSION" \
-            --out dist --toolchain xcode-clt --setup-gui build/rel/wwhd-setup \
+            --out dist --toolchain xcode-clt --setup-gui build/rel/wwhd-setup "${DECOMP[@]}" \
             --runtime-file "$VK/runtime/libvulkan.1.dylib" \
             --runtime-file "$VK/runtime/libMoltenVK.dylib" \
             --runtime-file "$VK/runtime/MoltenVK_icd.json" \
@@ -364,7 +382,10 @@ jobs:
         # one file, no unzipping: drops portable.txt, so setup keeps everything in the per-user folders.
         # The trailing slash in the glob picks the packaged folder, not its .zip.
         run: |
+          # the runtime is pinned (appimage.py RUNTIME, SHA-256 checked; a mismatch fails here)
           python3 tools/release/appimage.py dist/WindWakerHD-*/ --out dist
+          PIN=$(cd tools/release && python3 -c 'import appimage; print(appimage.RUNTIME_COMMIT)')
+          dist/*.AppImage --appimage-version 2>&1 | grep -F "type2-runtime/commit/$PIN"
           (cd "$RUNNER_TEMP" && "$GITHUB_WORKSPACE"/dist/*.AppImage --appimage-extract)
           python3 tools/release/guard.py "$RUNNER_TEMP"/squashfs-root
           # the real mount is read-only: make the extracted tree that too, so a write into <image>/data
@@ -382,6 +403,26 @@ jobs:
           test ! -e "$RUNNER_TEMP/squashfs-root/data"
           test ! -e "$GITHUB_WORKSPACE/dist/data"
           test ! -e "$GITHUB_WORKSPACE/dist/portable.txt"
+          # portable use is the runtime's standard: --appimage-portable-home creates <image>.home, which
+          # then becomes $HOME (also with --appimage-extract-and-run); everything the setup writes must
+          # land in it and nothing in the player's real home (a fresh stand-in here)
+          "$APP" --appimage-portable-home
+          test -d "$APP.home"
+          mkdir "$RUNNER_TEMP/real-home"
+          env -u XDG_DATA_HOME -u XDG_CONFIG_HOME -u XDG_CACHE_HOME HOME="$RUNNER_TEMP/real-home" \
+            SDL_VIDEO_DRIVER=offscreen "$APP" --appimage-extract-and-run --self-test
+          test -f "$APP.home/.local/share/wwhd/setup.log"
+          test -z "$(ls -A "$RUNNER_TEMP/real-home")"
+          rm -rf "$APP.home" "$RUNNER_TEMP/real-home"
+          # a v0.2.13 "<image>.data" folder is no longer used: AppRun and the setup window name it, and
+          # nothing is written into it
+          mkdir "$APP.data"
+          SDL_VIDEO_DRIVER=offscreen "$APP" --appimage-extract-and-run --self-test --data-dir "$RUNNER_TEMP/data-hint" \
+            2> "$RUNNER_TEMP/hint.txt"
+          grep -F "Found $(basename "$APP").data: this folder is no longer used" "$RUNNER_TEMP/hint.txt"
+          grep -F "notice: Found $(basename "$APP").data" "$RUNNER_TEMP/hint.txt"
+          test -z "$(ls -A "$APP.data")"
+          rm -rf "$APP.data" "$RUNNER_TEMP/data-hint" "$RUNNER_TEMP/hint.txt"
           chmod -R u+w "$RUNNER_TEMP"/squashfs-root && rm -rf "$RUNNER_TEMP"/squashfs-root
 
       - name: Installer self-test (unzipped release, placeholder code, toolchain download)
@@ -619,6 +660,62 @@ jobs:
           if (-not $g.WaitForExit(600000)) { $g.Kill(); throw "the setup program did not finish its self-test (fresh data folder)" }
           if ($g.ExitCode -ne 0) { throw "setup program self-test on a fresh data folder failed ($($g.ExitCode))" }
           if (Test-Path (Join-Path $env:WWHD_DATA_DIR 'python')) { throw "the window downloaded a Python" }
+
+      - name: Installer self-test in a deep folder (issue #144)
+        # Windows' "Extract All" puts the release folder into a folder of the same name. The release here is
+        # as deep as setup accepts (175 characters): the compiler's deepest files are then beyond MAX_PATH while
+        # setup unpacks them (it uses \\?\ paths). One character deeper, setup stops before it downloads anything.
+        # The compiler archive is the one fetched above, given to setup as a copy the player saved (#113).
+        shell: pwsh
+        run: |
+          $zip = (Get-ChildItem dist\*.zip).FullName
+          $name = [IO.Path]::GetFileNameWithoutExtension($zip)
+          $root = Join-Path $env:RUNNER_TEMP 'deep'
+          $outer = Join-Path $root ('x' * (175 - $root.Length - 2 - $name.Length))
+          Expand-Archive -Path $zip -DestinationPath $outer
+          $pkg = Join-Path $outer $name
+          if ($pkg.Length -ne 175) { throw "the release folder is $($pkg.Length) characters, not 175" }
+          $arcname = python -c "import json, os; t=json.load(open('tools/installer/toolchains.json'))['toolchains'][os.environ['TOOLCHAIN']]; print(t['url'].rsplit('/', 1)[1])"
+          $arcname = $arcname.Trim()
+          Copy-Item (Join-Path $env:RUNNER_TEMP 'llvm-mingw.zip') (Join-Path $pkg $arcname)
+          "WWHD_DEEP_PKG=$pkg" >> $env:GITHUB_ENV
+
+      - name: Installer self-test in a deep folder, setup in a console window
+        shell: cmd
+        run: |
+          call "%WWHD_DEEP_PKG%\tools\Setup in a console window.bat" --yes --no-launch --gen-dir "%GITHUB_WORKSPACE%\build\gen-stub" < NUL
+          if errorlevel 1 exit /b 1
+
+      - name: Installer self-test in a deep folder, results
+        shell: pwsh
+        run: |
+          $zip = (Get-ChildItem dist\*.zip).FullName
+          $name = [IO.Path]::GetFileNameWithoutExtension($zip)
+          $pkg = $env:WWHD_DEEP_PKG
+          $outer = Split-Path $pkg -Parent
+          $data = Join-Path $pkg 'data'
+          if (-not (Test-Path (Join-Path $data 'install.json'))) { throw "the setup in a deep folder did not finish" }
+          $deepest = python -c "import sys, zipfile; print(max(zipfile.ZipFile(sys.argv[1]).namelist(), key=len))" (Join-Path $env:RUNNER_TEMP 'llvm-mingw.zip')
+          $deepest = $deepest.Trim().Replace('/', '\')
+          $unpacked = Join-Path $data "toolchain\unpack.tmp\$deepest"
+          "deepest compiler file while unpacking: $($unpacked.Length) characters"
+          if ($unpacked.Length -le 259) { throw "the test folder is not deep enough to cross MAX_PATH" }
+          if (-not (Test-Path -LiteralPath ('\\?\' + (Join-Path $data "toolchain\$deepest")))) { throw "the deepest compiler file is missing" }
+          if (Test-Path (Join-Path $data 'toolchain\unpack.tmp')) { throw "unpack.tmp was left behind" }
+          $p = Start-Process -FilePath (Join-Path $data 'bin\wwhd.exe') -ArgumentList '--game', (Join-Path $env:RUNNER_TEMP 'nogame') `
+            -RedirectStandardError deep-run.log -RedirectStandardOutput deep-out.log -NoNewWindow -PassThru
+          if (-not $p.WaitForExit(120000)) { $p.Kill() }
+          if (-not (Select-String -Path deep-run.log, deep-out.log -Pattern 'cannot load' -Quiet)) { throw "the game built in a deep folder did not start" }
+          # one character deeper: setup stops at once with the plain message
+          Expand-Archive -Path $zip -DestinationPath ($outer + 'x')
+          $pkg = Join-Path ($outer + 'x') $name
+          $out = & (Join-Path $pkg 'tools\python\python.exe') (Join-Path $pkg 'tools\installer\setup.py') --yes --no-launch `
+            --gen-dir (Join-Path $env:GITHUB_WORKSPACE 'build\gen-stub') 2>&1 | Out-String
+          $out
+          if ($LASTEXITCODE -ne 1) { throw "setup in a too deep folder exited with $LASTEXITCODE, not 1" }
+          if ($out -notmatch "This folder's path is too long for Windows \(176 characters, at most 175 work\)") { throw "no path length message" }
+          if ($out -match 'Getting the compiler') { throw "setup went on in a too deep folder" }
+          exit 0  # the refused setup above left $LASTEXITCODE at 1, which would fail this step
 
       - uses: actions/upload-artifact@v5
         with:

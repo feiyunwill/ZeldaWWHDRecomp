@@ -585,7 +585,7 @@ void dismiss() {
     LOG("[text] the game closed its keyboard");
 }
 
-bool active() { return g_active.load(std::memory_order_relaxed); }
+bool active() { return g_active.load(std::memory_order_relaxed) || field_active(); }
 
 void key(int code, bool down, bool repeat) {
     (void)repeat;  // repeats edit too (holding Backspace deletes on)

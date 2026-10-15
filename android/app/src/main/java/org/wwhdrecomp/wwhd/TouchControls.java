@@ -11,6 +11,7 @@ import android.view.MotionEvent;
 import android.view.View;
 
 import org.libsdl.app.SDLActivity;
+import org.libsdl.app.SDLControllerManager;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -20,10 +21,15 @@ import java.util.List;
 // (runtime/src/platform/touch_pad.cpp), so the game reads them like a controller. Touches that land
 // on no control go on to the game as before (the GamePad picture, the view button), the way
 // SDLSurface passes them. While a game controller is connected they are hidden, and the next touch
-// brings them back.
+// brings the floating buttons back temporarily.
 public class TouchControls extends View implements InputManager.InputDeviceListener {
     private static native void nativeSetPad(int buttons, int face, float lx, float ly, float rx, float ry, float lt, float rt);
     private static native void nativeDetachPad();
+    private static native int nativeTouchState();
+    private static native void nativeControllerConnected(boolean connected);
+    private static native void nativeScreenDpi(float dpi);
+    private static native void nativeRevealButtons();
+    private static native void nativeShowControls(boolean shown);
 
     // SDL_GamepadButton numbers
     private static final int BACK = 4, START = 6,
@@ -52,20 +58,25 @@ public class TouchControls extends View implements InputManager.InputDeviceListe
             text = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final SharedPreferences prefs;
     private final InputManager inputs;
+    private ControllerHintPolicy hintPolicy;
+    private Runnable refresh;
     private boolean shown;      // the player's choice (the show/hide button), remembered
     private boolean controller; // a game controller is connected and no touch came since
+    private boolean buttonsVisible = true, revealGesture, settingsOpen;
     private boolean toggleTo;   // what the show/hide button sets when released (shown before the touch: hide)
-    private int lastButtons = -1;
+    private int lastButtons = -1, lastTouchDevice;
     private float lastLx, lastLy, lastRx, lastRy, lastLt, lastRt;
 
     public TouchControls(Context context) {
         super(context);
         prefs = context.getSharedPreferences("controls", Context.MODE_PRIVATE);
         shown = prefs.getBoolean("touch_controls", true);
+        hintPolicy = new ControllerHintPolicy(prefs.getBoolean("settings_shortcut_hint_shown", false));
         inputs = (InputManager) context.getSystemService(Context.INPUT_SERVICE);
         if (inputs != null) {
             inputs.registerInputDeviceListener(this, null);
             for (int id : inputs.getInputDeviceIds()) controller |= isController(InputDevice.getDevice(id));
+            SDLControllerManager.requestDeviceRefresh();
         }
         // the top left corner has the game's view button and the show/hide button: nothing else there
         controls.add(new Control(KIND_STICK, 0, "", 0.14f, 0.70f, 0.13f));
@@ -88,9 +99,32 @@ public class TouchControls extends View implements InputManager.InputDeviceListe
         controls.add(new Control(KIND_BUTTON, BACK, "−", 0.42f, 0.92f, 0.04f));
         controls.add(new Control(KIND_BUTTON, START, "+", 0.58f, 0.92f, 0.04f));
         toggle = new Control(KIND_TOGGLE, 0, "🎮", 0f, 0f, 0.04f);  // placed in onSizeChanged
+        refresh = new Runnable() {
+            @Override public void run() {
+                syncTouchState();
+                maybeShowHint();
+                invalidate();
+                postDelayed(this, 100);
+            }
+        };
+        post(refresh);
         text.setTextAlign(Paint.Align.CENTER);
         text.setFakeBoldText(true);
         edge.setStyle(Paint.Style.STROKE);
+    }
+
+    @Override protected void onDetachedFromWindow() {
+        removeCallbacks(refresh);
+        if (inputs != null) inputs.unregisterInputDeviceListener(this);
+        try { nativeDetachPad(); } catch (UnsatisfiedLinkError ignored) {}
+        super.onDetachedFromWindow();
+    }
+
+    @Override protected void onAttachedToWindow() {
+        super.onAttachedToWindow();
+        if (inputs != null) inputs.registerInputDeviceListener(this, null);
+        removeCallbacks(refresh);
+        post(refresh);
     }
 
     @Override
@@ -112,7 +146,7 @@ public class TouchControls extends View implements InputManager.InputDeviceListe
     @Override
     protected void onDraw(Canvas canvas) {
         if (active()) for (Control c : controls) drawControl(canvas, c);
-        drawControl(canvas, toggle);
+        if (buttonsVisible && !settingsOpen) drawControl(canvas, toggle);
     }
 
     private void drawControl(Canvas canvas, Control c) {
@@ -132,7 +166,7 @@ public class TouchControls extends View implements InputManager.InputDeviceListe
     }
 
     private Control hit(float x, float y) {
-        if (near(toggle, x, y, 1.3f)) return toggle;
+        if (buttonsVisible && !settingsOpen && near(toggle, x, y, 1.3f)) return toggle;
         if (!active()) return null;
         Control best = null;
         float bestD = Float.MAX_VALUE;
@@ -158,11 +192,25 @@ public class TouchControls extends View implements InputManager.InputDeviceListe
     @Override
     public boolean onTouchEvent(MotionEvent event) {
         final int action = event.getActionMasked();
+        lastTouchDevice = event.getDeviceId();
         if (action == MotionEvent.ACTION_DOWN && event.getToolType(0) != MotionEvent.TOOL_TYPE_FINGER)
             return false;  // mouse and stylus: SDLSurface underneath as before
+        syncTouchState();
+        if (settingsOpen) return false;
+        if (revealGesture) {
+            if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) revealGesture = false;
+            return true;
+        }
+        final float corner = Math.min(getWidth(), getHeight()) * 0.24f;
+        if (!buttonsVisible && action == MotionEvent.ACTION_DOWN && event.getX() < corner && event.getY() < corner) {
+            nativeRevealButtons();
+            syncTouchState();
+            revealGesture = true;
+            invalidate();
+            return true;
+        }
         final int index = event.getActionIndex();
         final boolean wasActive = active();
-        if (action == MotionEvent.ACTION_DOWN && controller) { controller = false; lastButtons = -1; }  // back
         switch (action) {
             case MotionEvent.ACTION_DOWN:
             case MotionEvent.ACTION_POINTER_DOWN: {
@@ -237,12 +285,60 @@ public class TouchControls extends View implements InputManager.InputDeviceListe
         prefs.edit().putBoolean("touch_controls", on).apply();
         for (Control c : controls) { c.pressed = false; c.sx = 0; c.sy = 0; }
         for (int i = owner.size() - 1; i >= 0; i--) if (owner.valueAt(i) != null && owner.valueAt(i) != toggle) owner.removeAt(i);
-        controller = false;
+        nativeShowControls(on);
         if (!on) { nativeDetachPad(); lastButtons = -1; }
     }
 
     // shown, and not hidden for a connected controller
-    private boolean active() { return shown && !controller; }
+    private boolean active() { return shown && buttonsVisible && !settingsOpen; }
+
+    private void syncTouchState() {
+        try {
+            android.util.DisplayMetrics metrics = getResources().getDisplayMetrics();
+            float dpi = Math.min(metrics.xdpi, metrics.ydpi);
+            if (!Float.isFinite(dpi) || dpi < 72 || dpi > 1000) dpi = metrics.densityDpi;
+            nativeScreenDpi(dpi);
+            nativeControllerConnected(controller);
+            final int state = nativeTouchState();
+            final boolean visible = (state & 1) != 0, controlsShown = (state & 2) != 0, open = (state & 4) != 0;
+            if (buttonsVisible == visible && shown == controlsShown && settingsOpen == open) return;
+            buttonsVisible = visible; shown = controlsShown; settingsOpen = open;
+            for (Control c : controls) { c.pressed = false; c.sx = 0; c.sy = 0; }
+            for (int i = owner.size() - 1; i >= 0; --i) {
+                if (owner.valueAt(i) != null) owner.removeAt(i);
+                else if (settingsOpen) {
+                    SDLActivity.onNativeTouch(lastTouchDevice, owner.keyAt(i), MotionEvent.ACTION_CANCEL, 0, 0, 0);
+                    owner.removeAt(i);
+                }
+            }
+            nativeDetachPad(); lastButtons = -1;
+            if (active()) update();
+        } catch (UnsatisfiedLinkError ignored) { /* SDL has not loaded the native library yet. */ }
+    }
+
+    private void maybeShowHint() {
+        if (!(getParent() instanceof android.widget.RelativeLayout) || !hintPolicy.claim(controller)) return;
+        final android.widget.RelativeLayout parent = (android.widget.RelativeLayout) getParent();
+        final android.widget.TextView hint = new android.widget.TextView(getContext());
+        boolean home = false;
+        if (inputs != null) for (int id : inputs.getInputDeviceIds()) {
+            InputDevice d = InputDevice.getDevice(id);
+            if (isController(d)) home |= d.hasKeys(android.view.KeyEvent.KEYCODE_BUTTON_MODE)[0];
+        }
+        hint.setText(getContext().getString(home ? R.string.controller_settings_hint_home : R.string.controller_settings_hint));
+        hint.setTextSize(18); hint.setTextColor(0xFFFFFFFF); hint.setBackgroundColor(0xEE123340);
+        hint.setGravity(android.view.Gravity.CENTER);
+        final int pad = (int)(16 * getResources().getDisplayMetrics().density);
+        hint.setPadding(pad, pad, pad, pad);
+        android.widget.RelativeLayout.LayoutParams lp = new android.widget.RelativeLayout.LayoutParams(
+                android.view.ViewGroup.LayoutParams.MATCH_PARENT, android.view.ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.addRule(android.widget.RelativeLayout.ALIGN_PARENT_BOTTOM);
+        lp.setMargins(pad, pad, pad, pad);
+        parent.addView(hint, lp);
+        hint.setOnClickListener(v -> parent.removeView(hint));
+        hint.postDelayed(() -> parent.removeView(hint), 8000);
+        prefs.edit().putBoolean("settings_shortcut_hint_shown", true).apply();
+    }
 
     private static boolean isController(InputDevice d) {
         if (d == null || d.isVirtual()) return false;
@@ -252,6 +348,7 @@ public class TouchControls extends View implements InputManager.InputDeviceListe
     }
 
     @Override public void onInputDeviceAdded(int id) {
+        SDLControllerManager.requestDeviceRefresh();
         if (controller || !isController(InputDevice.getDevice(id))) return;
         controller = true;
         for (Control c : controls) { c.pressed = false; c.sx = 0; c.sy = 0; }
@@ -260,12 +357,18 @@ public class TouchControls extends View implements InputManager.InputDeviceListe
         invalidate();
     }
     @Override public void onInputDeviceRemoved(int id) {
+        SDLControllerManager.requestDeviceRefresh();
         if (!controller || inputs == null) return;
         boolean any = false;
         for (int other : inputs.getInputDeviceIds()) any |= other != id && isController(InputDevice.getDevice(other));
         if (!any) { controller = false; invalidate(); }
     }
-    @Override public void onInputDeviceChanged(int id) {}
+    @Override public void onInputDeviceChanged(int id) {
+        SDLControllerManager.requestDeviceRefresh();
+        controller = false;
+        if (inputs != null) for (int other : inputs.getInputDeviceIds()) controller |= isController(InputDevice.getDevice(other));
+        invalidate();
+    }
 
     private void update() {
         if (!active()) return;

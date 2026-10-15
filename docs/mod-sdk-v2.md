@@ -19,6 +19,9 @@ supported.
 - [Host services](#host-services)
 - [Port settings](#port-settings)
 - [Drawing on screen (HUD API v1)](#drawing-on-screen-hud-api-v1)
+- [Letters](#letters)
+- [Charts and markers](#charts-and-markers)
+- [The story notebook](#the-story-notebook)
 - [Packages with content and images](#packages-with-content-and-images)
 - [Trust](#trust)
 - [Save states](#save-states)
@@ -31,31 +34,29 @@ supported.
 Code-mod support is **off** by default. Content replacements, settings presets, Cemu
 graphics packs and Native SDK v1 mods don't need it.
 
-1. Open **Settings (F1) → Mods** and choose **Enable code mods (PowerPC mods)**. On macOS the
-   Gameplay menu has the same option.
-2. Confirm the rebuild of the game code. It usually takes a few minutes; the dialog shows
-   progress and errors. Cancel keeps the current build.
-3. Choose **Restart now** (or restart later). Support is active from the next start.
+The simplest way: switch the code mod on in **Settings (F1) → Mods**. Its review says that
+code-mod support is added; after **Install** (or **Switch on**) the game code is rebuilt once
+(a few minutes; the progress view shows it), the game restarts by itself and the setup
+continues until the mod is on. A failed step shows one sentence, **Show details** and **Try
+again**; Cancel keeps the current build.
 
-Turning support off works the same way. Both variants are cached, so switching back to one
+To switch support on or off by hand: **Mods → More → Code-mod support → Use code mods** (on macOS the
+Gameplay menu has the same option), confirm the rebuild, then **Restart now** (or later).
+Support is active from the next start. Both variants are cached, so switching back to one
 you built before is quick. Keep the complete release folder and the compiler setup
 downloaded: building code mods uses those local tools. If they are missing, the Mods tab asks
 you to run setup again.
 
-You can install a code mod while support is off. For a mod with setup steps,
-tick its checkbox or choose **Set up** in the installed or catalogue entry.
-One confirmation explains the open steps, asks for choices, and records your trust
-in this package version (see [Trust](#trust)). After Continue, setup runs on its
-own and enables the mod. If needed, it rebuilds code-mod support and restarts,
-then continues setup automatically. A changed package asks for trust again.
-Errors stop at the failed step: choose **Show details** or **Try again**.
-Individual step buttons are available under **Advanced**.
-Enabling, disabling and changing options of code mods take effect after a restart.
+Accepting the review records your trust in this package version (see [Trust](#trust)); a
+changed package asks again. Individual steps can be run again under **Troubleshooting** on
+the mod's page while it is off. Switching code mods on or off and changing their options take
+effect after a restart.
 
 ### GameCube files used by mods
 
-In **Settings → Mods → GameCube game for mods**, choose your GameCube Wind Waker disc
-image (`.iso` / `.gcm`) or extracted game folder once. The setting shows the recognised
+The review of a mod that needs it asks for your GameCube Wind Waker disc image (`.iso`,
+`.gcm` or `.rvz`) or extracted game folder; **Mods → More → GameCube game for mods**
+changes it later. The setting shows the recognised
 region; some mods require a specific region. These files stay on your computer.
 
 Mods use this shared copy automatically. A mod with a missing or incompatible copy shows
@@ -110,12 +111,14 @@ where MSYS2's lld defaults to PE. The same `mod.elf` works on every desktop plat
 
 ### Package and install
 
-Put a `manifest.json` next to `mod.elf`:
+Put a `manifest.json` next to `mod.elf` (`game_id` is `"wwhd"` for both regions, from mod manager 1.5;
+`"wwhd-usa"` from older manifests is still accepted; the game build is checked when the code mod is built):
 
 ```json
 {
   "format_version": 1,
-  "game_id": "wwhd-usa",
+  "game_id": "wwhd",
+  "minimum_manager_version": "1.5.0",
   "id": "hello-link",
   "name": "Hello Link",
   "version": "1.0.0",
@@ -143,6 +146,15 @@ The examples in [`examples/guest-mods`](../examples/guest-mods) are complete mod
 | `addcalc-replace` | replacing a game function (`cLib_addCalc2`) and calling the original |
 | `hud-demo` | HUD drawing with package artwork and text, texture reload after a state load |
 | `button-icons` | reading port settings, following the game's button panes |
+
+Story mods live in the mod repository ([ZeldaWWHDMods](https://github.com/ZeldaWWHDRecomp/ZeldaWWHDMods))
+with their content:
+
+| Package | Shows |
+| --- | --- |
+| `story-notebook` | the story system's required package: the letter that brings the story notebook, the notebook's look, a first quest as data (see [The story notebook](#the-story-notebook)) |
+| `rito-letter` | a story mod's letter, delivered once per save file by the Rito postbox |
+| `story-chart` | a story mod's chart, like a treasure chart: the red circle on Windfall's lighthouse once Link stands there |
 
 ## Hooks and replacements
 
@@ -201,6 +213,9 @@ use object fields that are the same in both versions.
 | `wwhd_setting_get`, `wwhd_setting_changed` | Read-only port settings, below |
 | `wwhd_hud_*` | Drawing on screen, below |
 | `wwhd_audio_*` | Bounded PCM streams, below |
+| `wwhd_mail_send`, `wwhd_mail_state` | A letter from your mod, delivered by the Rito postbox, below |
+| `wwhd_chart_*` | A chart from your mod that marks places on Link's sea chart, below |
+| `wwhd_quest_*` | Your mod's quests in the story notebook, below |
 | `memcpy`, `memmove`, `memset` | As usual |
 
 Your mod can also call any game function. Original synthesized audio can use the PCM stream service below.
@@ -291,6 +306,503 @@ image, since that changes registration at a map boundary.
 It draws on Metal and Vulkan, in the TV picture and the GamePad screen (window or
 picture-in-picture); the settings overlay stays on top. Positions are not interpolated
 between logic steps.
+
+## Letters
+
+A story mod (a mod that adds a quest) can announce itself the way Wind Waker does: with a
+letter. The Rito postbox hands it out like the game's own mail, and the game shows it in its
+letter window.
+
+```c
+#include "wwhd_guest.h"
+#include "wwhd/functions.h"
+#include "wwhd/save.h"
+
+WWHD_HOOK(WWHD_ADDR_daPy_Execute, send_letter, (void* link)) {
+    (void)link;
+    u16 max_life = dComIfGs_player_status_a.max_life;
+    if (max_life < 12 || max_life > 80) return;  /* no save file loaded */
+    wwhd_mail_send("hello", "A wandering storyteller",
+                   "Dear Link,\na new tale has reached the Great Sea.\nFair winds!");
+}
+```
+
+`wwhd_mail_send(letter_id, sender, text)` puts the letter in the postbox of the loaded save file,
+unless that file already got it. Call it from a gameplay hook; calling it again (even every logic
+step) never sends the letter twice. It returns the letter's state:
+
+| Result | Meaning |
+| --- | --- |
+| `WWHD_MAIL_NONE` (0) | never sent to this save file (only from `wwhd_mail_state`) |
+| `WWHD_MAIL_WAITING` (1) | waiting in the postbox (handed out once Link has the Delivery Bag) |
+| `WWHD_MAIL_READ` (2) | handed out and read |
+| `WWHD_MAIL_INVALID` (-1) | invalid ID, sender or text |
+| `WWHD_MAIL_NO_ROOM` (-2) | no save file loaded, or its story record is full (255 entries per Quest Log, shared with charts and the notebook) |
+
+`wwhd_mail_state(letter_id)` returns the state without sending; use it, for example, to start
+your quest once the letter was read.
+
+- **ID:** 1 to 32 characters `a`-`z`, `0`-`9`, `-`, `_`, `.`; unique within your mod.
+- **Sender:** one line, up to 48 bytes. It is shown below the text as the signature.
+- **Text:** plain UTF-8, up to 1200 bytes; `\n` breaks a line. Other control characters are
+  refused (the game uses them for its own text codes). Keep lines short (about 40 characters)
+  and the letter to about ten lines. Characters the game's font lacks are not shown.
+- The text of the first call in a session is used; the letter can only be shown while your mod is
+  on.
+
+**Delivery.** Any Rito postbox hands out waiting letters, after the game's own, once Link has the
+**Delivery Bag** (from Quill on Dragon Roost Island; the port asks the game, as its own characters
+do). Until then a letter stays waiting in the save file: nothing is lost, and it comes with the
+first postbox visit after Link gets the bag. The game opens its postboxes only after the first
+pearl; letters from mods are handed out before that too, as soon as Link has the bag (the game's
+own letters still wait for the pearl). A letter from a mod needs no postage. Like the game's
+letters it comes with an enclosure, which Link takes after reading: the Story Notebook package's
+letter encloses the **story notebook**, every other one a green rupee. Several waiting letters are
+handed out one after another.
+
+**The story notebook** is the port's journal for story mods (see [The story notebook](#the-story-notebook)).
+Link keeps it in the Delivery Bag. Receiving it writes nothing to the inventory: it is kept in the
+story record (below).
+
+**Saving.** Whether a letter was sent and read, and whether the notebook was received, is kept with
+the save file (see [Where story progress is saved](#where-story-progress-is-saved)). A letter
+received but not saved arrives again after loading the older save. The text is not stored; turning
+your mod off leaves its letters waiting in the record, and nothing changes for the postbox.
+
+**Players without letter mods.** The postbox, message and item functions are only hooked while a loaded
+mod uses `wwhd_mail_*`. If another mod replaces one of them, letters from mods are not delivered
+in that session and the log says so.
+
+## Charts and markers
+
+A story mod can give Link a chart the way Wind Waker gives him a treasure chart, and the sea
+chart treats it the same way. In the game, an owned treasure chart puts nothing on the sea chart:
+its X is only on the chart itself. Once the treasure is salvaged, the game's red hand-drawn circle
+marks the spot on the sea chart. Your mod's chart behaves the same way: while Link only owns it,
+the sea chart shows nothing for it; when your mod finishes it, the red circle marks each of its
+markers' spots. (The guiding marks of your quest are the story notebook's job: the quest shown on
+the chart gets the game's white story ring, see [The story notebook](#the-story-notebook).)
+
+```c
+#include "wwhd_guest.h"
+#include "wwhd/functions.h"
+#include "wwhd/save.h"
+
+WWHD_HOOK(WWHD_ADDR_daPy_Execute, quest_step, (void* link)) {
+    (void)link;
+    u16 max_life = dComIfGs_player_status_a.max_life;
+    if (max_life < 12 || max_life > 80) return;  /* no save file loaded */
+    if (wwhd_mail_state("hello") == WWHD_MAIL_READ) wwhd_chart_give("tale");
+    wwhd_chart_mark("tale", "start", WWHD_CHART_COLUMN_X('D'), WWHD_CHART_ROW_Z(2),
+                    WWHD_CHART_ICON_STORY, "Windfall Island: the storyteller");
+}
+```
+
+| Service | What it does |
+| --- | --- |
+| `wwhd_chart_give(chart)` | Link gets the chart in the loaded save file (once; later calls change nothing) |
+| `wwhd_chart_finish(chart)` | the chart is done: the red circle marks its markers' spots |
+| `wwhd_chart_state(chart)` | the chart's state, without changing it |
+| `wwhd_chart_mark(chart, marker, x, z, icon, label)` | adds the marker, or moves it if it exists |
+| `wwhd_chart_unmark(chart, marker)` | removes the marker; `NULL` removes all markers of the chart |
+
+All of them return the chart's state in the loaded save file, or an error:
+
+| Result | Meaning |
+| --- | --- |
+| `WWHD_CHART_NONE` (0) | not given to this save file |
+| `WWHD_CHART_OWNED` (1) | Link has it (nothing on the sea chart yet, like an owned treasure chart) |
+| `WWHD_CHART_DONE` (2) | finished: its markers have the red circle |
+| `WWHD_CHART_INVALID` (-1) | invalid ID, place, icon or label |
+| `WWHD_CHART_NO_ROOM` (-2) | no save file loaded, or its record is full; or too many markers |
+
+- **IDs:** chart and marker IDs are 1 to 32 characters `a`-`z`, `0`-`9`, `-`, `_`, `.`; chart IDs
+  are unique within your mod, marker IDs within the chart.
+- **Place:** `x` and `z` in the Great Sea's world coordinates, the ones Link's position uses. The
+  sea is 7 × 7 squares of 100000 units; the center of square D4 is (0, 0), `x` grows to the east
+  and `z` to the south. `WWHD_CHART_COLUMN_X('A'..'G')` and `WWHD_CHART_ROW_Z(1..7)` give the
+  center of a square, so Windfall Island (D2) is `WWHD_CHART_COLUMN_X('D'), WWHD_CHART_ROW_Z(2)`.
+  The game's own marks sit on the island squares too.
+- **Icon:** `WWHD_CHART_ICON_STORY` is the only one for now (the sea chart draws the game's red
+  circle for a finished chart's marker, whatever the icon).
+- **Label:** one line of UTF-8, up to 64 bytes, or `NULL`. The sea chart shows the circle only,
+  like the game's own marks; the label names the marker for other screens (a quest notebook, a
+  minimap).
+- **Markers** are placed by your mod in every session, like the letter text: call
+  `wwhd_chart_mark` from a gameplay hook (every logic step is fine) with the place for the
+  current step of your quest, and move or remove it as the quest goes on. Up to 8 markers per
+  mod, 32 in all.
+
+**What the player sees.** While Link owns a chart, nothing of it is on the sea chart. Once the
+chart is finished, each of its markers has the game's red hand-drawn circle (the mark of a
+salvaged treasure) at its exact spot: on the sea chart of the MAP screen, on the GamePad, on the
+TV (Pro Controller) and on the warp map, and in the zoomed view of the marker's square. The circle
+is drawn and animated by the game: it is the circle of the marker's own square, or of another
+square, as long as the game does not show that square's circle itself. The game's own circles
+always come first: when Link salvages the treasure of a square whose circle a marker uses, the
+game gets it back and the marker takes another square's circle (with all 49 in the game's use, it
+waits). In the zoomed view of a square there is one circle: the notebook's shown quest comes first,
+then finished charts' markers, and the game's own circle wins over both.
+
+**Planned:** viewing a mod chart like a game chart (the MAP screen's chart list, the chart with its
+X at the spot) is not there yet.
+
+**Saving.** Whether Link owns a chart, and whether it is finished, is stored in the save file in
+the same record as the letters (it stays unused by the game itself; letters and charts of all mods
+share its 19 places per save file). It is saved and loaded with
+the game and kept by full and portable save states. Full save states hold the sea chart as the
+game left it, without the markers' circles; they appear again on the next frame. The places of the
+markers are not saved: your mod places them every session. Turning your mod off leaves its charts
+in the record, and the sea chart shows only the game's own marks.
+
+**Players without chart mods.** The sea chart functions are only hooked while a loaded mod uses
+`wwhd_chart_*`. If another mod replaces one of them, markers are not shown in that session and the
+log says so.
+
+**For map mods (native).** `story_chart::shown_markers()` (`runtime/src/mods/story_chart.h`) lists
+the markers the sea chart shows now, with their world place, icon and label, so a minimap can draw
+them in its own style.
+
+## The story notebook
+
+With several story mods on, the player needs to know what each of them asks for. Wind Waker has
+no quest log; the port adds one in the game's own way: a notebook that arrives by Rito mail.
+
+**The story system and its required package.** Letters, quests, the notebook and mod charts are the
+port's story system (the "Story system" built-in, on by default). It comes with one package from
+the mod repository, **`story-notebook`**: its letter brings the notebook (its manifest's
+`"encloses": ["notebook"]`; only this package's letter can), its manifest's `notebook` block gives
+the notebook's look (`"icon"`: a PNG, `"model"`: a binary glTF the port turns into the game model on
+the player's machine), and it holds a first small quest. The mod manager downloads it from the mod
+catalogue by itself, confirms it like the port's own code and keeps it enabled while the story
+system is on; it can't be switched off or removed on its own. Every quest mod depends on it (a
+manifest with `quests` or `charts` gets the dependency even if it doesn't declare it). While it
+isn't installed (offline, download failed), the story system is inactive: no letters, takeovers,
+chart marks or notebook; quest mods wait with "Needs the Story Notebook quest", the game is untouched
+and no save is changed; the next start tries again.
+
+Your mod fills the notebook with its quests: what to do next, where, and how far the player got.
+The player can show one quest on the sea chart.
+
+```c
+WWHD_HOOK(WWHD_ADDR_daPy_Execute, quest_step, (void* link)) {
+    (void)link;
+    u16 max_life = dComIfGs_player_status_a.max_life;
+    if (max_life < 12 || max_life > 80) return;  /* no save file loaded */
+    s32 letter = wwhd_mail_send("hello", "A wandering storyteller", "Dear Link, ...");
+    s32 quest = wwhd_quest_define("tale", "The storyteller's tale", "A piece of heart", 0);
+    if (letter == WWHD_MAIL_READ && quest == WWHD_QUEST_NEW) quest = wwhd_quest_step("tale", 1, 0, 0);
+    if (quest == 1) {
+        wwhd_quest_step("tale", 1, "Ask the storyteller about his lantern.", "Windfall Island");
+        wwhd_quest_place("tale", WWHD_CHART_COLUMN_X('D'), WWHD_CHART_ROW_Z(2));
+    }
+}
+```
+
+| Service | What it does |
+| --- | --- |
+| `wwhd_quest_define(quest, title, reward, condition)` | registers the quest for this session (call it first, in every session) |
+| `wwhd_quest_step(quest, step, next, where)` | step N reached (1..254), with what to do next and where; step 0 sets the texts only |
+| `wwhd_quest_place(quest, x, z)` | the next step's place on the sea chart (the coordinates of `wwhd_chart_mark`) |
+| `wwhd_quest_no_place(quest)` | the next step has no place on the chart; the notebook says so |
+| `wwhd_quest_known(quest, text)` | what the player knows so far (several lines) |
+| `wwhd_quest_portrait(quest, png)` | the quest's portrait, a PNG of your package (`assets/` or `textures/`, up to 256 × 256) |
+| `wwhd_quest_done(quest)` | the quest is done |
+| `wwhd_quest_state(quest)` | the quest's state, without changing it |
+| `wwhd_quest_set_flag(quest, n, on)` / `wwhd_quest_flag(quest, n)` | the quest's flags 1..8, your own markers for progress inside a step (returns the flag, 0 or 1) |
+
+All of them return the quest's state in the loaded save file, or an error:
+
+| Result | Meaning |
+| --- | --- |
+| `WWHD_QUEST_NEW` (0) | not started in this save file |
+| 1 to 254 | the step reached ("in progress") |
+| `WWHD_QUEST_DONE` (255) | done |
+| `WWHD_QUEST_INVALID` (-1) | invalid ID or text, or the quest was not defined in this session |
+| `WWHD_QUEST_NO_ROOM` (-2) | no save file loaded, or its story record is full; or too many quests (8 per mod, 32 in all) |
+
+- **IDs:** 1 to 32 characters `a`-`z`, `0`-`9`, `-`, `_`, `.`; unique within your mod.
+- **Texts** are plain UTF-8, one line each, `NULL` for none: title (1 to 48 bytes), reward (96),
+  condition (96), next step (120: one sentence), where (48: the island or place). What is known may
+  have line breaks (600 bytes). Like letters, texts are registered in every session and not saved.
+- **Steps** only go forward: a lower step than the saved one changes nothing, and a done quest stays
+  done. Call the services from a gameplay hook; calling them every logic step is fine.
+- **Condition:** a quest that can't be started yet names its condition ("after the Tower of the
+  Gods rises"); the notebook shows "Not yet available: ..." until your mod reaches step 1 or
+  defines the quest again without a condition.
+
+**What the player sees.** The notebook comes with the Story Notebook package's letter, so only once
+Link has the Delivery Bag (see [Letters](#letters)); a story mod's quests are in it from then on. It is kept in
+the Delivery Bag (the first empty place of the bag;
+if all eight places hold the game's items, it waits for one to be free), with its own icon: the port
+draws it over the bag place and it follows the menu's animations. It can't be put on X, Y
+or R. Touching it on the GamePad (or clicking it on the GamePad picture), or choosing it with A in
+the item menu, opens its page over the game:
+
+- one row per quest: your portrait, or an emblem with the initial of your mod's name; the title and
+  your mod's name; the next step; where; and the status: **New**, **In progress**, **Not yet
+  available**: the condition, or **Done** with a stamp;
+- the order: the quest shown on the chart, quests in progress, new ones, ones not yet available.
+  Done quests move to the **Archive** tab (Left/Right or a tap on the tab switches);
+- choosing a row shows what is known so far and the reward, and **Show on chart**: that quest's
+  next step gets the game's story ring on the sea chart (the first of the game's eight story
+  rings the game is not showing; the game's own marks come first). One quest at a time;
+  choosing it again stops showing it. The ring moves when you place the next step elsewhere and
+  disappears when the quest is done or the step has no place (the page then says the step has no
+  place on the chart). In the zoomed view of that square, the game's red hand-drawn circle (the one
+  it uses for a salvaged treasure) marks the step's exact place; where the game shows its own circle
+  in that square, the game's wins;
+- Up/Down (or the stick) choose, A opens or shows on the chart, B goes back and closes. Taps (and
+  the mouse on the GamePad picture) work on the rows and buttons. The game gets no input while the
+  page is open.
+
+The page looks like one of the item menu's own windows: its text is in the game's menu font, its
+window and plates are made from the item menu's torn-paper window and button plate, the A and B
+prompts are the game's button pictures (in the Xbox colours or as PlayStation shapes when the
+**Button prompts** setting restyles the game's own prompts), and the game's cursor brackets
+mark what A acts on. It opens and closes like the menu's mini windows, turns its page when you
+switch tabs or open a quest, and plays the menu's own sounds (cursor, decide, back, tab, show on
+chart). All of it is read from your copy of the game while you play; nothing of the game is stored
+in the port. If a piece can't be read (another mod changed the menu), the page falls back to plain
+boxes and the overlay font. The sealed letter of a quest is not the notebook: A or a touch on it in
+the Delivery Bag shows a small window with what it is (B, A or a tap closes it).
+
+**Saving.** The save file keeps the step reached, whether a quest is done, its flags, which quest is
+shown on the chart and the letters Link carries (see [Where story progress is saved](#where-story-progress-is-saved)).
+Quests that were never started take no room. Nothing is written to the inventory or the Delivery
+Bag: with all mods off, the game's save is a plain game save, and the notebook, its records and the
+chart ring are simply not shown.
+
+### Where story progress is saved
+
+Everything the port keeps for story mods (letters, charts, the notebook, quests, their flags, the
+tracked quest, carried letters) is stored per Quest Log in a **story block appended to `cking.sav`**,
+after the game's own bytes:
+
+- the game never sees it: its reads end at its own part and the file size it gets is its own. A
+  `cking.sav` with the block loads in the game (and on Cemu or a Wii U, where a save there drops the
+  block: the game save stays intact, the story progress is lost);
+- it is written with every game save (the block follows the game's write, through a temporary file
+  that replaces the save in one step), so story progress always matches the game save: progress not
+  saved is undone by loading, like the game's own. Full save states carry it; portable save states
+  don't;
+- without any story progress nothing is appended: a save stays byte for byte the game's;
+- the block ends with a footer (magic, length, format version, checksum). A block whose checksum
+  doesn't match is not used: the log says so and the file is copied once to
+  `cking.sav.story-damaged`; the next game save writes a new block;
+- up to 255 records per Quest Log. Saves from earlier test builds, which kept a smaller record in
+  the game's own save data, are moved into the block the first time that Quest Log is loaded.
+
+### Quests in the manifest
+
+The preferred way: describe the quest as data in your `manifest.json`. The port reads it when the
+player enables your mod, without running your code, so the quest is in the notebook at once. Your
+code then only reports progress the port can't see (`wwhd_quest_step`, `wwhd_quest_done`); the
+`story-notebook` package's quest needs no code at all. (The example is that package's own manifest:
+only it may enclose the notebook; your letters enclose `letter:...` or `chart:...`.)
+
+```json
+"npc_catalogue": 3,
+"quests_format": 1,
+"quests": [{
+  "id": "lantern",
+  "title": "The storyteller's lantern",
+  "journal": "on_enable",
+  "start": {"text": "Check a Rito postbox for a letter."},
+  "letter": {"id": "lantern", "sender": "The storyteller", "text": "Dear Link, ...",
+             "encloses": ["notebook", "letter:friend"]},
+  "reward": {"text": "100 rupees", "item": "rupee_orange"},
+  "steps": [{
+    "n": 1,
+    "text": "Bring the storyteller's letter to his old friend who keeps Windfall's light.",
+    "npc": {"who": "windfall-um1",
+            "when": {"carries": "letter:friend"},
+            "lines": ["A letter from my old friend? Thank you!", "...", "..."],
+            "then": {"give": "rupee_orange", "take": "letter:friend", "complete": true}}
+  }]
+}]
+```
+
+- `journal`: `on_enable` (in the notebook as soon as the mod is on, the default), `on_trigger` or
+  `hidden` (not in the notebook; revealing comes later).
+- `letter`: the port sends it (the postbox hands it out once Link has the Delivery Bag). When it
+  is read the quest reaches step 1, and with `"letter:..."` in `encloses` Link carries a sealed
+  letter for the quest: it shows in the Delivery Bag next to the notebook (never in the game's
+  inventory) until it is handed over. A or a touch on it shows what it is; the enclosure may be
+  written as an object to say that in its own words: `{"id": "letter:friend", "name": "Sealed
+  Letter", "description": "A sealed letter from the storyteller for his old friend."}` (both
+  optional; `name` up to 40 bytes, `description` up to 200 bytes and three lines). Without them the
+  bag says "Sealed Letter" and "A sealed letter from <sender>. It isn't addressed to you."
+- `steps`: the notebook shows each step's `text`, `where` and `place` (world `x`/`z`, the
+  coordinates of `wwhd_chart_mark`; the tracked quest's ring goes there). A step with an `npc`
+  takes `where` and `place` from the NPC catalogue unless it gives its own. While that character is
+  loaded (Link is in its room), the tracked step's marks on the sea chart follow where it actually
+  stands, read from the game without changing anything; otherwise they are at the place. A step's
+  `"npc": {"follow": false, ...}` keeps them at the place. Before step 1 it shows `start.text`.
+- `available` (optional, per step): the step's prerequisites, checked read-only from the save:
+  `"event"` / `"not_event"`: the game's event flag numbers (`"0x2D01"`, or a list) that must be set
+  / not set; `"time"`: `"day"` (6:00–18:00), `"night"` or `"any"`; and `"text"` for the player.
+  While they don't hold, the notebook says "Not yet possible: <text>", the step has no ring on the
+  chart and its resident talk is not live. The port never changes any of them.
+- `sail_line` (optional, per step): what the King of Red Lions says once about this step, the next
+  time Link boards him or walks up to him: a string or a list of up to three lines (one message box,
+  240 bytes). Below.
+- `npc`: a talk to a game resident, below. Up to 8 quests per mod; texts have the limits of
+  `wwhd_quest_*`.
+- A declaration the port doesn't accept (an invalid field, an NPC its catalogue doesn't know, or
+  an `npc_catalogue` version newer than the port's) keeps the mod from being enabled; the Mods tab
+  shows the reason ("Story quests: ...").
+
+### Talking to residents
+
+A step can have a game resident speak your lines instead of their own, once: the friend reads
+the letter, thanks Link, gives the reward through the game's own get-item scene, and the quest is
+done. The port arbitrates, not your mod:
+
+- the talk takes over while your quest is at that step and its conditions hold: Link carries its
+  letter (`when.carries`) and the step's `available` holds. Tracking is not needed; it only decides
+  the sea chart's ring and circle. Otherwise the resident talks exactly as in the game;
+- several quests (from any mods) may want the same resident at once. Then the talk starts with the
+  game's own choice box: two of the quests (the one shown on the chart first, else the ones started
+  first, by their titles, shortened to fit) and "Never mind". The chosen quest's lines follow in the
+  same talk. "Never mind" ends the talk, the resident's next talk is the game's own line, and the one
+  after that offers the quests again. One quest per talk;
+- a step that takes over a resident with no condition at all (no letter, no `available`) speaks for
+  your quest whenever the step is current; the log warns about it, so give such steps a condition;
+- the port never sets or clears a game flag. For that one talk the resident's own choice of line
+  does not run, so a first-meeting line the game would have shown (and the flag it would have
+  set) is not lost: it comes with a later talk;
+- the lines are one message box: up to three lines, 240 bytes. `then.give` is a rupee item
+  (`rupee_green` ... `rupee_orange`, 100);
+- `"who"` names a resident from the NPC catalogue, below.
+
+From code, the same is `wwhd_quest_talk(id, step, "windfall-um1", lines, reward_item)` and
+`wwhd_quest_carry(id, 1)` gives the sealed letter.
+
+### The King of Red Lions
+
+A step's `sail_line` is said once by the King of Red Lions, the way he gives his own news: the next
+time Link boards him or walks up to him in front, he turns to Link and says it in one message box.
+
+```json
+{"n": 1, "text": "Bring the storyteller's letter to his old friend who keeps Windfall's light.",
+ "sail_line": ["That sealed letter you carry is for the man",
+               "who keeps the light up on Windfall's windmill.",
+               "Let us not keep an old friend waiting, Link!"]}
+```
+
+The port arbitrates, not your mod:
+
+- only for the quest **shown on the chart** (tracked), at its current step. Untracked (or with your
+  mod off) the boat talks exactly as in the game;
+- **the game comes first.** His own lines that he says unasked (news after a pearl, a story
+  moment) always go first; the quest's line waits while one of them is pending, while any event or
+  cutscene runs, and for a short moment after the boat's last talk. Talking to him yourself always
+  gives his own hint: the quest's line never replaces it;
+- said once per step: the save's story record remembers it (see
+  [Where story progress is saved](#where-story-progress-is-saved)), never a flag of the game. A
+  later step with its own `sail_line` is said once again. A line that was cut short before its box
+  showed (a save state loaded during the talk) comes again;
+- the port never sets or clears a game flag for it, and the boat's state after the talk is the
+  state before it.
+
+### The NPC catalogue
+
+The characters a quest can name, by a neutral id: `<place>-<actor code>` (`windfall-um1`). The port
+keeps a **recipe** per place (`runtime/assets/npc_catalogue/<place>.recipe.json`): the ids, our own
+description of each character, the place in our words, when they are out, and references into the
+game (actor class and code, stage, room, layers, the figurine's message number). No game text and no
+coordinates are in the port: the character's name (its Nintendo Gallery figurine name) and where it
+stands outside come from the player's own game files. The port runs
+`tools/story_mods/npc_catalogue.py` the first time a quest mod is loaded and keeps the result in its
+data folder (`story/` in the port's configuration folder); without it, the notebook and the log show
+the description instead of the name, and residents have no place on the chart unless the step gives
+one.
+
+**Which id is which character.** Run the tool against your own game:
+
+```sh
+python3 tools/story_mods/npc_catalogue.py --game <your game folder> --list
+```
+
+It prints each id with the name your game gives the character, where it is and its spot; the list of
+names exists only on your machine.
+
+A new place or a new character adds rows to a recipe, never a change to the manifest format. A mod
+that names a character added in a later catalogue version declares the version it needs,
+`"npc_catalogue": 3`, so an older port refuses it with a clear message instead of ignoring the talk.
+
+Each entry lists the actors that are this character (actor class plus what identifies it: the
+townsperson code for the `people` class, the stage actor name for others) and the rooms and room
+layers they stand in. The name is the game's figurine name for exactly that actor: the decompilation
+ties each actor's pictograph type to its figurine (`dSnap_RegistFig`, figure = type − 0x49, name
+message 0x37DD + figure). A figurine that shows a pair or a group doesn't say which actor is which;
+those entries show their description.
+
+A talk is matched where the recipe says the actor stands (stage and room). Only the townspeople
+(class `people`) can speak a quest's lines so far; naming another character is refused with the
+reason. When the characters are out: "by day" is 6:00–18:00, and during the Endless Night (between
+the Wind Waker and Nayru's pearl) it is always night. A step whose `available` time never meets its
+character's is accepted with a warning in the log. Some characters move with the story (the recipe's
+`gate`): a couple of the town square follows their own story, two families swap houses, the pirates
+are in the bomb shop only for that scene.
+
+Catalogue version 3, Windfall Island ("unconfirmed": for characters other than the townspeople, the
+actor's own conditions for appearing are not decoded yet; only the room layers say when they are out).
+
+| Id | Who (our words) | Where | Out | Actor | Quest lines |
+|---|---|---|---|---|---|
+| `windfall-uo1` | an old man resting on the sea-view bench at the cliff | on the sea-view bench at the cliff | day | people Uo1 | yes |
+| `windfall-uo2` | a man who sits at the bar all day | in the bar | day | people Uo2 | yes |
+| `windfall-uo3` | a well-dressed man walking through town | walking through town | day | people Uo3 | yes |
+| `windfall-ub1` | one of the two women chatting up the steps by the brick house (the first) | up the steps by the brick house | day | people Ub1 | yes |
+| `windfall-ub2` | one of the two women chatting up the steps by the brick house (the second) | up the steps by the brick house | day | people Ub2 | yes |
+| `windfall-ub3` | a woman on the harbour pier | on the harbour pier | day | people Ub3 | yes |
+| `windfall-ub4` | a woman by the town gate | by the town gate | day and night | people Ub4 | yes |
+| `windfall-uw1` | the young woman working in the bar | in the bar | day and night | people Uw1 | yes |
+| `windfall-uw2` | a young woman in the town square or in the bar | the town square or the bar | day | people Uw2 | yes |
+| `windfall-um1` | the man up on the windmill by the light | up on the windmill by the light | day and night | people Um1 | yes |
+| `windfall-um2` | a young man in the town square or in the bar | the town square or the bar | day | people Um2 | yes |
+| `windfall-um3` | a young man on the steps by the red door (up high at night) | on the steps by the red door (up high at night) | day and night | people Um3 | yes |
+| `windfall-sa1` | a sailor who drinks in the bar at night | in the bar at night | night | people Sa1 | yes |
+| `windfall-sa2` | a sailor on the high lookout | on the high lookout | day | people Sa2 | yes |
+| `windfall-sa3` | a sailor on the stone dock | on the stone dock | day and night | people Sa3 | yes |
+| `windfall-sa4` | a sailor at the end of the wooden pier | at the end of the wooden pier | day and night | people Sa4 | yes |
+| `windfall-sa5` | a sailor on the grass by the stone wall | on the grass by the stone wall | day and night | people Sa5 | yes |
+| `windfall-ug1` | one of the two by the flowers at the cliff (the first) | by the flowers at the cliff | day and night | people Ug1 | yes |
+| `windfall-ug2` | one of the two by the flowers at the cliff (the second) | by the flowers at the cliff | day and night | people Ug2 | yes |
+| `windfall-rsh1` | the travelling merchant at his stall | the travelling merchant's stall | day (unconfirmed) | npc_rsh1 Rsh1 | not yet |
+| `windfall-tt` | the dancer on the hill | dancing on the hill | day and night (unconfirmed) | npc_tt Tt | not yet |
+| `windfall-kk1` | the rich man's daughter | in town | day and night (unconfirmed) | npc_kk1 Kk1 | not yet |
+| `windfall-gk1` | the rich man, the daughter's father | in town | day and night (unconfirmed) | npc_gk1 Gk1, Kf1 | not yet |
+| `windfall-kp1` | the poor family's daughter | the auction house | day and night (unconfirmed) | npc_kp1 Kp1 | not yet |
+| `windfall-pf1` | the poor family's father | in town | day and night (unconfirmed) | npc_pf1 Pf1, Gp1 | not yet |
+| `windfall-bms1` | the bomb shop keeper | the bomb shop | day and night (unconfirmed) | npc_bms1 Bms1, Bms2 | not yet |
+| `windfall-ds1` | the potion maker in his shop | the potion shop | day and night (unconfirmed) | npc_ds1 Ds1 | not yet |
+| `windfall-po` | the photographer in his studio | the photographer's studio | day and night (unconfirmed) | npc_photo Po | not yet |
+| `windfall-ho` | the teacher of the school house | the school house | day and night (unconfirmed) | npc_ho Ho | not yet |
+| `windfall-kg1` | the host of the battleship game | the battleship game | day and night (unconfirmed) | npc_kg1 Kg1 | not yet |
+| `windfall-npcso` | the talking fish in the sea by the island | the sea by the island | day and night (unconfirmed) | npc_so NpcSo | not yet |
+| `windfall-tc` | the man locked in the jail | the jail | day and night (unconfirmed) | npc_tc Tc | not yet |
+| `windfall-bm4` | a man in the bar who also comes to the auctions | the bar and the auction house | day and night (unconfirmed) | npc_bm4 Bm4 | not yet |
+| `windfall-zl1` | the pirate captain in the bomb shop | the bomb shop | day and night (unconfirmed) | npc_zl1 Zl1 | not yet |
+| `windfall-p1a` | a pirate in the bomb shop (the first of three) | the bomb shop | day and night (unconfirmed) | npc_p1 P1a | not yet |
+| `windfall-p1b` | a pirate in the bomb shop (the second of three) | the bomb shop | day and night (unconfirmed) | npc_p1 P1b | not yet |
+| `windfall-p1c` | a pirate in the bomb shop (the third of three) | the bomb shop | day and night (unconfirmed) | npc_p1 P1c | not yet |
+| `windfall-mk` | one of the four children around town (the leader) | around town | day (unconfirmed) | npc_mk Mk | not yet |
+| `windfall-ukb` | one of the four children around town (the second) | around town | day (unconfirmed) | npc_uk UkB | not yet |
+| `windfall-ukc` | one of the four children around town (the third) | around town | day (unconfirmed) | npc_uk UkC | not yet |
+| `windfall-ukd` | one of the four children around town (the fourth) | around town | day (unconfirmed) | npc_uk UkD | not yet |
+
+Not in the catalogue: the auction's bidders (their faces are chosen at random each auction), animals
+and objects, and characters who only appear in cutscenes.
+
+**Testing.** `tools/story_mods/notebook_e2e.sh` runs the `story-notebook` package headless from a
+save on Windfall: letter, notebook, page, tracking and the sea chart, and checks the log.
+
+**Players without story mods.** The item menu functions are only hooked while a loaded mod uses
+`wwhd_quest_*`. If another mod replaces one of them, the notebook is not in the item menu that
+session and the log says so.
 
 ## Packages with content and images
 
@@ -390,10 +902,13 @@ off baseline remains unchanged, and observes each running process's executable
 path against the verified selection. Setting an environment flag alone is not
 accepted as evidence of compiled hooks being disabled or enabled.
 
-The driver refreshes and installs through the catalogue worker, rebuilds code-mod
-support while the package remains disabled, restarts, selects/validates sources,
-runs preparation and builds the guest module through normal setup workers, then
-enables it for the following restart. It checks setup receipts, declared output
+In one game run, as a player does it, the driver switches the catalogue mod on
+(the test aid accepts its review, with the GameCube game from the private JSON): it
+is downloaded, its setup adds code-mod support, the game relaunches itself into
+the hook-enabled build (the relaunch keeps the support just built, also when the
+run started with `WWHD_CODE_MODS=0`), the setup resumes there, runs preparation,
+builds the guest module through the normal setup workers and switches it on for
+the following restart. It checks setup receipts, declared output
 files, regional build allocation and module existence, activation after restart,
 disable-until-restart and removal. Normal saves are copied for each process; full
 states are never transferred between versions. Only owned game processes are

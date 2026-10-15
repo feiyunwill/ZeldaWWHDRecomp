@@ -11,6 +11,7 @@
 #include "platform/host.h"
 #include "Cafe/HW/Latte/ISA/RegDefines.h"
 #include "../warm_progress.h"
+#include "../headstart_limits.h"
 #include <zlib.h>
 #include <array>
 #include <algorithm>
@@ -162,8 +163,8 @@ int warm_headstart_shaders() {
     return 1;
   }
   try {
-    if (std::filesystem::file_size(std::filesystem::u8path(path)) > 256 * 1024 * 1024)
-      throw std::runtime_error("head-start file exceeds 256 MiB");
+    if (std::filesystem::file_size(std::filesystem::u8path(path)) > kHeadstartMaxFileBytes)
+      throw std::runtime_error("head-start file exceeds 2 GiB");
     std::unique_ptr<FILE, decltype(&std::fclose)> file(open_utf8_file(path, "rb"), &std::fclose);
     if (!file) throw std::runtime_error("cannot open head-start file");
     // progress: shader records (1, 3, 6) and portable pipeline records (5), counted from the headers
@@ -183,15 +184,16 @@ int warm_headstart_shaders() {
     ProgramPool pool;
     std::array<uint32_t, 0x10000> regs{};
     std::vector<std::shared_ptr<PipelineRecipe>> portable;
-    size_t known = 0, speculative = 0, failed = 0, metalPipelines = 0, vulkanPipelines = 0, count = 0, rawBytes = 0;
+    size_t known = 0, speculative = 0, failed = 0, metalPipelines = 0, vulkanPipelines = 0, skippedPipelines = 0;
+    uint64_t count = 0, rawBytes = 0;
     std::array<uint8_t, 12> header;
     for (;;) {
       size_t got = std::fread(header.data(), 1, header.size(), file.get());
       if (!got && !std::ferror(file.get())) break;
       if (got != header.size()) throw std::runtime_error("truncated record header");
       uint32_t type = word(header.data()), size = word(header.data() + 4), compressed = word(header.data() + 8);
-      if (++count > 100000 || !size || size > 16 * 1024 * 1024 ||
-          !compressed || compressed > 16 * 1024 * 1024 || size > 256 * 1024 * 1024 - rawBytes)
+      if (++count > kHeadstartMaxRecords || !size || size > kHeadstartMaxRecordBytes ||
+          !compressed || compressed > kHeadstartMaxRecordBytes || size > kHeadstartMaxRawBytes - rawBytes)
         throw std::runtime_error("invalid head-start record bounds");
       rawBytes += size;
       std::vector<uint8_t> encoded(compressed), raw(size);
@@ -201,7 +203,8 @@ int warm_headstart_shaders() {
       if (uncompress(raw.data(), &decoded, encoded.data(), encoded.size()) != Z_OK || decoded != size)
         throw std::runtime_error("invalid head-start compressed payload");
       if (type == 5) {
-        if (portable.size() >= 16384) throw std::runtime_error("portable pipeline count limit");
+        // the startup worker holds at most kPipelineRecipeMaxCount recipes: keep the first ones
+        if (portable.size() >= kPipelineRecipeMaxCount) { ++skippedPipelines; continue; }
         portable.push_back(decode_code_free_pipeline_recipe(raw)); ++vulkanPipelines; continue;
       }
       if (type == 2) { ++metalPipelines; continue; }
@@ -316,8 +319,8 @@ int warm_headstart_shaders() {
         known, speculative, failed, metalPipelines, (unsigned long long)stats.spirvCompiles,
         (unsigned long long)stats.diskHits, (unsigned long long)stats.diskSaves,
         !dirty ? "unchanged" : saved ? "ok" : "failed");
-    std::fprintf(stderr, "[vulkan headstart] %zu Vulkan pipeline records; %zu ready, %zu failed\n",
-        vulkanPipelines, pipelines.ready, pipelines.failed);
+    std::fprintf(stderr, "[vulkan headstart] %zu Vulkan pipeline records; %zu ready, %zu failed; %zu over the %zu limit skipped\n",
+        vulkanPipelines, pipelines.ready, pipelines.failed, skippedPipelines, kPipelineRecipeMaxCount);
     return failed || pipelines.failed || (dirty && !saved) || !(known + speculative + pipelines.ready) ? 1 : 0;
   } catch (const std::exception& error) {
     std::fprintf(stderr, "[vulkan headstart] %s: %s\n", path.c_str(), error.what());

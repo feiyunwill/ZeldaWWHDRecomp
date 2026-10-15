@@ -128,6 +128,12 @@ int main(int argc, char** argv) {
     assert(bytes(fs::u8path(getenv("WWHD_SHADER_CACHE")))=="legacy Metal bytes");
 #endif
     assert(!fs::exists(live/"vulkan-invalid.bin"));
+    // device caches under the current short name (issue #144) are recognised too
+    assert(shaderprebuild::legacy_pipeline_filename("vk-0123456789ab.bin"));
+    assert(shaderprebuild::legacy_pipeline_filename("vk-0123456789ab.bin.recipes"));
+    assert(!shaderprebuild::legacy_pipeline_filename("vk-0123456789aB.bin"));
+    assert(!shaderprebuild::legacy_pipeline_filename("vk-0123456789ab.bin.t0123abcd"));
+    assert(shaderprebuild::legacy_pipeline_filename(pipeline));
     assert(!fs::exists(live/(pipeline+".tmp")));
     assert(fs::is_regular_file(live/".legacy-defaults-v1"));
     write(legacy/later,"new legacy cache after migration");

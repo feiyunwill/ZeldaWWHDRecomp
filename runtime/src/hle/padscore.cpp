@@ -5,6 +5,7 @@
 #include "../crashrec.h"
 #include "../runtime.h"
 #include "../input.h"
+#include "../mods/story_notebook.h"
 #include "../motion/motion.h"
 #include "../rumble.h"
 
@@ -81,6 +82,7 @@ HLE(padscore, KPADReadEx) {
         p.lx = f.lx; p.ly = f.ly; p.rx = f.rx; p.ry = f.ry;
     }
     last_p = p;
+    story_notebook::mute(p);  // the notebook's page has the controller (VPADRead drives it)
     mods::move_speed_input(p.buttons);
     mods::fast_forward_input(p.buttons);
     if (!repeat) motion::right_stick(p.rx, p.ry);  // the Pro Controller's stick decides gyro use too (motion.h)

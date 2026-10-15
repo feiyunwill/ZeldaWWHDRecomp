@@ -15,6 +15,9 @@ licenses). This check rejects, by name and by content:
     and git hashes 40, which do not match).
 The Windows release's tools/python/ (the official embeddable Python) must hold exactly the files listed
 in tools/release/python-windows-files.json, each with its listed SHA-256.
+An AppImage tree (a folder with AppRun at its root, e.g. the extracted squashfs-root) must carry the
+AppImage runtime's license texts (tools/release/appimage-runtime-licenses, copied by appimage.py)
+unchanged in third-party-licenses/.
 Android Python source archives must not contain debug fixture registration or smoke
 entry points. Only debug CI artifacts may opt in with --allow-android-test-fixtures.
 Exit status 1 lists every problem.
@@ -87,6 +90,10 @@ def check_python(name, data, seen, problems, files=PYTHON_FILES):
 # Independent implementation of the release exception; deliberately never import
 # shaderprep or its format reader. Any schema evolution requires guard review.
 SAFE_TEMPLATE_MAGIC = b"WWHT0003"
+# Same limits as tools/shaderprep_format.py (MAX_BYTES, MAX_ENTRIES): a full-game template decodes to
+# about 300 MiB of JSON with about 90,000 states.
+TEMPLATE_MAX_BYTES = 1024 * 1024 * 1024
+TEMPLATE_MAX_ENTRIES = 1000000
 SAFE_TEMPLATE_PATH = re.compile(r"^(?:[^./][^/]*/)?tools/shadercache/template\.bin$")
 
 # Independently reviewed typed Vulkan whitelist; no opaque binary fields.
@@ -136,11 +143,11 @@ def _validate_vulkan_template(p, fields, number, array):
 
 
 def validate_code_free_template(data):
-    if not data.startswith(SAFE_TEMPLATE_MAGIC) or len(data) > 256 * 1024 * 1024:
+    if not data.startswith(SAFE_TEMPLATE_MAGIC) or len(data) > TEMPLATE_MAX_BYTES:
         raise ValueError("invalid code-free template envelope")
     dec = zlib.decompressobj()
-    raw = dec.decompress(data[8:], 256 * 1024 * 1024 + 1)
-    if len(raw) > 256 * 1024 * 1024 or dec.unconsumed_tail or not dec.eof or dec.unused_data:
+    raw = dec.decompress(data[8:], TEMPLATE_MAX_BYTES + 1)
+    if len(raw) > TEMPLATE_MAX_BYTES or dec.unconsumed_tail or not dec.eof or dec.unused_data:
         raise ValueError("invalid or trailing template compression")
     def unique(items):
         result = {}
@@ -180,7 +187,7 @@ def validate_code_free_template(data):
                 attr["offset"] > 65535 or any(attr[n] > 7 for n in ("x", "y", "z", "w")) or
                 (attr["fetch_type"] == 1 and attr["divisor"] < 1)):
                 raise ValueError("unsupported fetch attribute")
-    for state in array(doc["states"]):
+    for state in array(doc["states"], maximum=TEMPLATE_MAX_ENTRIES):
         names = ("hash", "vertex", "fetch", "registers")
         fields(state, names + (("linked_vertex",) if type(state) is dict and "linked_vertex" in state else ()))
         number(state["hash"], high=0xffffffffffffffff)
@@ -206,7 +213,7 @@ def validate_code_free_template(data):
                 not (0x2000 <= address < 0x4000 or 0xa000 <= address < 0xc000 or 0xe000 <= address < 0x10000)):
                 raise ValueError("unapproved or duplicate register")
             seen.add(address)
-    for pipeline in array(doc["pipelines"]):
+    for pipeline in array(doc["pipelines"], maximum=TEMPLATE_MAX_ENTRIES):
         if type(pipeline) is dict and pipeline.get("backend") == "vulkan":
             _validate_vulkan_template(pipeline, fields, number, array)
             continue
@@ -289,6 +296,11 @@ def check_windows_manifest(name, data, problems):
                 '{http://schemas.microsoft.com/SMI/2019/WindowsSettings}activeCodePage')
             active = [node.text.strip() if node.text else '' for node in nodes]
             if active != ['UTF-8']: raise ValueError('application manifest must select activeCodePage UTF-8')
+            long_paths = document.findall('./{urn:schemas-microsoft-com:asm.v3}application/'
+                '{urn:schemas-microsoft-com:asm.v3}windowsSettings/'
+                '{http://schemas.microsoft.com/SMI/2016/WindowsSettings}longPathAware')
+            if [node.text.strip() if node.text else '' for node in long_paths] != ['true']:
+                raise ValueError('application manifest must declare longPathAware true (issue #144)')
             if not any(node.tag.endswith('}requestedExecutionLevel') for node in document.iter()):
                 raise ValueError('application manifest lacks requestedExecutionLevel')
     except (ValueError, struct.error, ET.ParseError) as error:
@@ -337,6 +349,24 @@ ANDROID_TEST_FILES = {
 }
 
 
+RUNTIME_LICENSES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "appimage-runtime-licenses")
+
+
+def check_appimage_licenses(path, problems):
+    """An AppImage tree has the runtime's license texts, byte for byte (appimage.py add_runtime_licenses)."""
+    names = sorted(f for f in os.listdir(RUNTIME_LICENSES) if f.startswith("AppImage-runtime-") and f.endswith(".txt"))
+    if not names:
+        problems.append("no AppImage runtime license texts in " + RUNTIME_LICENSES)
+    for name in names:
+        shipped = os.path.join(path, "third-party-licenses", name)
+        if not os.path.isfile(shipped):
+            problems.append("third-party-licenses/%s: the AppImage runtime's license text is missing" % name)
+            continue
+        with open(shipped, "rb") as a, open(os.path.join(RUNTIME_LICENSES, name), "rb") as b:
+            if a.read() != b.read():
+                problems.append("third-party-licenses/%s: differs from tools/release/appimage-runtime-licenses" % name)
+
+
 def scan(path, allow_android_test_fixtures=False):
     problems, count, python = [], 0, set()
     files = python_files(path)
@@ -353,6 +383,8 @@ def scan(path, allow_android_test_fixtures=False):
             except zipfile.BadZipFile:
                 problems.append("%s: invalid Android Python source archive" % name)
 
+    if os.path.isdir(path) and os.path.isfile(os.path.join(path, "AppRun")):
+        check_appimage_licenses(path, problems)
     if os.path.isdir(path):
         for dp, _, fns in os.walk(path):
             for fn in fns:

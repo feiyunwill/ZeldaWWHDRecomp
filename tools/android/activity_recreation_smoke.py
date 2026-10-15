@@ -6,6 +6,7 @@ from pathlib import Path
 import re
 import shlex
 import subprocess
+import adb_util
 import time
 
 from display_smoke import primary_preview_clear
@@ -21,10 +22,11 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     prefix = [args.adb, "-s", args.serial]
+    adb_util.wait_until_ready(prefix)
 
     def adb(*command, check=True):
         if command[0] == "shell": command = ("shell", shlex.join(command[1:]))
-        return subprocess.run(prefix + list(command), check=check, capture_output=True,
+        return adb_util.run(prefix + list(command), check=check, capture_output=True,
                               text=True, timeout=30).stdout.strip()
 
     if adb("shell", "getprop", "ro.kernel.qemu") != "1": parser.error("requires an emulator")
@@ -32,7 +34,7 @@ def main():
     original = adb("shell", "settings", "get", "global", "overlay_display_devices")
     immersive = adb("shell", "settings", "get", "secure", "immersive_mode_confirmations")
     settings = "/sdcard/Android/data/" + PACKAGE + "/files/config/wwhd/settings.ini"
-    existing = subprocess.run(prefix + ["exec-out", "cat", settings], capture_output=True, timeout=20)
+    existing = adb_util.run(prefix + ["exec-out", "cat", settings], capture_output=True, timeout=20)
     if existing.returncode not in (0, 1): raise RuntimeError("Cannot inspect settings")
     saved = existing.stdout if existing.returncode == 0 else None
     report = {"passed": False, "observations": []}
@@ -146,7 +148,7 @@ def main():
         adb("shell", "am", "force-stop", PACKAGE, check=False)
         if saved is None: adb("shell", "rm", "-f", settings)
         else:
-            subprocess.run(prefix + ["shell", "-T", "cat > " + shlex.quote(settings)], input=saved,
+            adb_util.run(prefix + ["shell", "-T", "cat > " + shlex.quote(settings)], input=saved,
                            check=True, capture_output=True, timeout=20)
         if original == "null": adb("shell", "settings", "delete", "global", "overlay_display_devices")
         else: adb("shell", "settings", "put", "global", "overlay_display_devices", original)

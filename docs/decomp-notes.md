@@ -797,6 +797,7 @@ change three things.
 | `1004AAF0` | `16/9` constant | only read by `camera_execute` (`024FFA94`) and `init_phase2` (`025020D8`); Cemu's resolution pack patches this one (plus `101417D0` and `10165898`, see below) |
 | `024FFA3C` | `camera_execute` | `view.mAspect` (+0xD8) = constant, every logic step (`@024FFA98`) |
 | `024FFC40` | `camera_draw` | `C_MTXPerspective(proj, mFovy, mAspect, mNear, mFar)` at `024FFD60` |
+| `0250007C` | `camera_draw` | `sead::PerspectiveProjection::set` (`0274E04C`) on camera+0x66C with `mNear`, `mFar`, `mFovy` × π/180, `mAspect`: the projection the HD renderer draws the scene with (its matrices at camera+0x8B8 and +0x8F8). Without this hook the patched `mAspect` reaches it but the Vert+ fovy does not, and taller screens got a cropped 16:9 picture |
 | `024F8068` | `view_setup` | `mDoLib_clipper::setup(mFovy, mAspect, mNear, far)` at `024F811C` / `024F8168`: the frustum all culling uses (`fopAcM_cullingCheck`, `daBg_Draw`, grass, trees via `J3DUClipper`) |
 | `025ADB04` | `dScnName_c::setView` | the file-select scene's own perspective (`025ADB38`) |
 

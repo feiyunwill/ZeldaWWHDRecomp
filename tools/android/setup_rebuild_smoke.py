@@ -11,7 +11,7 @@ import json
 from pathlib import Path
 import re
 import shlex
-import subprocess
+import adb_util
 import time
 import uuid
 import zipfile
@@ -29,10 +29,11 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     prefix = [args.adb, "-s", args.serial]
+    adb_util.wait_until_ready(prefix)
 
     def adb(*command, check=True, data=None):
         if command[0] == "shell": command = ("shell", shlex.join(command[1:]))
-        return subprocess.run(prefix + list(command), input=data, check=check, capture_output=True,
+        return adb_util.run(prefix + list(command), input=data, check=check, capture_output=True,
                               timeout=120 if command[0] == "install" else 30)
 
     def shell(*command, **kwargs): return adb("shell", *command, **kwargs).stdout

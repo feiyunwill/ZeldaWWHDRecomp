@@ -11,7 +11,7 @@ import json
 from pathlib import Path
 import re
 import shlex
-import subprocess
+import adb_util
 import time
 import uuid
 import zipfile
@@ -32,10 +32,11 @@ def main():
     if args.damage_complete and args.obsolete_generations:
         parser.error("choose cache damage or obsolete-generation cleanup")
     prefix = [args.adb, "-s", args.serial]
+    adb_util.wait_until_ready(prefix)
 
     def adb(*command, check=True, data=None):
         if command[0] == "shell": command = ("shell", shlex.join(command[1:]))
-        return subprocess.run(prefix + list(command), input=data, capture_output=True, check=check, timeout=30)
+        return adb_util.run(prefix + list(command), input=data, capture_output=True, check=check, timeout=30)
 
     def shell(*command, **kwargs): return adb("shell", *command, **kwargs).stdout
     def exists(path): return adb("shell", "run-as", PACKAGE, "test", "-e", path, check=False).returncode == 0

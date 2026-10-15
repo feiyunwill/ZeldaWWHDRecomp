@@ -10,7 +10,7 @@ import json
 import re
 from pathlib import Path
 import shlex
-import subprocess
+import adb_util
 import time
 
 PACKAGE = "org.wwhdrecomp.wwhd"
@@ -27,12 +27,13 @@ def main():
     args = parser.parse_args()
     if args.general_layout and args.external_memory_capabilities: parser.error("choose GPU rendering or capability queries")
     prefix = [args.adb, "-s", args.serial]
+    adb_util.wait_until_ready(prefix)
     command = "external_memory_capabilities" if args.external_memory_capabilities else "shared_image_general_probe" if args.general_layout else "shared_image_probe"
     marker = "external memory capability probe" if args.external_memory_capabilities else "two-device shared image general shader probe" if args.general_layout else "two-device shared image shader probe"
 
     def adb(*command, check=True):
         if command[0] == "shell": command = ("shell", shlex.join(command[1:]))
-        return subprocess.run(prefix + list(command), check=check, capture_output=True, text=True, timeout=20).stdout.strip()
+        return adb_util.run(prefix + list(command), check=check, capture_output=True, text=True, timeout=20).stdout.strip()
 
     if adb("shell", "getprop", "ro.kernel.qemu") != "1": parser.error("requires an emulator")
     paths = adb("shell", "pm", "path", PACKAGE).splitlines()

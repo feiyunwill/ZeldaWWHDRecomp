@@ -5,6 +5,11 @@
 #include <unordered_map>
 #include <array>
 #include <vector>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <string>
 struct Shader {
   uint64_t pipelineId; bool vertex; int output; bool valid = true;
   bool ready() const { return valid; }
@@ -15,7 +20,31 @@ int main() {
   const auto first=gfxvk::pipeline_cache_override({},"live",0x1002,0x1234,uuid);
   const auto second=gfxvk::pipeline_cache_override({},"live",0x10de,0x5678,uuid);
   assert(first&&second&&first!=second);
-  assert(*first=="live/vulkan-00001002-00001234-00000000000000000000000000000000.bin");
+  // vk-<12 hex>.bin (issue #144), and the name of releases up to v0.2.12 for adopting their caches
+  assert(first->size()==std::string("live/vk-0123456789ab.bin").size() && first->starts_with("live/vk-"));
+  assert(*gfxvk::pipeline_cache_override({},"live",0x1002,0x1234,uuid,true)==
+         "live/vulkan-00001002-00001234-00000000000000000000000000000000.bin");
+  {
+    namespace fs=std::filesystem;
+    const auto dir=fs::temp_directory_path()/("wwhd-pipeline-adopt-"+std::to_string(std::rand()));
+    fs::create_directories(dir);
+    auto put=[](const fs::path& p,const char* text) { std::ofstream(p)<<text; };
+    auto get=[](const fs::path& p) { std::ifstream f(p); return std::string(std::istreambuf_iterator<char>(f),{}); };
+    const auto current=*gfxvk::pipeline_cache_override({},dir.string(),0x1002,0x1234,uuid);
+    const auto legacy=*gfxvk::pipeline_cache_override({},dir.string(),0x1002,0x1234,uuid,true);
+    put(legacy,"cache");put(legacy+".recipes","recipes");
+    gfxvk::adopt_legacy_pipeline_cache(current,legacy);
+    assert(get(current)=="cache"&&get(current+".recipes")=="recipes"&&!fs::exists(legacy));
+    // a cache under the current name wins; the earlier one is left alone
+    put(legacy,"older");
+    gfxvk::adopt_legacy_pipeline_cache(current,legacy);
+    assert(get(current)=="cache"&&get(legacy)=="older");
+    // nothing to adopt, or no cache: no change, no failure
+    gfxvk::adopt_legacy_pipeline_cache((dir/"none.bin").string(),(dir/"missing.bin").string());
+    gfxvk::adopt_legacy_pipeline_cache("","");
+    assert(!fs::exists(dir/"none.bin"));
+    fs::remove_all(dir);
+  }
   assert(gfxvk::pipeline_cache_override({},"live/",0x1002,0x1234,uuid)==first);
   assert(gfxvk::pipeline_cache_override({},"live",0x1002,0x1234,secondUuid)!=first);
   assert(gfxvk::pipeline_cache_override("exact.bin","live",1,2,uuid)=="exact.bin");

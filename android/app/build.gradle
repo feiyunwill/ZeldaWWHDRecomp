@@ -11,6 +11,7 @@ android {
     ndkVersion "30.0.16248370"  // android/build_native.sh's default (the native libraries come from there)
     defaultConfig {
         applicationId "org.wwhdrecomp.wwhd"
+        testInstrumentationRunner "org.wwhdrecomp.wwhd.SetupPolishInstrumentation"
         minSdk 33
         targetSdk 36
         // release.yml passes the release version and a growing build number; local builds keep these

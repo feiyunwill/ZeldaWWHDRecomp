@@ -76,7 +76,9 @@ extern "C" void site_023FD39C(Cpu* c) {
 // GameCube :2300): `mNormalSpeed += accel` per step, or cLib_addCalc (scaled in true60.cpp) ----
 extern "C" void hook_02416230(Cpu* c) {
     if (link60()) c->f[1].ps0 = (float)(c->f[1].ps0 * true60::dt());
+    const mods::SidleScope sidle = mods::sidle_scope_begin(c, true);  // faster sidling (traversal.cpp)
     f_02416230_orig(c);
+    mods::sidle_scope_end(sidle);
 }
 
 // ---- cLib_calcTimer<T> (`if (*t != 0) --*t; return *t;`), one copy per type and file. With

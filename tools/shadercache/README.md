@@ -10,6 +10,53 @@ Upstream tag, development-dispatch and nightly builds require the secret. Fetch 
 stops packaging. GitHub's SSH host key is pinned rather than learned at fetch time.
 The workflow keeps its temporary SSH key private and removes it even when a step fails.
 
+## Contributing your shader template (players, issue #177)
+
+The game records every shader state and pipeline it builds in your own caches
+(`shader-prebuild/live/`: `shaders.bin` with Metal, `*.bin.recipes` with Vulkan). Those caches contain
+game-derived shader code and stay on your computer. **Export** turns them into a code-free template
+(`my-template.bin`: program hashes, register values and typed pipeline settings only) that you can attach
+to [issue #177](https://github.com/ZeldaWWHDRecomp/ZeldaWWHDRecomp/issues/177); merged templates
+let the next release prepare those shaders for everyone.
+
+The easiest way: **Settings → Graphics → Export shader template**. It writes `my-template.bin` to the
+screenshots folder and shows the path. (Not on Android yet.)
+
+From a terminal, in the release folder (the folder with `tools/`):
+
+| System | Command |
+| --- | --- |
+| Windows (PowerShell or Command Prompt) | `tools\python\python.exe tools\shaderprep.py export` |
+| macOS | `python3 tools/shaderprep.py export` |
+| Linux (release folder) | `python3 tools/shaderprep.py export` |
+| Linux AppImage | `./WindWakerHD-*.AppImage --appimage-extract 'tools/*'` then `python3 squashfs-root/tools/shaderprep.py export ~/my-template.bin` (then delete `squashfs-root`) |
+
+`export` finds your caches by itself: a portable release's `data/user/shader-prebuild/live`, otherwise
+the per-user folder (`~/Library/Application Support/WWHD`, `%APPDATA%\WWHD`, `~/.config/wwhd` or
+`$XDG_CONFIG_HOME/wwhd`, `WWHD_USER_DIR`), and the older locations (`~/Library/Caches/wwhd/shaders.bin`,
+`<settings>/shadercache/`). Point it elsewhere with `--from FOLDER` (for example an AppImage
+`<AppImage>.data/config/wwhd`). It writes `my-template.bin` in the release folder unless you name the
+output file. It prints how many states and pipelines it found and for which renderer, skips (and counts)
+any damaged records, and refuses to write anything that fails the release guard's code-free check. It
+never copies the raw caches, the driver caches or SPIR-V.
+
+Maintainers merge contributions (each input and the result must pass the guard; duplicates are dropped):
+
+```sh
+python3 tools/shaderprep.py merge merged.bin player1.bin player2.bin ...
+python3 tools/shaderprep.py merge merged.bin merged.bin tools/shadercache/template.bin   # with the current one
+```
+
+Limits (the same in every writer and reader): a template holds up to 1,000,000 states and 1,000,000
+pipelines and 1 GiB of decoded JSON (`shaderprep_format.py` `MAX_ENTRIES`/`MAX_BYTES`, mirrored in
+`tools/release/guard.py`); a head start up to 4,000,000 records, 2 GiB on disk and 8 GiB decoded
+(`runtime/src/gfx/headstart_limits.h`, mirrored in `shaderprep.py` `HEADSTART_*`). A full-game template
+(about 90,000 states and 40,000 pipelines) is about 8 MB, 300 MB decoded, and builds a head start of
+about 120,000 records and 90 MB.
+
+`template CACHE [OUT] --merge T` still converts one cache (shaders.bin or a `.recipes` file) and keeps
+template `T`; `merge` combines any number of code-free templates without a cache.
+
 ## Local recording
 
 Use Python 3. The archive decoder builds a small local C helper with Clang/GCC (`CC` overrides it),
@@ -47,12 +94,16 @@ pipeline recipes. Vulkan and Metal skip the other renderer's typed recipes.
 `WWHD_HEADSTART=<file>` selects a local built headstart (`0` disables it).
 `WWHD_VK_SHADER_CACHE=<directory>` selects SPIR-V storage; `WWHD_VK_PIPELINE_CACHE=<file>` selects the
 device cache. `WWHD_VK_PIPELINE_CACHE_DIR=<directory>` selects device-specific
-`vulkan-<vendor>-<device>-<uuid>.bin` files and adjacent `.recipes` files; an
-explicit file override wins over the directory. Normal setup and runtime use
+`vk-<12 hex digits>.bin` files (vendor, device and the driver's cache UUID hashed;
+short, so Windows paths stay short) and adjacent `.recipes` files; a cache under the earlier
+name `vulkan-<vendor>-<device>-<uuid>.bin` is renamed once. An explicit file override wins over
+the directory. Normal setup and runtime use
 `shader-prebuild/live/`. On first activation, old default Vulkan caches and the
 macOS Metal shader cache are copied there once without replacing existing files.
 Sources stay intact; copy errors are logged and do not prevent play.
 Never pass `spirv.bin` to `shaderprep.py template`: conversion requires the GX2 recording.
+`template`, `export` and `coverage` read player caches tolerantly: a damaged, truncated or
+unknown record is skipped (counted in a warning), and reading resumes at the next intact record.
 
 The stripped template schema is documented at the top of `tools/shaderprep.py`. The independent
 `tools/release/guard.py` permits only that schema at the packaged template path. Packaging tests generate

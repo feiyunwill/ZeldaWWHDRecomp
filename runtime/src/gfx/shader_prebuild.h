@@ -1,6 +1,7 @@
 // Private setup-generated cache generations. The release template contains no
 // code; these files are resolved from the player's game and stay on this device.
 #pragma once
+#include "shader_setup_hint.h"
 #include "platform/host.h"
 #include "platform/process.h"
 #include "mods/mod_json.h"
@@ -331,7 +332,15 @@ inline bool copy_legacy_file(const fs::path& source, const fs::path& target,
     return copied;
 }
 inline bool legacy_pipeline_filename(const std::string& name) {
-    // Only our old device-specific cache and its adjacent recipe file.
+    // Only our device-specific caches and their adjacent recipe files: vk-<12 hex>.bin
+    // (gfxvk::device_pipeline_cache_filename) and the earlier vulkan-<vendor>-<device>-<uuid>.bin.
+    if (name.starts_with("vk-")) {
+        if (name.size() != 19 && name.size() != 27) return false;
+        if (name.substr(15, 4) != ".bin" || (name.size() == 27 && name.substr(19) != ".recipes")) return false;
+        for (size_t i = 3; i < 15; ++i)
+            if (!((name[i] >= '0' && name[i] <= '9') || (name[i] >= 'a' && name[i] <= 'f'))) return false;
+        return true;
+    }
     constexpr size_t baseSize = 7 + 8 + 1 + 8 + 1 + 32 + 4;
     if (name.size() != baseSize && name.size() != baseSize + 8) return false;
     if (!name.starts_with("vulkan-") || name[15] != '-' || name[24] != '-' ||

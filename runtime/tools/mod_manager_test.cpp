@@ -63,15 +63,22 @@ bool get(const char* k, std::string& value) {
 }
 void set(const char* k, const std::string& value) { ++writes;preferences[k]=value; }
 }
-namespace mods::packages { void remember_builtin(const std::string&,bool) {} }
+static std::map<std::string,double> remembered;
+namespace mods::packages {
+void remember_builtin(const std::string&,bool) {}
+void remember_option(const std::string& id,double value) { remembered[id]=value; }
+void remember_option(const std::string&,const std::string&) {}
+}
 int main() {
     using namespace mods::manager;
     env("WWHD_NO_HOST_INPUT",nullptr);
     for(const auto& entry:entries()) env(entry.startup_env,nullptr);
     env("WWHD_MOD_CAMERA_SPEED",nullptr);env("WWHD_MOD_MOUSE_SENS",nullptr);
     env("WWHD_MOD_MOVE_FACTOR",nullptr);env("WWHD_MOD_MOVE_SWIM",nullptr);env("WWHD_MOD_MOVE_STAMINA",nullptr);
-    assert(entries().size()==8);
+    assert(entries().size()==13);
+    for(const auto& option:traversal_options()) env(option.startup_env,nullptr);
     load_saved(); for(bool on:state) assert(!on); // stock defaults stay off
+    assert(!mods::ladder_speed() && !mods::sidle_speed() && !mods::sail_speed() && !mods::auto_wind());
     preferences["mod.wall-climb.enabled"]="1";
     preferences["mod.quick-doors.enabled"]="invalid";
     preferences["mod.direct-camera.speed"]="1.5";
@@ -120,6 +127,30 @@ int main() {
     preferences["mod.move-speed.factor"] = "3";
     load_saved();
     assert(mods::move_speed_land_factor() == 3.f && mods::move_speed_swim_factor() == 3.f);
+    // The traversal mods (#95, #96): switches and their factors round-trip; out-of-range values are ignored.
+    for(const char* id:{"ladder-speed","sidle-speed","sail-speed","auto-wind"}) assert(set_enabled(id,true));
+    assert(mods::ladder_speed() && mods::sidle_speed() && mods::sail_speed() && mods::auto_wind());
+    disable_all(); assert(!mods::ladder_speed() && !mods::sidle_speed() && !mods::sail_speed() && !mods::auto_wind());
+    assert(mods::ladder_speed_factor()==1.5f && mods::sidle_speed_factor()==1.5f);  // defaults once switched on
+    assert(mods::sail_speed_normal_factor()==1.5f && mods::sail_speed_swift_factor()==1.5f);
+    preferences["mod.ladder-speed.factor"]="2";
+    preferences["mod.sidle-speed.factor"]="9";      // out of range: ignored
+    preferences["mod.sail-speed.normal"]="1.25";
+    preferences["mod.sail-speed.swift"]="nan";
+    load_saved();
+    assert(mods::ladder_speed_factor()==2.f && mods::sidle_speed_factor()==1.5f);
+    assert(mods::sail_speed_normal_factor()==1.25f && mods::sail_speed_swift_factor()==1.5f);
+    set_traversal_option("ladder-speed.factor",2.5f);
+    assert(mods::ladder_speed_factor()==2.5f && remembered["ladder-speed.factor"]==2.5);
+    assert(std::stof(preferences["mod.ladder-speed.factor"])==2.5f);
+    set_traversal_option("sail-speed.swift",2.5f);
+    assert(mods::sail_speed_swift_factor()==2.5f && remembered["sail-speed.swift"]==2.5);
+    assert(std::stof(preferences["mod.sail-speed.swift"])==2.5f);
+    set_traversal_option("sidle-speed.factor",7.f);  // clamped by the setter, saved as applied
+    assert(mods::sidle_speed_factor()==3.f && remembered["sidle-speed.factor"]==3.0);
+    env("WWHD_MOD_LADDER_FACTOR","1");preferences["mod.ladder-speed.factor"]="3";
+    load_saved(); assert(mods::ladder_speed_factor()==2.5f);  // the environment owns startup values
+    env("WWHD_MOD_LADDER_FACTOR",nullptr);
     // Test isolation protects player settings even when toggles are exercised.
     env("WWHD_NO_HOST_INPUT","1");prior=reads;load_saved();assert(reads==prior);
     prior=writes;assert(set_enabled("quick-doors",true));assert(state[4]);assert(writes==prior);
