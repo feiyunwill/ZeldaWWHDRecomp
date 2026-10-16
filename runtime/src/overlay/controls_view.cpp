@@ -526,7 +526,30 @@ void draw_controls(ControlsView& v, float w, float h) {
             dl->AddCircleFilled(p.c, p.R, lit(p.action) ? P.fill : P.button);
             dl->AddCircle(p.c, p.R, ring(p.action, &wd), 0, wd);
             bool small = p.action == kHome || p.action == kPlus || p.action == kMinus;
-            text_centered(dl, p.text, p.c, small ? std::max(10.0f, 0.021f * s) : bf, lit(p.action) ? P.white : P.buttonText);
+            const auto look = prompt_style(m, pad_family());
+            const bool styled = p.action >= kA && p.action <= kY && face_layout(m) != FaceLayout::kLabels
+                                && look.face != FaceStyle::kOriginal;
+            const int host = styled ? look.buttons[p.action - kA] : 0;
+            ImU32 ink = lit(p.action) ? P.white : P.buttonText;
+            if (styled && look.colours) {
+                constexpr uint32_t xbox[] = {0x58BE36, 0xE34B49, 0x3B91E5, 0xEBC52E};
+                constexpr uint32_t ps[] = {0x3C7DD9, 0xD9413C, 0xD05FB0, 0x2AA67D};
+                const uint32_t rgb = look.face == FaceStyle::kXbox ? xbox[host] : ps[host];
+                ink = col(((rgb >> 16) & 255)/255.0f, ((rgb >> 8) & 255)/255.0f, (rgb & 255)/255.0f);
+            }
+            if (styled && look.face == FaceStyle::kPlayStation) {
+                const float r = p.R * 0.5f, x = p.c.x, y = p.c.y;
+                if (host == 0) {
+                    dl->AddLine({x-r,y-r}, {x+r,y+r}, ink, 1.5f);
+                    dl->AddLine({x+r,y-r}, {x-r,y+r}, ink, 1.5f);
+                } else if (host == 1) dl->AddCircle(p.c, r, ink, 24, 1.5f);
+                else if (host == 2) dl->AddRect({x-r,y-r}, {x+r,y+r}, ink, 0, 1.5f);
+                else dl->AddTriangle({x,y-r}, {x+r,y+r}, {x-r,y+r}, ink, 1.5f);
+            } else {
+                constexpr const char* letters[] = {"A", "B", "X", "Y"};
+                text_centered(dl, styled ? letters[host] : p.text, p.c,
+                              small ? std::max(10.0f, 0.021f * s) : bf, ink);
+            }
         } else if (p.kind == kPartStick) {
             dl->AddCircleFilled(p.c, p.R, P.well);
             bool dirHot = false, conflict = false;

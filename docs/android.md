@@ -59,6 +59,8 @@ your saves and settings (the Android device prepares the game again when an upda
 
 The full steps are in the README, section *Android (build it yourself)*.
 
+Moon jump is an optional cheat in **Gameplay → Cheats**, off by default. Enable it and hold **L** to rise; the left stick steers relative to the camera while airborne, including after you release L. Release the stick to stop horizontal flight. **No fall damage after moon jump** is a separate option that applies only to a flight started with this cheat. Both options work with 30 fps, frame interpolation and true 60; loading a state clears the current flight.
+
 ## Fair play
 
 - Use your own copy of the game, dumped from your own disc or console.

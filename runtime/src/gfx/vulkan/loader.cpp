@@ -45,11 +45,12 @@ void load_instance_functions(VkInstance instance) {
 #undef WWHD_VK_LOAD
 }
 
-void load_device_functions(VkDevice device, bool khrDynamicRendering) {
+void load_device_functions(VkDevice device, bool khrDynamicRendering, bool renderPasses) {
 #define WWHD_VK_LOAD(name) \
   if (!(name = reinterpret_cast<PFN_##name>(vkGetDeviceProcAddr(device, #name)))) missing(#name);
   WWHD_VK_DEVICE_FUNCTIONS(WWHD_VK_LOAD)
 #undef WWHD_VK_LOAD
+  if (renderPasses) { vkCmdBeginRendering=nullptr; vkCmdEndRendering=nullptr; return; }
   // the core 1.3 function or the extension's: same parameters (VkRenderingInfoKHR = VkRenderingInfo)
 #define WWHD_VK_LOAD(name)                                                                          \
   {                                                                                                 \

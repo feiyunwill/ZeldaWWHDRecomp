@@ -1,5 +1,6 @@
 // Optional gameplay mods (Gameplay menu). All off by default; each can be switched live.
 //   camera.cpp  direct right-stick camera, mouse camera, first person on R3 / mouse wheel
+//   lock_on.cpp optional enemy range and R3 cycling through the native eligible list
 //   mouse.mm    mouse capture in the game window (macOS events)
 //   turbo.cpp   quick doors and fast scene changes (extra logic steps while they run)
 //   cheats.cpp  items, sword/shield, stats, infinite health/magic/ammo, songs, Triforce, dungeon items
@@ -30,6 +31,16 @@ bool quick_doors();
 void set_quick_doors(bool on);
 bool fast_scenes();
 void set_fast_scenes(bool on);
+
+// Optional enemy targeting assistance. Off preserves the game's targeting unchanged.
+bool extended_lock_on();
+void set_extended_lock_on(bool on);
+float lock_on_range(); // multiplier of native enemy acquisition/release distances, 1..3
+void set_lock_on_range(float factor);
+bool lock_on_cycling();
+void set_lock_on_cycling(bool on);
+void lock_on_filter_pad(input::PadState& s); // reserve R3 only while enemy-locked
+void lock_on_reset(); // focus loss, overlays and save/load require a fresh press
 
 bool move_speed();
 void set_move_speed(bool on);
@@ -118,9 +129,14 @@ enum Cheat {
     kCheatSongs = 8, kCheatTriforce = 16, kCheatDungeon = 32, kCheatKey = 64,
 };
 void request_cheat(int which);  // any thread
-enum Infinite { kInfHealth = 1, kInfMagic = 2, kInfAmmo = 4 };
+enum Infinite { kInfHealth = 1, kInfMagic = 2, kInfAmmo = 4, kMoonJump = 8, kMoonNoFall = 16 };
 bool infinite(int which);
 void set_infinite(int which, bool on);
+void moon_jump_input(const input::PadState& pad);
+void moon_jump_camera(uint32_t camera);
+void moon_jump_reset(); // game thread after state restore
+void moon_jump_step(Cpu* cpu, uint32_t link, bool before);
+bool moon_jump_move(uint32_t link, float& x, float& z);
 void cheats_service();          // game main thread, frame start (interp.cpp)
 
 // shared helpers (mods.cpp)

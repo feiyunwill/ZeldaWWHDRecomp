@@ -39,6 +39,8 @@ void defaults() {
     const ext::Features f = ext::features(), plain{};
     assert(f.clipboard && f.file_picker && f.screenshots && f.full_states);
     assert(plain.clipboard && plain.file_picker && plain.screenshots && plain.full_states);
+    assert(f.code_mods && f.mod_downloads && f.speaker_choice && f.keyboard);
+    assert(plain.code_mods && plain.mod_downloads && plain.speaker_choice && plain.keyboard);
     assert(!ext::font_loader() && ext::shortcuts().empty() && !ext::text_input() && ext::frame_layers().empty());
     // L / R wrap around the bar, as before
     assert(ext::next_tab(0, -1) == ext::kBuiltinCount - 1 && ext::next_tab(ext::kBuiltinCount - 1, +1) == 0);
@@ -89,8 +91,11 @@ void sealed_late() {
     ext::Features f;
     f.clipboard = false;
     f.file_picker = false;
+    f.code_mods = false;
+    f.keyboard = false;
     ext::set_features(f);
     assert(!ext::features().clipboard && !ext::features().file_picker && ext::features().screenshots);
+    assert(!ext::features().code_mods && ext::features().mod_downloads && !ext::features().keyboard);
     assert(!ext::sealed());
     (void)ext::tabs();  // the overlay's first frame
     assert(ext::sealed());
@@ -104,6 +109,7 @@ void sealed_late() {
     ext::add_frame_layer({[](std::string&) { return true; }, [](float, float) { return true; }});
     assert(ext::tab_index("late") == -1 && ext::tab_index("saves") == 0);
     assert(!ext::features().clipboard && ext::shortcuts().empty() && !ext::font_loader() && !ext::text_input());
+    assert(!ext::features().code_mods && !ext::features().keyboard);
     assert(ext::frame_layers().empty());
 }
 

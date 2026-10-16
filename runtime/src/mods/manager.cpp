@@ -19,6 +19,10 @@ const Entry catalogue[] = {
     {"first-person", "First-person shortcut", "Camera",
      "Enter first person with R3 or the mouse wheel.",
      "WWHD_MOD_FIRST_PERSON", first_person_wheel, set_first_person_wheel},
+    {"lock-on", "Extended enemy lock-on", "Gameplay",
+     "Extend enemy targeting range and press R3 while locked on to cycle enemy targets. "
+     "Disabled keeps the original targeting behavior.",
+     "WWHD_MOD_LOCK_ON", extended_lock_on, set_extended_lock_on},
     {"wall-climb", "Climb any wall", "Gameplay",
      "Grab and climb walls using a stamina wheel. A or B lets go.",
      "WWHD_CLIMB", climb_enabled, set_climb_enabled},
@@ -113,6 +117,12 @@ void load_saved() {
     if (!std::getenv("WWHD_MOD_FF_MUTE")) {
         std::string v;
         if (hostui::get("mod.fast-forward.mute", v) && (v == "0" || v == "1")) set_fast_forward_mute(v == "1");
+    }
+    number("mod.lock-on.range", "WWHD_MOD_LOCK_ON_RANGE", 1.f, 3.f, set_lock_on_range);
+    if (!std::getenv("WWHD_MOD_LOCK_ON_CYCLING")) {
+        std::string v;
+        if (hostui::get("mod.lock-on.cycling", v) && (v == "0" || v == "1"))
+            set_lock_on_cycling(v == "1");
     }
     number("mod.move-speed.land", "WWHD_MOD_MOVE_FACTOR", 1.f, 4.f, set_move_speed_land_factor);
     number("mod.move-speed.swim", "WWHD_MOD_MOVE_SWIM", 1.f, 4.f, set_move_speed_swim_factor);

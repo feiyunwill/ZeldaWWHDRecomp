@@ -1754,6 +1754,23 @@ class DecompOption(unittest.TestCase):
         link = calls[-1]
         self.assertEqual(link[1:4], [setup.fwd(os.path.join(setup.PKG, "sdk")) + "/decomp/obj/main.o", "hooks.o", "u1.o"])
 
+    def test_response_files_are_utf8(self):
+        # Windows links through response files; a folder with characters outside the code page (an emoji,
+        # Asian scripts) stopped setup with "'charmap' codec can't encode" before they were written as UTF-8
+        calls = []
+        tc = setup.Toolchain(["cc"], ["c++"], ["ar"], rsp=True)
+        with tempfile.TemporaryDirectory() as root:
+            d = os.path.join(root, "\U0001f3ae Games \u6e38\u620f")
+            os.makedirs(d)
+            obj = os.path.join(d, "g.o")
+            with mock.patch.object(setup, "run_logged", lambda cmd, **kw: calls.append(cmd)), \
+                    mock.patch.object(setup, "link_with_sdk_fallback", lambda cmd, env: calls.append(cmd) or
+                                      open(os.path.join(d, "out"), "w").close()):
+                setup.link_game(tc, {"link": ["{gamecode}", "-o", "{out}"]}, [obj], d, os.path.join(d, "out"))
+            for name in ("ar.rsp", "link.rsp"):
+                with open(os.path.join(d, name), encoding="utf-8") as f:
+                    self.assertIn("\U0001f3ae Games \u6e38\u620f", f.read(), name)
+
     def test_state_keeps_decomp_exe_relative(self):
         with tempfile.TemporaryDirectory() as d, mock.patch.object(setup, "PORTABLE", True):
             exe = os.path.join(d, "bin", "wwhd-decomp")

@@ -9,6 +9,7 @@
 #include "mods/catalogue_setup.h"
 #include <cassert>
 #include <cstdlib>
+#include <cmath>
 #include <map>
 #include <string>
 
@@ -35,6 +36,15 @@ void set_fast_forward_rate(unsigned r) { if (r >= 2 && r <= 4) ff_rate = r; }
 uint32_t fast_forward_button() { return ff_button; }
 void set_fast_forward_button(uint32_t b) { if (valid_fast_forward_button(b)) ff_button = b; }
 bool fast_forward_mute() { return ff_mute; } void set_fast_forward_mute(bool on) { ff_mute = on; }
+
+static bool lock_on_enabled = false, lock_on_cycle = true;
+static float lock_on_multiplier = 1.f;
+bool extended_lock_on() { return lock_on_enabled; }
+void set_extended_lock_on(bool on) { lock_on_enabled = on; }
+float lock_on_range() { return lock_on_multiplier; }
+void set_lock_on_range(float f) { if (std::isfinite(f) && f >= 1 && f <= 3) lock_on_multiplier = f; }
+bool lock_on_cycling() { return lock_on_cycle; }
+void set_lock_on_cycling(bool on) { lock_on_cycle = on; }
 
 static bool move_on = false;
 static float move_land = 1.5f, move_swim = 1.25f, move_seconds = 5.f, move_cooldown = 3.f;

@@ -1,3 +1,4 @@
+#include "pass.h"
 #include "../../exception_report.h"
 #include "aspect.h"
 #include "aspect_panes.h"
@@ -10,6 +11,7 @@
 #include "backend.h"
 #include "stereo.h"
 #include "../stereo_projection.h"
+#include "sampler_filtering.h"
 #include "deferred_dispatch.h"
 #include "buffer_cache.h"
 #include "render_prof.h"
@@ -817,6 +819,7 @@ Pipeline &pipeline(const uint32_t *r, vk::Shader *vs, vk::Shader *ps,
   p.trimFetch = fs;
   p.trimVertex = vs;
   p.bindingTrims.reserve(fs->bufferGroups.size());
+  uint32_t tailLocation = vk::vertex_tail_location(vs->mapping.attributeMapping);
   for (auto &g : fs->bufferGroups) {
     bool instance = false;
     BindingTrimMetadata trim;
@@ -826,14 +829,25 @@ Pipeline &pipeline(const uint32_t *r, vk::Shader *vs, vk::Shader *ps,
       int loc = vs->mapping.attributeMapping[a.semanticId];
       if (loc < 0)
         continue;
-      auto fmt = vk::vertex_format(a.format);
+      auto fmt = R.vertexFormats.fetch(vk::vertex_format(a.format));
       if (fmt == VK_FORMAT_UNDEFINED)
         exception_report::raise("unsupported vertex format");
       attributes.push_back(
           {uint32_t(loc), g.attributeBufferIndex, fmt, a.offset});
-      // Mirror the conservative prefix rules using the actual pipeline format.
+      const auto nativeFormat = vk::vertex_format(a.format);
+      if (R.vertexFormats.fallback(nativeFormat)) {
+        if (tailLocation >= R.properties.limits.maxVertexInputAttributes ||
+            attributes.size() >= R.properties.limits.maxVertexInputAttributes)
+          exception_report::raise("RGB fallback exceeds device vertex attribute limit");
+        const uint64_t tailOffset = uint64_t(a.offset) + vk::vertex_tail_offset(nativeFormat);
+        if (tailOffset > R.properties.limits.maxVertexInputAttributeOffset)
+          exception_report::raise("RGB fallback exceeds device vertex attribute offset limit");
+        attributes.push_back({tailLocation++, g.attributeBufferIndex,
+            vk::vertex_tail_format(nativeFormat), uint32_t(tailOffset)});
+      }
+      // Split fetches cover exactly the native attribute bytes.
       if (trim.supported) {
-        const uint32_t width = vertex_format_bytes(fmt);
+        const uint32_t width = vertex_format_bytes(vk::vertex_format(a.format));
         if (!width || (trim.rate && *trim.rate != a.fetchType) ||
             (a.fetchType != LatteConst::VertexFetchType2::VERTEX_DATA &&
              a.fetchType != LatteConst::VertexFetchType2::INSTANCE_DATA) ||
@@ -863,6 +877,8 @@ Pipeline &pipeline(const uint32_t *r, vk::Shader *vs, vk::Shader *ps,
     trim.stride = stride;
     p.bindingTrims.push_back(trim);
   }
+  if (R.vertexFormats.fallbackMask && attributes.size() > R.properties.limits.maxVertexInputAttributes)
+    exception_report::raise("RGB fallback exceeds device vertex attribute limit");
   VkPipelineVertexInputStateCreateInfo vi{
       VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
   vi.vertexBindingDescriptionCount = bindings.size();
@@ -1056,7 +1072,7 @@ Pipeline &pipeline(const uint32_t *r, vk::Shader *vs, vk::Shader *ps,
       depth && depth->fmt.stencil ? df : VK_FORMAT_UNDEFINED;
   VkGraphicsPipelineCreateInfo ci{
       VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
-  ci.pNext = &rc;
+  pipeline_targets(ci, rc);
   ci.stageCount = 2;
   ci.pStages = stages;
   ci.pVertexInputState = &vi;
@@ -1068,7 +1084,7 @@ Pipeline &pipeline(const uint32_t *r, vk::Shader *vs, vk::Shader *ps,
   ci.pColorBlendState = &bs;
   ci.pDynamicState = &dy;
   ci.layout = p.layout;
-  GraphicsPipelineState pipelineState(ci);
+  GraphicsPipelineState pipelineState(ci, &rc);
   WarmPipeline warmed;
   if (!recipeSpirv[0].empty() && !recipeSpirv[1].empty() &&
       take_warm_pipeline(recipeKey, recipeSpirv, descriptorBindings, p.dynamicUniforms, pipelineState, warmed)) {
@@ -1166,24 +1182,25 @@ Pipeline &pipeline(const uint32_t *r, vk::Shader *vs, vk::Shader *ps,
 struct SamplerMemo {
   VkDevice device = VK_NULL_HANDLE;
   std::array<uint32_t, 3> words{};
-  bool compare = false, integer = false, forceAniso = false;
+  bool compare = false, integer = false, forceAniso = false, nearestOnly = false;
   VkSampler value = VK_NULL_HANDLE;
   bool matches(VkDevice nextDevice, const uint32_t* nextWords,
-               bool nextCompare, bool nextInteger, bool nextForceAniso) const {
+               bool nextCompare, bool nextInteger, bool nextForceAniso, bool nextNearestOnly) const {
     return value && device == nextDevice && compare == nextCompare &&
-        integer == nextInteger && forceAniso == nextForceAniso &&
+        integer == nextInteger && forceAniso == nextForceAniso && nearestOnly == nextNearestOnly &&
         words[0] == nextWords[0] && words[1] == nextWords[1] && words[2] == nextWords[2];
   }
   void remember(VkDevice nextDevice, const uint32_t* nextWords,
-                bool nextCompare, bool nextInteger, bool nextForceAniso, VkSampler nextValue) {
+                bool nextCompare, bool nextInteger, bool nextForceAniso, bool nextNearestOnly, VkSampler nextValue) {
     device = nextDevice;
     std::memcpy(words.data(), nextWords, sizeof(words));
-    compare = nextCompare; integer = nextInteger; forceAniso = nextForceAniso;
+    compare = nextCompare; integer = nextInteger; forceAniso = nextForceAniso; nearestOnly = nextNearestOnly;
     value = nextValue;
   }
 };
 SamplerMemo samplerMemo;
-VkSampler sampler(const uint32_t *words, bool compare, bool integer, bool allowAniso) {
+VkSampler sampler(const uint32_t *words, bool compare, bool integer, bool allowAniso, bool linearSupported) {
+  const bool nearestOnly = sampler_nearest_only(integer, compare, linearSupported);
   static const bool memo = [] {
     const char* e = std::getenv("WWHD_VK_SAMPLER_MEMO");
     return e && !std::strcmp(e, "1");
@@ -1191,19 +1208,20 @@ VkSampler sampler(const uint32_t *words, bool compare, bool integer, bool allowA
   const bool forceAniso = allowAniso && aniso_enabled();
   const bool stats = preparation_stats_enabled();
   if (stats) ++R.cpuPreparation.samplerRequests;
-  if (memo && samplerMemo.matches(R.device, words, compare, integer, forceAniso)) {
+  if (memo && samplerMemo.matches(R.device, words, compare, integer, forceAniso, nearestOnly)) {
     if (stats) ++R.cpuPreparation.samplerMemoHits;
     return samplerMemo.value;
   }
   if (stats) ++R.cpuPreparation.samplerMapLookups;
   auto remember = [&](VkSampler value) {
-    if (memo) samplerMemo.remember(R.device, words, compare, integer, forceAniso, value);
+    if (memo) samplerMemo.remember(R.device, words, compare, integer, forceAniso, nearestOnly, value);
     return value;
   };
   std::string key(reinterpret_cast<const char *>(words), 12);
   key.push_back(compare);
   key.push_back(integer);
   key.push_back(forceAniso);
+  key.push_back(nearestOnly);
   static std::unordered_map<std::string, VkSampler> cache;
   if (auto it = cache.find(key); it != cache.end())
     return remember(it->second);
@@ -1237,7 +1255,7 @@ VkSampler sampler(const uint32_t *words, bool compare, bool integer, bool allowA
   VkSamplerCreateInfo ci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
   ci.magFilter = filter(static_cast<uint32_t>(w.get_XY_MAG_FILTER()));
   ci.minFilter = filter(static_cast<uint32_t>(w.get_XY_MIN_FILTER()));
-  if (integer)
+  if (nearestOnly)
     ci.minFilter = ci.magFilter = VK_FILTER_NEAREST;
   ci.mipmapMode = static_cast<uint32_t>(w.get_MIP_FILTER()) == 2
                       ? VK_SAMPLER_MIPMAP_MODE_LINEAR
@@ -1268,7 +1286,7 @@ VkSampler sampler(const uint32_t *words, bool compare, bool integer, bool allowA
   if (forceAniso && uint32_t(w.get_MIP_FILTER()) != 0 && ci.minFilter == VK_FILTER_LINEAR &&
       uint32_t(w.get_DEPTH_COMPARE_FUNCTION()) == 0)
     anisotropy = 16;
-  if (R.enabledFeatures.samplerAnisotropy && !integer && anisotropy > 1) {
+  if (R.enabledFeatures.samplerAnisotropy && !nearestOnly && anisotropy > 1) {
     ci.anisotropyEnable = VK_TRUE;
     ci.maxAnisotropy = std::min(float(anisotropy), R.properties.limits.maxSamplerAnisotropy);
   }
@@ -1282,6 +1300,7 @@ VkSampler sampler(const uint32_t *words, bool compare, bool integer, bool allowA
     ci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
     ci.borderColor = VkBorderColor(uint32_t(ci.borderColor) + 1);
   }
+  restrict_sampler_filtering(ci, nearestOnly);
   VkSampler s;
   vk_check(vkCreateSampler(R.device, &ci, nullptr, &s), "sampler");
   cache.emplace(std::move(key), s);
@@ -1910,7 +1929,7 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
     }
     info = {sampler(samplerWords, sh->dec->textureUsesDepthCompare[unit],
                    s->fmt.kind != FormatInfo::FLOAT,
-                   !s->gpuWritten && s->mips > 1),
+                   !s->gpuWritten && s->mips > 1, s->linearFiltering),
                              sampledView,
                              VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
     auto &write = appendWrite(rankPlan.textures[unit]);
@@ -2391,7 +2410,17 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
     ri.pStencilAttachment = depth && depth->fmt.stencil ? &da : nullptr;
     if(R.gpuPassTimestampsEnabled) gpu_begin_render_scope(colors,depth,slices,depthSlice,width,height);
     trace_pass(colors, ncolor, depth, depthSlice, width, height);
-    record::vkCmdBeginRendering(cmd, &ri);
+    begin_pass(cmd, ri, [&] {
+      PassBegin pass; pass.formats.colorCount = ncolor;
+      for (uint32_t i = 0; i < ncolor; ++i) if (colors[i]) {
+        pass.formats.colors[i] = colors[i]->fmt.pixel; pass.layouts[i] = colors[i]->layout;
+      }
+      if (depth) {
+        pass.formats.depth = depth->fmt.pixel; pass.formats.stencil = depth->fmt.stencil;
+        pass.layouts[8] = depth->layout;
+      }
+      return pass;
+    });
     ++R.renderPassCount;
     R.rendering = true;
     R.passTracked = true;

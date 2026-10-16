@@ -62,6 +62,8 @@ cuando una actualización lo necesita).
 
 Los pasos completos están en el README, sección *Android (build it yourself)*.
 
+El salto lunar es un truco opcional en **Gameplay → Cheats**, desactivado de forma predeterminada. Actívalo y mantén **L** para ascender; la palanca izquierda dirige el vuelo con respecto a la cámara, incluso después de soltar L. Suelta la palanca para detener el movimiento horizontal. **No fall damage after moon jump** es una opción independiente que solo protege un vuelo iniciado con este truco. Ambas opciones funcionan a 30 fps, con interpolación y con true 60; cargar un estado borra el vuelo actual.
+
 ## Juego limpio
 
 - Usa tu propia copia del juego, extraída de tu propio disco o consola.

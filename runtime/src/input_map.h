@@ -152,9 +152,9 @@ PadFamily pad_family();
 
 // What the in-game button prompts look like (button_glyphs.cpp draws it). Resolved from the
 // mapping and the pad family; pure, so input_map_test and button_glyphs_test can cover it.
-//   face: the face buttons are restyled only while they are by label (the game's own prompts
-//     already match a by-position pad): Automatic picks PlayStation shapes on a PlayStation pad
-//     and the Xbox colours/positions on anything else; Original keeps the game's look.
+//   face: appearance and host-button identities follow the resolved face bindings. Automatic
+//     follows Xbox/PlayStation; position/custom on Nintendo or unknown retain original icons.
+//     By label retains its existing Xbox fallback. Original never changes face prompts.
 //   shoulders: Automatic follows the face style (Xbox: LB/RB/LT/RT, PlayStation: L1/R1/L2/R2,
 //     original: the game's L/R/ZL/ZR); a fixed choice applies with any face layout.
 enum class FaceStyle : uint8_t { kOriginal, kXbox, kPlayStation };
@@ -164,6 +164,7 @@ struct PromptStyle {
     bool colours = false;         // face colours (only with a face style)
     ShoulderStyle shoulders = ShoulderStyle::kOriginal;
     bool positions = false;       // HUD face cluster in the Xbox/PlayStation positions
+    std::array<int, 4> buttons = {0, 1, 2, 3};  // Wii U face -> host A/B/X/Y
     bool active() const { return face != FaceStyle::kOriginal || shoulders != ShoulderStyle::kOriginal; }
     bool operator==(const PromptStyle&) const = default;
 };

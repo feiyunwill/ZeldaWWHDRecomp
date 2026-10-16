@@ -55,6 +55,8 @@ struct Host {
     std::string build_name = "USA";
     bool android = false;
     bool file_picker = true; // the host has file and folder choosers (overlay/extensions.h Features)
+    bool code_mods = true;      // code mods can run here (Features::code_mods)
+    bool mod_downloads = true;  // the online mod list (Features::mod_downloads)
     bool back = false;       // controller B this frame
     bool b_used = false;     // out: B answered something here (it must not also close the menu)
     bool test = false;       // isolated headless run: WWHD_TEST_* aids apply
@@ -169,7 +171,9 @@ inline bool selectable(const char* label, bool selected = false, ImGuiSelectable
 inline bool g_expand_all = false;
 inline bool section(const char* label) {
     if (g_expand_all) ImGui::SetNextItemOpen(true, ImGuiCond_Always);
-    return ImGui::CollapsingHeader(label);
+    const bool open = ImGui::CollapsingHeader(label);
+    state().rects[label] = ImRect(ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+    return open;
 }
 inline bool tree(const char* label) {
     if (g_expand_all) ImGui::SetNextItemOpen(true, ImGuiCond_Always);
@@ -243,7 +247,7 @@ inline void open_catalogue(const Host& h) {
     auto work = catalogue_work();
     if (work.empty()) return;
     auto& s = state();
-    s.loader.open(catalogue_url(), work, h.fetch, ImGui::GetTime(), s.auto_check);
+    s.loader.open(catalogue_url(), work, h.fetch, ImGui::GetTime(), s.auto_check && h.mod_downloads);
 }
 inline const mods::catalogue::Entry* catalogue_entry(const CatalogueLoader::Snapshot& snap, const std::string& id) {
     for (const auto& e : snap.catalogue.index.entries) if (e.id == id) return &e;
@@ -984,6 +988,7 @@ inline bool begin_list(const char* id) {
 // Why a catalogue mod can't be switched on here ("" when it can).
 inline std::string unavailable_reason(const Host& h, const mods::catalogue::Entry& e) {
     if (e.kind == "guest" && h.android) return "Code mods don't work on Android yet.";
+    if (e.kind == "guest" && !h.code_mods) return "Code mods don't work on this platform.";
     bool compatible = false;
     try { compatible = e.compatible(h.port_version, h.build_name, mods::packages::platform_key()); } catch (...) {}
     return compatible ? "" : "Not available for this version of the game.";
@@ -993,6 +998,9 @@ inline void builtin_list(Host& h) {
     muted(kAreaCaptions[kBuiltin]);
     if (!begin_list("builtin")) return;
     for (const auto& e : mods::manager::entries()) {
+        // the story system needs the Story Notebook package, which only the mod list provides
+        if (e.id == "story-system" && !h.mod_downloads && !find_view(mods::packages::list(), mods::required::kStoryNotebook))
+            continue;
         Facts fx;
         fx.builtin = true;
         fx.enabled = e.enabled();
@@ -1013,7 +1021,7 @@ inline void builtin_list(Host& h) {
 inline void community_list(Host& h) {
     using namespace mods::packages;
     auto& s = state();
-    muted(kAreaCaptions[kCommunity]);
+    muted(h.mod_downloads ? kAreaCaptions[kCommunity] : "Mods you add to the mods folder (More > Mods folder).");
     auto list = mods::packages::list();
     auto snap = s.loader.snapshot();
     static const char* test_install = h.test ? getenv("WWHD_TEST_CATALOGUE_INSTALL") : nullptr;
@@ -1052,12 +1060,13 @@ inline void community_list(Host& h) {
     // the story system's required package (mods/required.h): its status, Install while it is missing
     if (const auto required = mods::required::status(); !required.text.empty()) {
         colored(required.working || required.restart ? kMuted : kWarn, required.text);
-        if (!required.working && !find_view(list, mods::required::kStoryNotebook) && mods::story_system()) {
+        if (h.mod_downloads && !required.working && !find_view(list, mods::required::kStoryNotebook) && mods::story_system()) {
             ImGui::SameLine();
             if (small_button("Install##story_notebook")) install_story_notebook(h);
         }
     }
     // available to download
+    if (!h.mod_downloads) return;
     ImGui::SeparatorText("Available to download");
     auto line = catalogue_line(snap.have_list, snap.checking, snap.failed, s.auto_check);
     if (!line.text.empty()) {
@@ -1461,7 +1470,7 @@ inline void more(Host& h) {
         if (button("Choose folder…##package")) pick(true);
         ImGui::Unindent();
     }
-    if (section("GameCube game for mods")) {
+    if (h.file_picker && section("GameCube game for mods")) {  // (chosen with a file picker)
         ImGui::Indent();
         muted("Some mods use files from the GameCube version of the game. They stay on your computer.");
         game_source_picker(h, "gc_wind_waker");
@@ -1469,7 +1478,7 @@ inline void more(Host& h) {
         if (!src.path.empty() && small_button("Forget it")) { std::string e; set_game_source("gc_wind_waker", "", e); }
         ImGui::Unindent();
     }
-    if (section("Code-mod support")) {
+    if (h.code_mods && section("Code-mod support")) {
         ImGui::Indent();
         bool code = mods::code::enabled();
         // not the section's own label: two items with one ID
@@ -1483,7 +1492,7 @@ inline void more(Host& h) {
         if (experimental::backups_section(h.back)) h.b_used = true;
         ImGui::Unindent();
     }
-    if (section("Mod list")) {
+    if (h.mod_downloads && section("Mod list")) {
         ImGui::Indent();
         if (ImGui::Checkbox("Check for new mods automatically", &s.auto_check))
             hostui::post([on = s.auto_check] { hostui::set("mod.catalogue.auto", on ? "1" : "0"); });

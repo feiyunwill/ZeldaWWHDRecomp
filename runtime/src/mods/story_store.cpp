@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
@@ -69,8 +70,20 @@ void memory_to_card(Cpu* c) {
     }
     g_original(c, kMemoryToCard);
 }
+// initdata_to_card builds a new Quest Log's initial data in its own 0x420-byte stack frame (stwu r1,-0x420)
+// and copies the frame's records to the card buffer whole, padding included (dSv_player_status_c_c's
+// status A byte 0x17, once per status C record, and the frame's other gaps). Those bytes are whatever an
+// earlier call left on the stack, so the empty Quest Logs' bytes in cking.sav followed which code ran on
+// the save thread before: the port's mods (their guest calls) changed them. The frame is cleared first,
+// so a new Quest Log's bytes are the game's initial values and zeros, whatever ran before.
+constexpr uint32_t kInitdataFrame = 0x420;
+void clear_initdata_frame(const Cpu* c) {
+    const uint32_t sp = c->r[1];
+    if (sp > kInitdataFrame) memset(mem::ptr(sp - kInitdataFrame), 0, kInitdataFrame);
+}
 void initdata_to_card(Cpu* c) {
     const uint32_t log = c->r[5];
+    clear_initdata_frame(c);
     g_original(c, kInitdataToCard);
     if (!g_quiet && g_memory && log < kQuestLogs) {
         std::lock_guard lock(g_mu);

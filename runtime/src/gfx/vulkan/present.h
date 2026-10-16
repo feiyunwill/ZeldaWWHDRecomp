@@ -54,6 +54,8 @@ struct PresentImageParams {
 struct PresentImageDraw {
  VkDevice device=VK_NULL_HANDLE;
  VkPipeline pipeline=VK_NULL_HANDLE;
+ VkRenderPass renderPass=VK_NULL_HANDLE;
+ VkFramebuffer framebuffer=VK_NULL_HANDLE;
  VkPipelineLayout layout=VK_NULL_HANDLE;
  VkDescriptorSetLayout descriptors=VK_NULL_HANDLE;
  VkSampler sampler=VK_NULL_HANDLE;
@@ -73,13 +75,13 @@ std::optional<PresentImageDraw> prepare_present_image(Screen&,uint32_t imageInde
 // access renderer submission state, mutable resource caches or screen objects.
 void record_present_image(const PresentImageDraw&,VkCommandBuffer,VkDescriptorPool);
 // Presentation resources and dispatch belonging to a separate logical device.
-// Device must enable dynamic rendering; source is a linearly sampleable RGBA8
+// Device enables dynamic rendering unless renderPasses is selected; source is a linearly sampleable RGBA8
 // view with caller-owned layout/ownership synchronization. Caller owns target
 // views, command/descriptor pools, and must drain all draws before destruction.
 // Prepare and record are serialized by the owner, never mutate global dispatch.
 class IndependentPresenter {
 public:
- IndependentPresenter(VkDevice,bool dynamicRenderingKHR);
+ IndependentPresenter(VkDevice,bool dynamicRenderingKHR,bool renderPasses=false);
  ~IndependentPresenter();
  IndependentPresenter(const IndependentPresenter&)=delete;
  IndependentPresenter& operator=(const IndependentPresenter&)=delete;
@@ -88,6 +90,8 @@ public:
      VkImageLayout oldLayout,int filter,bool fxaa,
      VkImageLayout finalLayout=VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
  void record(const PresentImageDraw&,VkCommandBuffer,VkDescriptorPool) const;
+ // Caller has drained all draws referencing these target views.
+ void forget_views(const VkImageView*,size_t);
 private:
  struct Impl;
  std::unique_ptr<Impl> impl;

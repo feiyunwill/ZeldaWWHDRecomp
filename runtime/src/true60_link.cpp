@@ -60,10 +60,13 @@ extern "C" void site_023FD39C(Cpu* c) {
     mods::move_start_effect(c, link);
     mods::move_trail_effect(c, link);
     mods::move_swim_effect(c, link);
-    if (!half && factor == 1.f) return; // preserve the stock path and all FP bits when off
+    float moon_x = 0, moon_z = 0;
+    const bool moon = mods::moon_jump_move(link, moon_x, moon_z);
+    if (!half && factor == 1.f && !moon) return; // preserve the stock path and all FP bits when off
     const float dt = half ? true60::dt() : 1.f;
     uint32_t sp = c->r[4];  // &speed
     float vx = u32_as_f32(ld32(sp)), vy = u32_as_f32(ld32(sp + 4)), vz = u32_as_f32(ld32(sp + 8));
+    if (moon) { vx = moon_x; vz = moon_z; }
     float dv = half ? vy - (float)c->f[31].ps0 : 0.f;
     uint32_t v = scratch_vec();
     st32(v, f32_as_u32(vx * dt * factor));

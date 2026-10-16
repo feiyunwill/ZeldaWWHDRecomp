@@ -429,11 +429,41 @@ static void test_prompts() {
 
     Mapping m = Mapping::defaults();
     CHECK(m.prompts == Mapping::Prompts::kAuto && m.shoulder_names == Mapping::ShoulderNames::kAuto && m.prompt_colours);
-    // by position: the game's own prompts, whatever the pad
-    for (PadFamily f : {PadFamily::kUnknown, PadFamily::kXbox, PadFamily::kPlayStation, PadFamily::kNintendo}) {
-        const PromptStyle s = prompt_style(m, f);
-        CHECK(!s.active() && !s.positions && !s.colours);
-    }
+    // Full layout x appearance x family matrix. Automatic layout is resolved from labels.
+    for (int layout = 0; layout < 4; ++layout)
+        for (auto prompts : {Mapping::Prompts::kAuto, Mapping::Prompts::kOriginal,
+                             Mapping::Prompts::kXbox, Mapping::Prompts::kPlayStation})
+            for (auto family : {PadFamily::kXbox, PadFamily::kPlayStation, PadFamily::kNintendo, PadFamily::kUnknown}) {
+                Mapping candidate = Mapping::defaults();
+                if (layout == 1) apply_face_layout(candidate, FaceLayout::kLabels);
+                if (layout == 2) {
+                    note_face_labels(family == PadFamily::kXbox ? xbox : family == PadFamily::kPlayStation ? ps
+                                     : family == PadFamily::kNintendo ? nintendo : none);
+                    set_face_auto(candidate, true);
+                }
+                if (layout == 3) {
+                    candidate.pad[kA] = kPadX; candidate.pad[kB] = kPadY;
+                    candidate.pad[kX] = kPadA; candidate.pad[kY] = kPadB;
+                }
+                candidate.prompts = prompts;
+                const bool labels = face_layout(candidate) == FaceLayout::kLabels;
+                const FaceStyle expected = prompts == Mapping::Prompts::kOriginal ? FaceStyle::kOriginal
+                    : prompts == Mapping::Prompts::kXbox ? FaceStyle::kXbox
+                    : prompts == Mapping::Prompts::kPlayStation ? FaceStyle::kPlayStation
+                    : family == PadFamily::kPlayStation ? FaceStyle::kPlayStation
+                    : labels || family == PadFamily::kXbox ? FaceStyle::kXbox : FaceStyle::kOriginal;
+                const auto actual = prompt_style(candidate, family);
+                CHECK(actual.face == expected);
+                CHECK(actual.positions == (labels && expected != FaceStyle::kOriginal));
+                CHECK(actual.colours == (expected != FaceStyle::kOriginal));
+                for (int i = 0; i < 4; ++i)
+                    CHECK(actual.buttons[i] == (expected == FaceStyle::kOriginal ? i : candidate.pad[kA+i] - kPadA));
+                // Every invalid/ambiguous face set falls back together.
+                for (int invalid : {int(kPadNone), int(kPadLB), candidate.pad[kB]}) {
+                    auto bad = candidate; bad.pad[kA] = invalid;
+                    CHECK(prompt_style(bad, family).face == FaceStyle::kOriginal);
+                }
+            }
     // by label, automatic: Xbox look (LB/RB/LT/RT) unless the pad is a PlayStation one (L1/R1/L2/R2)
     apply_face_layout(m, FaceLayout::kLabels);
     PromptStyle s = prompt_style(m, PadFamily::kXbox);
@@ -464,7 +494,7 @@ static void test_prompts() {
     apply_face_layout(m, FaceLayout::kPosition);
     m.shoulder_names = Mapping::ShoulderNames::kXbox;
     s = prompt_style(m, PadFamily::kXbox);
-    CHECK(s.face == FaceStyle::kOriginal && !s.positions && s.shoulders == ShoulderStyle::kXbox && s.active());
+    CHECK(s.face == FaceStyle::kXbox && !s.positions && s.shoulders == ShoulderStyle::kXbox && s.active());
     // custom face bindings: the game's face prompts
     apply_face_layout(m, FaceLayout::kLabels);
     m.pad[kX] = kPadLB;

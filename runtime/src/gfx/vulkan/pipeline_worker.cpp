@@ -1,3 +1,4 @@
+#include "pass.h"
 #include "pipeline_worker.h"
 #include "../headstart_limits.h"
 #include "pipeline_identity.h"
@@ -176,6 +177,7 @@ VkResult compile(VkDevice device, VkPipelineCache cache, PipelineRecipe& recipe,
       stages[i].pName = "main"; stages[i].module = modules[i];
     }
     info.pStages = stages; info.layout = out.layout;
+    if (R.renderPasses) render_pass_pipeline_targets(info, state.rendering_targets());
     const auto cpuStart = stutter::trace().enabled() ? stutter::thread_cpu_now() : 0;
     const auto started = stutter::trace().enabled() ? stutter::now() : 0;
     result = vkCreateGraphicsPipelines(device, cache, 1, &info, nullptr, &out.pipeline);

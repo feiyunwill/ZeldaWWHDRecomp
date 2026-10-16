@@ -69,7 +69,7 @@ def make_build_space(setup, data):
     if setup.free_space(str(data)) >= minimum:
         return
     try:
-        active = json.loads((data / 'code-mods-active.json').read_text())['fingerprint']
+        active = json.loads((data / 'code-mods-active.json').read_text(encoding='utf-8'))['fingerprint']
     except FileNotFoundError:
         active = None
     except (ValueError, KeyError, TypeError):
@@ -83,7 +83,7 @@ def make_build_space(setup, data):
             continue
         try:
             ready = cache / 'ready.json'
-            record = json.loads(ready.read_text())
+            record = json.loads(ready.read_text(encoding='utf-8'))
             key = record.get('fingerprint')
             if isinstance(key, str) and cache.name in (key, cache_name(key)):
                 candidates.append((ready.stat().st_mtime, cache))

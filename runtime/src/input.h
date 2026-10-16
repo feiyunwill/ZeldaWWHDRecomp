@@ -33,6 +33,8 @@ void set_touch(bool down, float x, float y);  // mouse on the GamePad window
 // GamePad stays connected (its screen and touch still work) but its buttons and sticks are idle.
 bool pro_controller();
 void set_pro_controller(bool on);
+// called (any thread) when set_pro_controller changes the choice (controller_reapply: the game follows)
+void set_controller_listener(void (*fn)(bool pro));
 
 void init();       // main thread, after NSApplication exists
 PadState read();   // any thread

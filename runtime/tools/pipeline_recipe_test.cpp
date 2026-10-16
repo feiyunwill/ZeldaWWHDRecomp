@@ -94,6 +94,19 @@ int main(int argc, char** argv) {
   identical.set_stage_module(0, reinterpret_cast<VkShaderModule>(uintptr_t(17)));
   assert(encode_pipeline_fixed_state(identical) == fixed); // handles never enter identity
   auto encoded = encode_pipeline_recipe(*recipe);
+  // Classic compatibility handles stay process-local. The recipe's format
+  // metadata and fixed-state identity are identical on both rendering paths.
+  auto classicSource = *recipe->state;
+  auto classicInfo = *classicSource.get();
+  const auto classicTargets = classicSource.rendering_targets();
+  classicInfo.pNext = nullptr;
+  classicInfo.renderPass = reinterpret_cast<VkRenderPass>(uintptr_t(123));
+  recipe->state = std::make_unique<GraphicsPipelineState>(classicInfo, &classicTargets);
+  assert(encode_pipeline_fixed_state(*recipe->state) == fixed);
+  assert(encode_pipeline_recipe(*recipe) == encoded);
+  auto classicDecoded = decode_pipeline_recipe(encoded);
+  recipe->state = std::move(classicDecoded->state);
+  assert(recipe->state && !recipe->state->get()->renderPass);
   // Portable state has the exact fixed-state wire fields, with no shader words.
   auto portable = encoded;
   size_t offset = 4 + 208 * 4 + 4;

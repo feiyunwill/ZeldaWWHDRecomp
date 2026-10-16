@@ -21,8 +21,7 @@ forward to the renderer chosen once at start-up:
 
 If Vulkan cannot start, the game falls back to Metal and shows why (log, a sheet on the TV window,
 the window title says "Metal (Vulkan unavailable)"): no Vulkan loader or glslang installed (both are
-weak imports, so the app still starts without them), no driver (MoltenVK), no device with dynamic
-rendering. `WWHD_VK_FORCE_INIT_FAIL=1` forces this path for testing.
+weak imports, so the app still starts without them), no driver (MoltenVK), no device with Vulkan 1.1 or newer. `WWHD_VK_FORCE_INIT_FAIL=1` forces this path for testing.
 
 The macOS release includes everything Vulkan needs, nothing has to be installed: the setup puts the
 Vulkan loader (`libvulkan.1.dylib`, built from Khronos' Vulkan-Loader) and MoltenVK
@@ -142,9 +141,27 @@ CI artifacts. No runtime frame-time claims should be made from these capture run
 
 ## Build
 
-Use Clang/clang++ with CMake, Vulkan 1.3 headers and loader, glslang and zlib (and SDL3 and, on
-Windows/Linux, LZ4 for the SDL host). A GPU/driver with dynamic rendering is required: Vulkan 1.3,
-or Vulkan 1.1 / 1.2 with `VK_KHR_dynamic_rendering`. Dependencies must match the target architecture.
+Use Clang/clang++ with CMake, Vulkan 1.3 headers, a Vulkan 1.1 or newer loader, glslang and zlib
+(and SDL3 and, on Windows/Linux, LZ4 for the SDL host). The GPU and driver must support Vulkan 1.1
+or newer. Dependencies must match the target architecture.
+
+The renderer normally uses Vulkan 1.3 dynamic rendering, or `VK_KHR_dynamic_rendering` on Vulkan
+1.1 / 1.2. Devices without that feature automatically use classic render passes. This allows older
+Vulkan 1.1 / 1.2 drivers, including the AMD Radeon R5 with driver 21.5.2, to start.
+
+Intel GPUs on Windows with a driver older than **101.2121** also use render passes, even when the
+driver advertises dynamic rendering. Issue #144 crashes inside Intel's 101.2115 driver during an
+MRT pass. The cutoff is conservatively the next legacy-driver release after that failing version;
+**101.2121 is not a confirmed fix**. Intel's [101.2121 release discussion](https://community.intel.com/t5/Graphics/Version-31-0-101-2121-Graphics-Driver/td-p/1479202)
+establishes that release, but does not document a fix for this crash. This rule applies to Windows
+only; Intel Mesa drivers on Linux keep the normal capability-based selection.
+
+For testing, set `WWHD_VK_FORCE_RENDERPASS=1` to force render passes on any supported device, or
+`WWHD_VK_FORCE_RENDERPASS=0` to bypass automatic fallback and require dynamic rendering. With `=0`,
+a device without dynamic rendering cannot start. Unset the variable to restore automatic selection.
+The startup log and GPU report name the selected path and its reason. Render-pass mode uses a
+separate on-disk pipeline cache with a `-rp` suffix; switching paths does not discard either cache.
+With `WWHD_VK_STATS=1`, fallback diagnostics also report framebuffers created per frame.
 
 The executable imports no Vulkan functions (`VK_NO_PROTOTYPES`): `gfx/vulkan/loader.h` loads them
 at run time through the loader's `vkGetInstanceProcAddr` / `vkGetDeviceProcAddr` (SDL host:
@@ -200,7 +217,8 @@ To enable Khronos validation, install the Vulkan validation layers and set
 Test aids for older drivers: `WWHD_VK_FORCE_API=1.2` (or `1.1`) makes the renderer treat every GPU as
 if it reported that Vulkan version, so a Vulkan 1.3 GPU takes the `VK_KHR_dynamic_rendering` path;
 `WWHD_VK_HIDE_EXTENSIONS=VK_KHR_dynamic_rendering` (comma-separated names) hides device extensions,
-which together with `WWHD_VK_FORCE_API=1.2` shows the "missing features" error.
+which together with `WWHD_VK_FORCE_API=1.2` automatically selects classic render passes. Add
+`WWHD_VK_FORCE_RENDERPASS=0` to verify the error for explicitly requiring unavailable dynamic rendering.
 If the loader does not discover MoltenVK, set `VK_DRIVER_FILES` to its installed
 `MoltenVK_icd.json` (Homebrew places it below `$(brew --prefix molten-vk)/etc/vulkan/icd.d`).
 

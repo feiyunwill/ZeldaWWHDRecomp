@@ -5,6 +5,7 @@
 #include "overlay/hostui.h"
 #include <cassert>
 #include <cstdlib>
+#include <cmath>
 #include <map>
 #include <string>
 
@@ -31,6 +32,15 @@ void set_fast_forward_rate(unsigned r) { if (r >= 2 && r <= 4) ff_rate = r; }
 uint32_t fast_forward_button() { return ff_button; }
 void set_fast_forward_button(uint32_t b) { if (valid_fast_forward_button(b)) ff_button = b; }
 bool fast_forward_mute() { return ff_mute; } void set_fast_forward_mute(bool on) { ff_mute = on; }
+
+static bool lock_on_enabled = false, lock_on_cycle = true;
+static float lock_on_multiplier = 1.f;
+bool extended_lock_on() { return lock_on_enabled; }
+void set_extended_lock_on(bool on) { lock_on_enabled = on; }
+float lock_on_range() { return lock_on_multiplier; }
+void set_lock_on_range(float f) { if (std::isfinite(f) && f >= 1 && f <= 3) lock_on_multiplier = f; }
+bool lock_on_cycling() { return lock_on_cycle; }
+void set_lock_on_cycling(bool on) { lock_on_cycle = on; }
 
 static bool move_on = false;
 static float move_land = 1.5f, move_swim = 1.25f, move_seconds = 5.f, move_cooldown = 3.f;
@@ -75,8 +85,12 @@ int main() {
     for(const auto& entry:entries()) env(entry.startup_env,nullptr);
     env("WWHD_MOD_CAMERA_SPEED",nullptr);env("WWHD_MOD_MOUSE_SENS",nullptr);
     env("WWHD_MOD_MOVE_FACTOR",nullptr);env("WWHD_MOD_MOVE_SWIM",nullptr);env("WWHD_MOD_MOVE_STAMINA",nullptr);
-    assert(entries().size()==13);
+    assert(entries().size()==14);
     for(const auto& option:traversal_options()) env(option.startup_env,nullptr);
+    env("WWHD_MOD_LOCK_ON_RANGE",nullptr);env("WWHD_MOD_LOCK_ON_CYCLING",nullptr);
+    assert(find("lock-on") && std::string(find("lock-on")->name)=="Extended enemy lock-on");
+    assert(std::string(find("lock-on")->category)=="Gameplay");
+    assert(!mods::extended_lock_on() && mods::lock_on_range()==1.f && mods::lock_on_cycling());
     load_saved(); for(bool on:state) assert(!on); // stock defaults stay off
     assert(!mods::ladder_speed() && !mods::sidle_speed() && !mods::sail_speed() && !mods::auto_wind());
     preferences["mod.wall-climb.enabled"]="1";
@@ -151,6 +165,25 @@ int main() {
     env("WWHD_MOD_LADDER_FACTOR","1");preferences["mod.ladder-speed.factor"]="3";
     load_saved(); assert(mods::ladder_speed_factor()==2.5f);  // the environment owns startup values
     env("WWHD_MOD_LADDER_FACTOR",nullptr);
+    preferences["mod.lock-on.enabled"]="1";
+    preferences["mod.lock-on.range"]="2.5";
+    preferences["mod.lock-on.cycling"]="0";
+    load_saved();
+    assert(mods::extended_lock_on() && mods::lock_on_range()==2.5f && !mods::lock_on_cycling());
+    for (const char* invalid : {"nan", "inf", "-inf", "0.9", "3.1", "2junk", ""}) {
+        preferences["mod.lock-on.range"]=invalid;load_saved();assert(mods::lock_on_range()==2.5f);
+    }
+    preferences["mod.lock-on.range"]="3";preferences["mod.lock-on.cycling"]="invalid";
+    load_saved();assert(mods::lock_on_range()==3.f && !mods::lock_on_cycling());
+    preferences["mod.lock-on.range"]="1";preferences["mod.lock-on.cycling"]="1";
+    mods::set_extended_lock_on(false);
+    env("WWHD_MOD_LOCK_ON","0");env("WWHD_MOD_LOCK_ON_RANGE","2");env("WWHD_MOD_LOCK_ON_CYCLING","0");
+    load_saved();assert(!mods::extended_lock_on() && mods::lock_on_range()==3.f && !mods::lock_on_cycling());
+    env("WWHD_MOD_LOCK_ON",nullptr);env("WWHD_MOD_LOCK_ON_RANGE",nullptr);env("WWHD_MOD_LOCK_ON_CYCLING",nullptr);
+    load_saved();assert(mods::extended_lock_on() && mods::lock_on_range()==1.f && mods::lock_on_cycling());
+    assert(set_enabled("lock-on",false));assert(preferences["mod.lock-on.enabled"]=="0");
+    assert(set_enabled("lock-on",true));disable_all();assert(!mods::extended_lock_on());
+    assert(mods::lock_on_range()==1.f && mods::lock_on_cycling());
     // Test isolation protects player settings even when toggles are exercised.
     env("WWHD_NO_HOST_INPUT","1");prior=reads;load_saved();assert(reads==prior);
     prior=writes;assert(set_enabled("quick-doors",true));assert(state[4]);assert(writes==prior);

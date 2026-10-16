@@ -57,6 +57,8 @@ struct Takeover {
     uint8_t reward = 0;  // a rupee item (0x01..0x06) or 0
     Availability when;   // the step's prerequisites (checked by the caller with the save's state)
     bool follow = true;  // the chart's marks follow the resident while it is loaded (manifest "follow")
+    std::string chart_mod, chart;  // "then": {"give": "chart:<id>"}: the mod chart the talk gives Link
+    std::string item;              // "then": {"give": "item:<id>"}: one of the mod's items (story_items.h), the mod is chart_mod's
 };
 
 inline bool carries(const story_mail::Book& b, uint16_t quest) { return b.get(kRecordCarried, quest) == 1; }

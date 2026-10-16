@@ -34,7 +34,8 @@ namespace interp { void set_mode(int){} uint64_t logic_steps(){return 0;} }
 namespace timebase { uint64_t now(){return 0;} }
 namespace true60 { uint64_t link_steps(){return 0;} bool state_loaded(){return false;} }  // test scenario clock (input_sdl.cpp)
 namespace true60_test { void set_origin_step(uint64_t){} void tick(double,bool){} }
-namespace mods { void fast_forward_reset(){} }  // fast forward (mods/fast_forward.cpp): releases the hold on focus loss
+static int lockOnResets=0;
+namespace mods { void fast_forward_reset(){} void lock_on_reset(){++lockOnResets;} }  // mods: release required on focus loss
 void log_msg(const char*,...){}
 // settings overlay: closed (keys reach the game and its shortcuts as before); the game's text prompt
 // (overlay/text_entry.h) shows while promptShown: overlay::key takes every key then, as the real one does
@@ -153,7 +154,9 @@ int main(int argc,char** argv){
  key(SDL_SCANCODE_W,true);assert(input::read().ly==1);
  key(SDL_SCANCODE_D,true);assert(input::read().lx>0.7f&&input::read().lx<0.71f);
  key(SDL_SCANCODE_LSHIFT,true);assert(input::read().buttons&input::kZL);
+ const int resetsBeforeFocus=lockOnResets;
  SDL_Event focus{};focus.type=SDL_EVENT_WINDOW_FOCUS_LOST;input::handle_event(focus);assert(input::read().buttons==0&&input::read().lx==0);
+ assert(lockOnResets==resetsBeforeFocus+1);
  auto map=input_map::Mapping::defaults();map.keys[input_map::kA]={input_map::key_from_id("J"),input_map::kNoKey};map.keys[input_map::kB]={input_map::kNoKey,input_map::kNoKey};input_map::set_current(map,false);
  key(SDL_SCANCODE_J,true);assert(input::read().buttons==input::kA);
  input::set_touch(true,0.25f,0.75f);auto pad=input::read();assert(pad.touch&&pad.tx==0.25f&&pad.ty==0.75f);

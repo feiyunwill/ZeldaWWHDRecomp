@@ -32,6 +32,8 @@
             <meta-data android:name="android.support.FILE_PROVIDER_PATHS"
                 android:resource="@xml/crash_share_paths" />
         </provider>
+        <!-- Keep our renderer's resolution and frame pacing in every system game mode. -->
+        <meta-data android:name="android.game_mode_config" android:resource="@xml/game_mode_config" />
         <!-- lets simpleperf (NDK) profile the release build from adb shell -->
         <profileable android:shell="true" />
 

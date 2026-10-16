@@ -61,6 +61,12 @@ struct Features {
     bool file_picker = true;  // file and folder choosers (Mods: install from a file, the GameCube game)
     bool screenshots = true;  // the Screenshots section of Saves
     bool full_states = true;  // full save states and Crash Recovery's automatic states (both are full states)
+    bool code_mods = true;    // code mods (Mods > More > Code-mod support); without: that section is left out and
+                              // a catalogue code mod says it can't run on this platform
+    bool mod_downloads = true;  // the online mod list (Mod list settings, mods available to download, the Story
+                                // Notebook download); without: only the mods already in the mods folder
+    bool speaker_choice = true; // Audio: the Speakers choice (stereo / surround 5.1); without: the host's output as is
+    bool keyboard = true;       // keyboard and mouse hints (Saves, Language / About); without: the controller's only
 };
 void set_features(const Features& features);
 const Features& features();  // any thread

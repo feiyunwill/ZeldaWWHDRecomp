@@ -267,6 +267,7 @@ void filter_pad(input::PadState& s) {
         }
     }
     if (now >= g_r3_from && now < g_r3_to) s.buttons |= input::kStickR;
+    lock_on_filter_pad(s);
 }
 
 }  // namespace mods

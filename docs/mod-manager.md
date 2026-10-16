@@ -38,7 +38,7 @@ mod's page), the *Experimental* tag where it applies and a one-word status (*On*
 *Restart to apply*, *Update available*, *Error*).
 
 - **Built-in** ("Included with the game. Switch on or off any time."): the mods compiled
-  into the game: direct camera, mouse camera, first-person shortcut, wall climbing,
+  into the game: direct camera, mouse camera, first-person shortcut, extended enemy lock-on, wall climbing,
   run/swim speed, faster ladders, faster sidling, sailing speed, automatic wind, quick
   doors, fast forward and fast scene changes; all off by default.
 - **Community** ("Made by players. Downloaded from the mod catalogue."): every installed
@@ -95,6 +95,16 @@ switched on or off, and the top of Mods says "Restart to apply: … ." with **Re
 now** (on Android: close and reopen the app). There is one restart offer at a time:
 the end of an install and the page of a mod that is off but still loaded offer
 their own instead, and switching mods does not open a popup.
+
+### Extended enemy lock-on
+
+**Extended enemy lock-on** is off by default. Switch it on in **Mods > Built-in**
+to adjust **Enemy lock-on range** from **1x to 3x** (default **1x**). Only enemy
+horizontal targeting distances change; the game's eligibility rules and NPC
+interactions stay unchanged. **Cycle enemy targets with R3** is on by default:
+press R3 while locked onto an enemy to select the next eligible enemy. With no
+alternative target, the lock stays unchanged. Switching the mod off restores
+original targeting behavior.
 
 Run/swim speed offers three animation choices. **Native** keeps the game's cycle with the boosted
 cadence. **Dash instead of walk** replaces the low-speed walk portion; the normal full-speed run

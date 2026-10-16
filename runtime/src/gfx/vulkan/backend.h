@@ -1,4 +1,5 @@
 #pragma once
+#include "vertex_format_policy.h"
 #include "loader.h"
 #include "barrier_state.h"
 #ifdef WWHD_SDL_HOST
@@ -35,6 +36,7 @@ struct Surface {
  std::unordered_map<uint32_t,VkImageView> sampledViews;
  uint32_t addr=0,mipAddr=0,width=0,height=0,slices=1,pitch=0,mips=1,format=0,dim=1,tileMode=0,swizzle=0;
  bool isDepth=false,gpuWritten=false,dirty=true,bcDecoded=false;
+ bool linearFiltering=false; // device capability for the actual optimal-tiling image format
  uint64_t writeSeq=0,contentHash=0,lastCheckedFrame=~0ull,sparseHash=0;
  bool formatViews=false; // another surface at this address has the same texel bits in another format (adopt_newer_alias)
  uint64_t writtenBackSeq=0; // writeSeq when last written back to guest memory (linear surfaces, write_back_linear_targets)
@@ -83,6 +85,7 @@ struct GpuScopeToken { uint64_t generation=0; uint32_t index=UINT32_MAX; };
 inline constexpr std::array<const char*,9> secondaryStageNames{
  "acquire", "acquire_wait", "ready_fd", "record", "submit", "draw_wait", "returned_fd", "present", "primary_snapshot_record"};
 struct Renderer {
+ vk::VertexFormatPolicy vertexFormats;
  VkInstance instance=VK_NULL_HANDLE; VkPhysicalDevice physicalDevice=VK_NULL_HANDLE; VkDevice device=VK_NULL_HANDLE;
  std::unordered_map<VkFormat,VkFormatProperties> formatProperties;
  VkPhysicalDeviceFeatures enabledFeatures{};
@@ -111,6 +114,8 @@ struct Renderer {
  bool secondaryPresentFences=false; // Android: optional swapchain-maintenance presentation retirement
  std::atomic<uint64_t> secondaryIdleWaits{0},secondaryRetired{0},secondaryRetirementPending{0};
  bool dynamicRenderingKHR=false; // VK_KHR_dynamic_rendering (device older than Vulkan 1.3)
+ bool renderPasses=false;
+ const char* renderingReason="not initialized";
  bool portabilitySubset=false,imageViewSwizzle=true,imageViewReinterpretation=true;
  bool attachmentViewUsage=false; // attachment views name their usage (issue #144: Intel; WWHD_VK_ATTACHMENT_VIEW_USAGE)
  bool imageView2DOn3DImage=true; // 2D views of volume slices (render targets); core Vulkan 1.1, optional in the portability subset
@@ -165,6 +170,7 @@ struct Renderer {
  uint64_t vertexReuseChecks=0,vertexReuseHits=0,vertexReuseBytes=0,vertexReuseCompareNs=0;
  std::vector<std::function<void()>> completions;
  std::vector<Buffer> garbageBuffers;
+ std::vector<VkFramebuffer> garbageFramebuffers;
  std::vector<bufcache::Region> garbageCacheRegions; // buffer cache regions replaced while recording
  struct RetiredImage { VkImage image;VkDeviceMemory memory;std::vector<VkImageView> views; }; std::vector<RetiredImage> garbageImages;
  // Each submission retains its pools, upload bytes and deferred objects until
@@ -189,6 +195,7 @@ struct Renderer {
   std::vector<UploadBlock> uploadBlocks;
   std::vector<std::function<void()>> completions;
   std::vector<Buffer> garbageBuffers;
+  std::vector<VkFramebuffer> garbageFramebuffers;
   std::vector<RetiredImage> garbageImages;
   std::vector<bufcache::Region> garbageCacheRegions;
  };

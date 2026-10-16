@@ -60,11 +60,25 @@ void say(uint32_t number, const std::u16string* text);
 void unsay();
 bool said();     // the armed line was looked up for display (its text replaced)
 bool can_say();  // the hooks are installed and have text buffers: say() can work
+// A caption the game sets from a message (the MAP screen's chart name): while armed, the message
+// `number` shows `text` (kept alive by the caller); uncaption() ends it. Armed only around the game
+// call that sets the caption.
+void caption(uint32_t number, const std::u16string* text);
+void uncaption();
+
+// A get-item message (0x65 + the item number) with the port's text, for a mod item handed out with a
+// game item's get demo (story_treasure_chest.cpp): while armed, the message `number` shows `text` (kept
+// alive by the caller); null ends it. Shares the notebook's slot: false while the notebook is being
+// handed out, or without the hooks.
+bool item_get_text(uint32_t number, const std::u16string* text);
 
 // guest memory for replaced message texts (host-only, at least 6 KiB), before install()
 void set_text_buffers(uint32_t guest, uint32_t bytes);
 // game code called from the hooks (guestmods::call_original / guest_call in the game)
 void set_game_calls(void (*original)(Cpu*, uint32_t), uint32_t (*call)(Cpu*, uint32_t, std::initializer_list<uint32_t>));
+// execItemGet for items that aren't the notebook's stand-in: the mod items' handler (story_items.h),
+// which runs the game's own function for the game's numbers. Null: the game's function.
+void set_item_get_next(void (*next)(Cpu*));
 
 // The hooks, exposed for runtime/tools/story_mail_test.cpp
 namespace hooks {

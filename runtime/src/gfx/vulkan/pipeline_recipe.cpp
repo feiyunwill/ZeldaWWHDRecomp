@@ -104,14 +104,14 @@ struct Parts {
   std::vector<VkPipelineColorBlendAttachmentState> attachments;
   std::vector<VkDynamicState> dynamics;
   Parts() = default;
-  explicit Parts(const VkGraphicsPipelineCreateInfo* ci) {
+  explicit Parts(const VkGraphicsPipelineCreateInfo* ci, const VkPipelineRenderingCreateInfo& targets) {
     // The persisted guest schema has dynamic viewports/scissors and mandatory
     // depth/dynamic structures. Utility snapshots are not guest recipes.
     if (!ci->pDepthStencilState || !ci->pDynamicState ||
         ci->pViewportState->pViewports || ci->pViewportState->pScissors ||
         ci->pMultisampleState->pSampleMask)
       throw std::runtime_error("unsupported guest recipe state");
-    rendering = *static_cast<const VkPipelineRenderingCreateInfo*>(ci->pNext);
+    rendering = targets;
     vertex = *ci->pVertexInputState; assembly = *ci->pInputAssemblyState;
     viewport = *ci->pViewportState; raster = *ci->pRasterizationState;
     multi = *ci->pMultisampleState; depth = *ci->pDepthStencilState;
@@ -230,7 +230,7 @@ template<class A> void recipe_fields(A& a, PipelineRecipe& recipe, Parts& parts,
 }
 std::vector<uint8_t> encode_pipeline_fixed_state(const GraphicsPipelineState& state) {
   auto snapshot = state;
-  Parts parts(snapshot.get());
+  Parts parts(snapshot.get(), snapshot.rendering_targets());
   Writer out;
   out.scalar(snapshot.get()->flags);
   out.scalar(snapshot.get()->pVertexInputState->flags);
@@ -242,7 +242,7 @@ std::vector<uint8_t> encode_pipeline_recipe(PipelineRecipe& recipe) {
   // get() rebinds internal pointers. Keep serialization read-only with respect
   // to a recipe also held by the recorder/startup map.
   auto snapshot = *recipe.state;
-  Parts parts(snapshot.get());
+  Parts parts(snapshot.get(), snapshot.rendering_targets());
   Writer out; recipe_fields(out, recipe, parts); return std::move(out.bytes);
 }
 std::shared_ptr<PipelineRecipe> decode_pipeline_recipe(const std::vector<uint8_t>& bytes) {

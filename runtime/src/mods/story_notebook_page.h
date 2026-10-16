@@ -51,6 +51,7 @@ struct PadInput {
     bool touch = false;
     float x = 0, y = 0;
 };
+inline constexpr uint32_t kPadX = 0x2000;
 inline constexpr uint32_t kPadA = 0x8000, kPadB = 0x4000, kPadUp = 0x0200, kPadDown = 0x0100, kPadLeft = 0x0800, kPadRight = 0x0400;
 
 // page geometry (1280 x 720)
@@ -132,6 +133,23 @@ inline std::vector<std::string> wrap(const std::string& text, float size, float 
     return out;
 }
 
+// what a finished quest's detail says (under "Finished", with no Where)
+inline constexpr const char* kFinished = "All steps done.";
+
+// Whether a quest's detail offers "Show on chart" / "Stop showing": not for a done quest, nor for one
+// whose current step has no place (a quest not started yet: step 1's); a tracked one can always be untracked.
+inline bool trackable(const Row& r) { return r.status != Status::Done && (r.quest->has_place || r.tracked); }
+
+// The detail's "Where" text. A quest not started yet names step 1's place, marked as not started.
+inline std::string where_text(const Row& r) {
+    const Quest& q = *r.quest;
+    if (r.status == Status::New || r.status == Status::NotAvailable) {
+        if (!q.where.empty()) return "Not started yet: " + q.where;
+        if (q.has_place) return "Not started yet: marked on the sea chart.";
+    }
+    return q.where.empty() ? std::string(q.has_place ? "Marked on the sea chart." : "This step has no place on the chart.") : q.where;
+}
+
 inline const char* status_text(Status s) {
     switch (s) {
     case Status::InProgress: return "In progress";
@@ -181,6 +199,7 @@ struct Scene {
     bool framed = false;      // the painted frame and row banners are loaded (story_notebook_art.h)
     bool pieces = false;      // the detail page's painted pieces (sheet, bands, chart card, plates)
     bool header = false;      // the header band (optional)
+    bool close_in_detail = false;  // the detail page shows the close button (the page drawn as a game layout)
     bool link_known = false;  // Link's place on the sea chart
     float link_x = 0, link_z = 0;
 };
@@ -195,8 +214,8 @@ class Page {
 public:
     enum class Mode : uint8_t { Closed, List, Detail };
     struct Action {
-        enum Kind : uint8_t { None, Close, Toggle } kind = None;
-        uint16_t key = 0;  // Toggle: the quest
+        enum Kind : uint8_t { None, Close, Toggle, OpenChart } kind = None;
+        uint16_t key = 0;  // Toggle, OpenChart: the quest
         Sound sound = Sound::None;
     };
 
@@ -362,11 +381,18 @@ public:
                 return act;
             }
             const Row& r = rows[size_t(index)];
-            const bool trackable = r.status != Status::Done;
+            const bool trackable = ::story_notebook::trackable(r);
             const Geo g = geo();
             const bool back_tap = tap && g.back.in(pad.x, pad.y);
             const bool track_tap = tap && g.track.in(pad.x, pad.y);
-            if (tap && hit_close(pad.x, pad.y)) {
+            const bool chart_tap = tap && !r.quest->chart.empty() && chart_plate(g).in(pad.x, pad.y);
+            if (!r.quest->chart.empty() && r.status != Status::Done && ((pressed & kPadX) || chart_tap)) {
+                // the step's chart in the MAP screen's chart list: the page closes, the map opens
+                hide();
+                act.kind = Action::OpenChart;
+                act.key = r.quest->key;
+                act.sound = Sound::Decide;
+            } else if (tap && hit_close(pad.x, pad.y)) {
                 hide();
                 act.kind = Action::Close;
                 act.sound = Sound::Close;
@@ -469,7 +495,8 @@ private:
     }
     static bool inside(float x, float y, float rx, float ry, float rw, float rh) { return x >= rx && x < rx + rw && y >= ry && y < ry + rh; }
     bool hit_close(float x, float y) const {
-        if (mode_ == Mode::Detail && scene_.framed && scene_.pieces) return false;  // the slot is under the header band there
+        // the HUD's detail page has the slot under its header band; the layout's shows the close button
+        if (mode_ == Mode::Detail && scene_.framed && scene_.pieces && !scene_.close_in_detail) return false;
         const Geo g = geo();
         return (x - g.close_x) * (x - g.close_x) + (y - g.close_y) * (y - g.close_y) <= (g.close_r + 8) * (g.close_r + 8);
     }
@@ -530,6 +557,25 @@ private:
         prompt(out, x + (w - width) / 2, y + (h - size) / 2, a, what, 1.0f, size);
         press(out, from, x + w / 2, y + h / 2, press_scale(a ? press_a_ : press_b_));
         if (on) cursor(out, x, y, w, h);
+    }
+    // "Open chart" (X, or a tap): between the Back and the track plates, else above the track plate
+    static Box chart_plate(const Geo& g) {
+        const float gap = 16, x = g.back.x + g.back.w + gap, w = g.track.x - gap - x;
+        if (w >= 200) return {x, g.track.y, w, g.track.h};
+        return {g.track.x, g.track.y - g.track.h - 10, g.track.w, g.track.h};
+    }
+    void open_chart_plate(std::vector<Command>& out, const Row& r) const {
+        if (r.quest->chart.empty() || r.status == Status::Done) return;
+        const Box b = chart_plate(geo());
+        out.push_back(box("nb:plate", b.x, b.y, b.w, b.h));
+        const float size = std::min(30.0f, b.h * 0.55f), width = size + 8 + text_width(bold("Open chart"), size * 0.8f) + 40;
+        float x = b.x + (b.w - width) / 2;
+        const float cy = b.y + b.h / 2;
+        out.push_back(circle(x + size / 2, cy, size / 2, 0x3A3A3AFF, true));  // the X button
+        out.push_back(text(x + size / 2 - text_width(bold("X"), size * 0.6f) / 2, cy - size * 0.32f, size * 0.6f, kWhite, bold("X")));
+        x += size + 8;
+        out.push_back(text(x, cy - size * 0.42f, size * 0.8f, kInk, bold("Open chart")));
+        chart_scroll(out, x + text_width(bold("Open chart"), size * 0.8f) + 8, cy - 13, 30, 26);
     }
     // the game's cursor: four corner brackets around what A acts on, breathing in and out
     void cursor(std::vector<Command>& out, float x, float y, float w, float h) const {
@@ -679,12 +725,13 @@ private:
             y += 7;
         };
         if (r.status == Status::Done) {
-            section("The story", "Done. The story is told.", 1);
+            section("Finished", kFinished, 1);
         } else if (r.status == Status::NotAvailable) {
             section("Not yet available", q.condition, 2);
         } else {
             section("Next step", q.next.empty() ? std::string("(not written down yet)") : q.next, 2);
-            section("Where", q.has_place ? (q.where.empty() ? std::string("Marked on the sea chart when you show it there.") : q.where)
+            if (r.status == Status::New) section("Where", where_text(r), 1);
+            else section("Where", q.has_place ? (q.where.empty() ? std::string("Marked on the sea chart when you show it there.") : q.where)
                                          : (q.where.empty() ? std::string("This step has no place on the chart.")
                                                             : q.where + " (this step has no place on the chart)"),
                     1);
@@ -694,11 +741,12 @@ private:
         if (!q.reward.empty()) section("Reward", q.reward, 1);
         // plates: Back (B) and Show on chart (A); the cursor is on what A does
         plate(out, kBackX, kBackY, kBackW, kBackH, false, false, "Back");
-        if (r.status != Status::Done) {
+        if (trackable(r)) {
             plate(out, kTrackX, kTrackY, kTrackW, kTrackH, true, true, r.tracked ? "Stop showing on chart" : "Show on chart");
             if (r.tracked && !q.has_place)
                 out.push_back(text(kTrackX, kTrackY - 30, 19, kInkSoft, "No place on the chart for this step"));
         }
+        open_chart_plate(out, r);
     }
 
     // ---- the painted frame (story_notebook_art.h) ----
@@ -880,17 +928,20 @@ private:
         if (r.status == Status::InProgress && now >= 2 && now - 2 < q.steps.size() && !q.steps[now - 2].empty())
             out.push_back(text(pcx - pr, pcy + pr + 4, 17, kInkLight, fit("Done: " + q.steps[now - 2], 17, uline.w)));
         // the three bands: what to do next, where, the reward
-        const char* heads[3] = {"Next step", "Where", "Reward"};
+        // a finished quest: "Finished" with no Where
+        const bool done = r.status == Status::Done;
+        const char* heads[3] = {done ? "Finished" : "Next step", "Where", "Reward"};
         const uint32_t colours[3] = {0xC0392BFF, 0x1F6FB2FF, 0x3A8A2AFF};
         std::string bodies[3];
-        if (r.status == Status::Done) bodies[0] = "Done. The story is told.";
+        if (done) bodies[0] = kFinished;
         else if (r.status == Status::NotAvailable) bodies[0] = "Not yet available: " + q.condition;
         else if (!q.hint.empty()) bodies[0] = q.hint + (q.next.empty() ? std::string() : " " + q.next);
         else bodies[0] = q.next.empty() ? std::string("(not written down yet)") : q.next;
         if (q.hint.rfind("Not yet possible", 0) == 0 && !q.next.empty()) bodies[0] = q.next + "\n" + q.hint;
-        bodies[1] = q.where.empty() ? std::string(q.has_place ? "Marked on the sea chart." : "This step has no place on the chart.") : q.where;
+        bodies[1] = where_text(r);
         bodies[2] = q.reward.empty() ? std::string("(none named)") : r.status == Status::Done ? q.reward + " (received)" : q.reward;
         for (int i = 0; i < 3; i++) {
+            if (done && i == 1) continue;
             const Box b = frame_part(d::kBands[i]);
             icon(out, i == 0 ? 0 : i == 1 ? 1 : 2, b.x - 4, b.y - 28, 22, colours[i]);
             out.push_back(text(b.x + 24, b.y - 28, 21, colours[i], bold(heads[i])));
@@ -925,10 +976,11 @@ private:
         const Geo g = geo();  // over the frame's own painted plates
         const Box bl = g.back, br = g.track;
         plate_piece(out, bl, false, "Back");
-        if (r.status != Status::Done) {
+        if (trackable(r)) {
             plate_piece(out, br, true, r.tracked ? "Stop showing" : "Show on chart", true);
             cursor(out, br.x + 2, br.y + 2, br.w - 4, br.h - 4);
         }
+        open_chart_plate(out, r);
     }
     // a painted plate (its own picture over the frame's, so it can be pressed) with its prompt
     void plate_piece(std::vector<Command>& out, const Box& b, bool a, const char* what, bool scroll = false) const {
@@ -1023,12 +1075,12 @@ private:
             y += 14;
         };
         if (r.status == Status::Done) {
-            section(3, 0x7A5E3AFF, 0xEDE2C455, "The story", "Done. The story is told.", 1);
+            section(3, 0x7A5E3AFF, 0xEDE2C455, "Finished", kFinished, 1);
         } else if (r.status == Status::NotAvailable) {
             section(0, 0xC0661EFF, 0xF7D9A855, "Not yet available", q.condition, 2);
         } else {
             section(0, 0xC0392BFF, 0xF7E3B580, "Next step", q.next.empty() ? std::string("(not written down yet)") : q.next, 2);
-            section(1, 0x1F6FB2FF, 0xD8E8EE90, "Where", q.where.empty() ? std::string(q.has_place ? "Marked on the sea chart." : "This step has no place on the chart.") : q.where, 1);
+            section(1, 0x1F6FB2FF, 0xD8E8EE90, "Where", where_text(r), 1);
         }
         if (!q.hint.empty() && r.status != Status::Done) section(0, 0xC0661EFF, 0xF7D9A870, "To continue", q.hint, 1);
         if (!q.reward.empty()) section(2, 0x3A8A2AFF, 0xDCEFCB90, "Reward", q.reward, 1);
@@ -1047,10 +1099,11 @@ private:
         mini_chart(out, q, rx, py + ph + 10, 312, 300);
         // plates: Back (B) and Show on chart (A); the cursor is on what A does
         plate_label(out, g.back, false, "Back");
-        if (r.status != Status::Done) {
+        if (trackable(r)) {
             plate_label(out, g.track, true, r.tracked ? "Stop showing" : "Show on chart", true);
             cursor(out, g.track.x + 4, g.track.y + 4, g.track.w - 8, g.track.h - 8);
         }
+        open_chart_plate(out, r);
     }
 
     // The mini sea chart: the chart's 7 x 7 squares on a torn chart paper, the step's place glowing,

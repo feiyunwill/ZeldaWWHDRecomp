@@ -1,5 +1,6 @@
 #include "mods/fast_forward.h"
 #include "mods/story_store.h"
+#include "mods/mods.h"
 // Save states: snapshot the whole running game into one of 5 slots and restore it, also in a new
 // process.
 //
@@ -58,10 +59,12 @@
 
 #include "runtime.h"
 #include "build_info.h"
+#include "controller_reapply.h"
 #include "crashrec.h"
 #include "portable_state.h"
 #include "state_memory.h"
 #include "mods/guest_mods.h"
+#include "mods/mods.h"
 #include "mods/guest_state_section.h"
 #include "mods/story_chart.h"
 #include "quit_prompt.h"
@@ -465,6 +468,7 @@ std::string area_label(const char* stage) {
 // true when done (saved or failed for good); false to retry on the next frame
 bool do_save(int slot) {
     mods::fast_forward_reset();
+    mods::lock_on_reset();
     std::string busy, why;
     auto t0 = std::chrono::steady_clock::now();
     if (!threads::quiesce(250, busy, 1, 30)) {
@@ -555,6 +559,7 @@ bool do_save(int slot) {
 
 bool do_load(const std::shared_ptr<Snapshot>& s) {
     mods::fast_forward_reset();
+    mods::lock_on_reset();
     std::string busy, why;
     auto t0 = std::chrono::steady_clock::now();
     threads_ss_targets(s->section(kSecThreads));
@@ -582,8 +587,7 @@ bool do_load(const std::shared_ptr<Snapshot>& s) {
         message("%s: cannot load here (%s)", slot_label(s->slot).c_str(), why.c_str());
         return true;
     }
-    restore_memory(*s);
-    if (s->h.controller) input::set_pro_controller(restored_pro_controller(s->h.controller, input::pro_controller()));
+    restore_memory(*s);  // the host's controller choice stays (controller_reapply: the game follows it)
     Reader r = s->section(kSecAllocs);
     mem::raise_runtime_top(r.u32());
     r = s->section(kSecHeaps);
@@ -608,6 +612,7 @@ bool do_load(const std::shared_ptr<Snapshot>& s) {
     message("Loaded %s%s", is_auto(s->slot) ? slot_label(s->slot).c_str() : ("slot " + std::to_string(s->slot)).c_str(), area.c_str());
     append_mod_warning(mods_differ);
     LOG("[savestate] slot %d: restored in %.1f ms", s->slot, ms);
+    controller_reapply::request("full load");
     return true;
 }
 
@@ -912,7 +917,7 @@ bool apply_portable(Cpu* c, const pstate::State& s, std::string& why, bool& retr
     st8(kNextStage + 10, (uint8_t)s.room);
     st8(kNextStage + 11, (uint8_t)s.layer);
     st8(kNextStage + 13, 0);  // wipe: fade
-    if (s.controller) input::set_pro_controller(restored_pro_controller(s.controller, input::pro_controller()));
+    mods::moon_jump_reset();
     st8(kNextStage + 12, 1);  // enabled
     return true;
 }
@@ -964,6 +969,7 @@ std::string g_last_portable;      // newest portable state written or loaded (un
 struct Arrival { std::string stage; float pos[3]; uint64_t frame = 0; uint32_t link_id = 0; int frames = 0; std::shared_ptr<pstate::State> s; } g_arrival;
 
 void do_portable_save(Cpu* c, int slot) {
+    mods::lock_on_reset();
     pstate::State s;
     std::string why;
     bool retry;
@@ -1019,6 +1025,7 @@ void service_portable_load(Cpu* c) {
         p = g_pload;
     }
     if (!p.s) return;
+    mods::lock_on_reset();
     std::string why;
     bool retry = false;
     const uint32_t sv0 = ld32(kSaveInfoPtr);
@@ -1088,6 +1095,7 @@ void watch_arrival(Cpu* c) {
         }
     }
     g_arrival = Arrival{};
+    controller_reapply::request("progress load");
 }
 
 // full states: the setting, the environment and the scripted tests
@@ -1401,6 +1409,8 @@ void service(Cpu* c) {
     if (int slot = g_psave_req.exchange(0)) do_portable_save(c, slot);
     service_portable_load(c);
     watch_arrival(c);
+    controller_reapply::service(c);
+    guestmods::service(c);  // story layouts dropped by a load: built for the loaded item screen
     // test aid: WWHD_STATE_DUMP=n dumps the n TV frames after each save/load (state_<save|load><slot>_<k>.png)
     static const int dump = getenv("WWHD_STATE_DUMP") ? atoi(getenv("WWHD_STATE_DUMP")) : 0;
     if (int slot = g_save_req.load()) {

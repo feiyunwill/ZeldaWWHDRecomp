@@ -7,6 +7,98 @@ what is on `devel` and not released yet (also in the
 
 ## Next update
 
+## v0.3.0
+
+- **Controls: Xbox and PlayStation button prompts also with "By position"** (issue #209, thanks @jamescastells):
+  with the Nintendo button layout on an Xbox or PlayStation controller, the game's button icons now show the button
+  that is physically in that place (for example the roll as a red B and the sword as a green A on an Xbox pad).
+  Custom face-button mappings show the buttons they are bound to. The settings' help texts now explain the two
+  options more clearly. "By label" and "Original" look as before.
+
+- **Vulkan: a fallback for GPUs without 3-part vertex formats** (issue #207, Pixel 10 Pro with a PowerVR GPU): some
+  GPUs can't read three-component vertex data directly, which showed as "exploded" shapes and a black screen. The
+  game now checks this at start and reads such data in two parts on those GPUs. Every other GPU keeps exactly the
+  same shaders and caches as before.
+
+- **Fixed: loading a save state switched the controller back** to the one the state was made with (for example a
+  GamePad state loaded while playing with a Pro Controller). Save states now keep your current controller, and the
+  game follows it right away, without any menus: after loading a full state, or after switching the controller in
+  the Input menu during play, Link moves with the controller you use and the button prompts match.
+- **Fixed: after loading a save state, story mod pages fell back to their plain look** (for example the Story
+  Notebook's page). Their layouts are now built again right after the load.
+
+- **Fixed: a story mod's treasure chart showed its X outside the map.** The chart view shows a small window of the
+  sea square; a mod chart now uses the window that contains its treasure spot, so the X sits on the map at the spot,
+  on the TV and the GamePad.
+
+- **Linux: sharp picture with desktop scaling on Wayland** (issue #201, thanks @findel77): the game window now
+  uses the screen's real pixel size, so with display scaling (for example 4K at 250%) the picture and the
+  settings overlay are no longer rendered small and stretched. On older versions, `SDL_VIDEO_WAYLAND_SCALE_TO_DISPLAY=1`
+  works around it.
+
+- **Mods: development builds can install packages for the next release.** A development build counts as the next
+  version for the mod catalogue (for example v0.2.14 plus newer changes counts as 0.2.15), so packages that need
+  the coming release, like the Story Notebook 0.6.1, install on it. Releases are unchanged.
+
+- **Extended enemy lock-on** (#192, PR #193, thanks @mhbxyz): Mods → Extended enemy lock-on, off by default. The
+  enemy lock-on range can be raised to 1x–3x (saved per profile), and R3 while locked on to an enemy switches to the
+  next eligible enemy, wrapping around. The game's own targeting still decides who can be targeted; talking
+  distances to characters are unchanged.
+
+- **For porters: more overlay switches** (PR #205, thanks @Pulpparty): a port to another platform can now turn off
+  code mods, mod downloads, the Speakers choice and the keyboard hints in the settings menu (`overlay::ext::Features`).
+  Nothing changes on Windows, macOS, Linux or Android.
+
+- **Fixed: ropes jittered with frame interpolation** (issue #202, thanks @floysh and @JulianSK1999): the grappling
+  hook's rope in Link's hand and rope bridges (for example on Outset Island in the title scene) were drawn at the exact
+  game step while everything around them was drawn in between, so they jumped back and forth at 60, 120 or 240 fps.
+  They now move smoothly with the rest of the picture. 30 fps and true 60 are unchanged.
+
+- **Cheats: moon jump** (idea from the GreenNaugahyde Android fork): in Gameplay → Cheats, off by default. Hold L
+  to rise; the left stick steers relative to the camera. **No fall damage after moon jump** is a separate option.
+  Works at 30 fps, with frame interpolation and in true 60; loading a state ends a flight.
+
+- **Vulkan: textures a graphics driver cannot filter smoothly** (some Android GPUs) are now sampled sharply
+  instead of breaking Vulkan's rules. Every other device keeps the same filtering as before.
+
+- **Fixed: leftover memory in the save file's empty Quest Logs.** With story mods on, saving could copy leftover
+  bytes into unused padding of the empty Quest Log slots. Those bytes are now always zero; the game never reads
+  them, and the active Quest Log is unchanged.
+
+- **Mod SDK v2: items and treasure charts for story mods** (for mod makers; nothing changes without such a mod):
+  - **Mod items:** mods can declare their own items with names, descriptions, icons in the game's item pictures
+    and stacks. Link keeps them in the Delivery Bag on extra pages, can put them in the bag's own places, and can
+    put them, or the story notebook, on X, Y or R to use them. While Link has mod items, R in the Delivery Bag
+    turns to the extra pages (L/R turn pages) instead of putting an item on R; X and Y still assign items.
+  - **Treasure charts:** a mod's treasure chart now works like the game's own: the light ring at its spot, the
+    crane, the chest and its item (a game item or a mod item), then the chart counts as finished.
+  - **Saves:** mod items and charts are kept in the story mods' own part of the save, and turning the mods off
+    shows the game's inventory exactly as before.
+
+- **Story Notebook: a new look for mod quests** (Mod SDK v2): the notebook's list and quest pages are now drawn
+  as real game layouts, on the TV and the GamePad, with a mini sea chart on each quest page, the open book in the
+  Delivery Bag and the game's own fonts. A quest's page says "Not started yet" with its first place, "Finished"
+  when done, and offers "Show on chart" only for a step with a place on the sea chart. For mod makers: mods can
+  give their items their own icons in the game's item pictures (built from your own game files on your machine).
+
+- **Android: system game modes** (idea from the GreenNaugahyde Android fork): the game declares Android's
+  performance and battery-saving game modes, and the system no longer downscales the picture or overrides the
+  frame rate, so the port's own resolution and frame pacing stay in charge.
+
+- **Vulkan: a classic render-pass mode for older graphics drivers** (issues #144 and #51): the game now also runs
+  on Vulkan 1.1 / 1.2 drivers without dynamic rendering (for example older AMD drivers), and older Intel
+  Windows drivers (before 101.2121), which crashed on dynamic rendering, use the classic mode automatically.
+  `WWHD_VK_FORCE_RENDERPASS=1` forces it for testing; `=0` turns it off. Everyone else keeps the current
+  renderer path, with the same pictures and performance.
+
+- **Fixed: Windows setup stopped while linking when the folder name had an emoji or other special characters**
+  ("'charmap' codec can't encode character"). Setup now writes its linker file lists as UTF-8, so the game can be
+  set up in any folder.
+
+- **A new app icon** (issue #199, thanks @thorazine111-coder): a sailing boat on the sea, original artwork, on
+  Android (adaptive icon on Android 8+) and in the Linux AppImage. The game's own icon from your copy is still
+  available as a home-screen shortcut (Android setup: **Add the game icon to the home screen**).
+
 - **Story system for quest mods** (letters, a quest notebook and sea-chart marks, in the game's own style). The
   port brings the system; all quest content comes from the mod catalogue:
   - **Story system** (Mods > Built-in, on): it needs the **Story Notebook** package from the mod catalogue, which
@@ -24,7 +116,10 @@ what is on `devel` and not released yet (also in the
   - **Characters take part:** a quest can give a resident new lines. When several quests want the same character,
     the game's own choice box asks which one. The King of Red Lions says a one-time line for the tracked quest.
     Residents are named by neutral ids; their names and places are read from your own game files.
-  - **Mod charts:** mods can mark places on Link's sea chart with the game's rings, like the game's treasure charts.
+  - **Mod charts:** a quest can hand Link its own chart (by letter, in a conversation or as a reward). It appears
+    in the MAP menu's chart list after the game's charts, opens in the game's own chart view with an X at its
+    place, and gets the check mark when its treasure is found. "Open chart" in the notebook jumps there. Mod
+    charts have their own numbers after the game's 61 charts and never touch the game's charts or save data.
   - **Progress is kept in the save file** in a small block the game itself ignores. Removing the mods leaves a normal
     save.
   Details for mod authors in docs/mod-sdk-v2.md; the Story Notebook package and the example quest mods are in the

@@ -1,3 +1,4 @@
+#include "pass.h"
 #include "deferred_dispatch.h"
 // The settings overlay's Dear ImGui draw data, drawn by the Vulkan renderer into the TV window's
 // composition (present.cpp compose()). The renderer's own command buffer, upload arena, descriptor
@@ -163,7 +164,7 @@ VkPipeline pipeline(VkFormat format,bool additive=false) {
         rendering.colorAttachmentCount = 1;
         rendering.pColorAttachmentFormats = &format;
         VkGraphicsPipelineCreateInfo ci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
-        ci.pNext = &rendering;
+        pipeline_targets(ci, rendering);
         ci.stageCount = 2;
         ci.pStages = stages;
         ci.pVertexInputState = &vi;

@@ -166,7 +166,7 @@ void test_services() {
 
 void test_hooks() {
     // install: all or nothing
-    set_text_buffers(kArena + 0x18000, 6144);
+    set_text_buffers(kArena + 0x18000, 8192);
     set_game_calls(original, game_call);
     install([](uint32_t) { return std::string(); }, [](uint32_t, void (*)(Cpu*)) { assert(!"not imported"); });
     assert(!installed());

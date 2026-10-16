@@ -22,4 +22,10 @@ int main() {
     d[0].unavailable = d[1].unavailable = "cannot draw to the game window";
     assert(choose_device(d, "", "").index == -1);
     assert(choose_device({}, "", "").index == -1);
+    DeviceInfo fallback{"fallback", "integrated", "uuid:rp"}; fallback.renderPasses = true;
+    DeviceInfo khr{"KHR", "discrete", "uuid:khr"};
+    assert(choose_device({fallback, khr, integrated}, "", "").index == 2);
+    assert(choose_device({fallback, khr}, "", "").index == 1);
+    assert(choose_device({fallback}, "", "").index == 0);
+    assert(choose_device({fallback, khr}, "uuid:rp", "").index == 0);
 }

@@ -14,6 +14,12 @@
 @02506C80 # dCamera_c::CalcSubjectAngle: the same on the game's inverted-aiming branch
 @02171B1C # new_himo2_move: after CPad_GET_SUBSTICK_POS_Y (rope-swing event camera)
 0240EBB0  # daPy_Execute: Link (left click while aiming, traces)
+# Enemy lock-on (mods/lock_on.cpp): scale only category-2 horizontal distance predicates.
+024ECCFC  # judgementButton: R3 cycles the freshly rebuilt native enemy list before state update
+@024EB4A8 # calcWeight: enemy acquisition distance, before check_distace
+@024ECC70 # chaseAttention: enemy release distance, before check_distace
+@024EB868 # EnemyDistance: enemy-only cutoff, without changing returned distance
+@024EE574 # LockonReleaseDistanse: camera advisory release radius
 # Quick doors / fast scene changes (mods/turbo.cpp; extra logic steps from interp.cpp's fpcEx_Handler hook)
 0252A684  # dDoor_info_c::getDemoAction: a door event cut is running
 021C0078  # daMbdoor_c::getDemoAction

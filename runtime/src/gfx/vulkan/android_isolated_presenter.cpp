@@ -88,6 +88,7 @@ struct AndroidIsolatedPresenter::Impl {
   if(device && vkDestroyDevice)vkDestroyDevice(device,nullptr);
  }
  void clear_swapchain() {
+  if(presenter)presenter->forget_views(views.data(),views.size());
   for(auto view:views)vkDestroyImageView(device,view,nullptr);
   views.clear();images.clear();layouts.clear();
   if(swapchain) { vkDestroySwapchainKHR(device,swapchain,nullptr);++R.secondaryRetired; }
@@ -96,7 +97,7 @@ struct AndroidIsolatedPresenter::Impl {
   if(surface)gfxvk::vkDestroySurfaceKHR(instance,surface,nullptr);
   surface=VK_NULL_HANDLE;window.reset();
  }
- void init(bool khr) {
+ void init(bool khr,bool renderPasses) {
   std::vector<const char*> extensions={VK_KHR_SWAPCHAIN_EXTENSION_NAME,
       "VK_ANDROID_external_memory_android_hardware_buffer","VK_KHR_external_semaphore_fd","VK_EXT_queue_family_foreign"};
   if(khr) {
@@ -111,7 +112,7 @@ struct AndroidIsolatedPresenter::Impl {
   VkDeviceQueueCreateInfo q{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
   q.queueFamilyIndex=family;q.queueCount=1;q.pQueuePriorities=&priority;
   VkPhysicalDeviceDynamicRenderingFeatures rendering{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES};rendering.dynamicRendering=VK_TRUE;
-  VkDeviceCreateInfo create{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};create.pNext=&rendering;
+  VkDeviceCreateInfo create{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};create.pNext=renderPasses?nullptr:&rendering;
   create.queueCreateInfoCount=1;create.pQueueCreateInfos=&q;
   create.enabledExtensionCount=extensions.size();create.ppEnabledExtensionNames=extensions.data();
   check(gfxvk::vkCreateDevice(physical,&create,nullptr,&device),"create secondary logical device");
@@ -121,7 +122,7 @@ struct AndroidIsolatedPresenter::Impl {
 #undef LOAD
   vkGetDeviceQueue(device,family,0,&queue);
   if(device==primary || queue==R.queue)throw std::runtime_error("Secondary device/queue is not independent");
-  presenter=std::make_unique<IndependentPresenter>(device,khr);
+  presenter=std::make_unique<IndependentPresenter>(device,khr,renderPasses);
   VkCommandPoolCreateInfo commandPool{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};commandPool.queueFamilyIndex=family;
   check(vkCreateCommandPool(device,&commandPool,nullptr,&pool),"secondary-device command pool");
   VkCommandBufferAllocateInfo commands{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
@@ -223,7 +224,7 @@ struct AndroidIsolatedPresenter::Impl {
  }
 };
 AndroidIsolatedPresenter::AndroidIsolatedPresenter(VkInstance instance,VkPhysicalDevice physical,VkDevice primary,
-    uint32_t family,bool khr):impl(std::make_unique<Impl>(instance,physical,primary,family)) { impl->init(khr); }
+    uint32_t family,bool khr,bool renderPasses):impl(std::make_unique<Impl>(instance,physical,primary,family)) { impl->init(khr,renderPasses); }
 AndroidIsolatedPresenter::~AndroidIsolatedPresenter()=default;
 VkQueue AndroidIsolatedPresenter::queue() const { return impl->queue; }
 bool AndroidIsolatedPresenter::busy() const { return impl->pending; }

@@ -11,4 +11,5 @@ void init(); // after dispatch::init, before guest threads start
 void frame(uint64_t step); // original full-step clock
 void draw_frame(Cpu* cpu,uint64_t executed_step); // once per actual logic pass, including true60
 void state_loaded(); // discard host HUD lists and texture handles after a full state load
+void service(Cpu* cpu); // at the frame boundary (main thread, other threads idle): story layouts' builds after a load
 }

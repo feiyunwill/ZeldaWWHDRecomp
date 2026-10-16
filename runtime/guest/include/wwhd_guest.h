@@ -251,3 +251,19 @@ s32 wwhd_quest_carry(const char* quest_id, s32 carried);
  * name from the NPC catalogue (docs/mod-sdk-v2.md), e.g. "windfall-um1"; an unknown name is
  * refused (WWHD_QUEST_INVALID). */
 s32 wwhd_quest_talk(const char* quest_id, u32 step, const char* resident, const char* lines, u32 reward);
+
+/* Mod items v1: items the mod declares in its manifest ("items": id, name, description, icon, stack,
+ * use), kept in the Delivery Bag (its extra pages, or one of the game's places the player picks). The
+ * save file's story block records how many Link has; nothing is written to the game's items, so a save
+ * without the mod is a normal one. item_id: an id of the manifest's "items". A give shows the item's
+ * caption with the game's small get jingle. Results: the count now (0..254), or a negative error. */
+#define WWHD_ITEM_API_VERSION 1
+#define WWHD_ITEM_INVALID (-1)     /* not an item of the manifest, or a count of 0 or over 254 */
+#define WWHD_ITEM_NO_ROOM (-2)     /* no save loaded or its story block is full */
+#define WWHD_ITEM_NOT_ENOUGH (-3)  /* take: Link has fewer */
+s32 wwhd_item_give(const char* item_id, u32 count);  /* up to the item's "stack" */
+s32 wwhd_item_take(const char* item_id, u32 count);
+s32 wwhd_item_count(const char* item_id);
+/* An item with "use": {"action": "event"}: how often the player used it (X, Y or R, or the bag) since
+ * the last call (the count is read and cleared; at most 255). */
+s32 wwhd_item_used(const char* item_id);

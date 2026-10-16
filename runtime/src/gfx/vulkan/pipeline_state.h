@@ -8,11 +8,11 @@ namespace gfxvk {
 // Owns the CPU-side state consumed by vkCreateGraphicsPipelines. Vulkan handles
 // (layout/modules) remain borrowed: the eventual job owner must retain those
 // objects until creation finishes, and join jobs before device destruction.
-// Accepts the guest and utility dynamic-rendering states. Unknown extension
+// Accepts guest and utility states for dynamic rendering or compatible render passes. Unknown extension
 // chains and specialization data are rejected rather than borrowed.
 class GraphicsPipelineState {
   VkGraphicsPipelineCreateInfo info;
-  VkPipelineRenderingCreateInfo rendering;
+  VkPipelineRenderingCreateInfo rendering{};
   VkPipelineVertexInputStateCreateInfo vertex;
   VkPipelineInputAssemblyStateCreateInfo assembly;
   VkPipelineViewportStateCreateInfo viewport;
@@ -44,18 +44,20 @@ public:
     if(!module) throw std::invalid_argument("null pipeline shader module");
     stages[index].module = module;
   }
-  explicit GraphicsPipelineState(const VkGraphicsPipelineCreateInfo& source)
+  explicit GraphicsPipelineState(const VkGraphicsPipelineCreateInfo& source,
+      const VkPipelineRenderingCreateInfo* targetMetadata = nullptr)
       : info(source) {
     if (source.sType != VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO ||
-        !source.pNext || !source.pVertexInputState || !source.pInputAssemblyState ||
+        (!source.pNext && !source.renderPass) || !source.pVertexInputState || !source.pInputAssemblyState ||
         !source.pViewportState || !source.pRasterizationState ||
         !source.pMultisampleState ||
         !source.pColorBlendState || source.pTessellationState)
       throw std::runtime_error("unsupported pipeline state snapshot");
-    if (static_cast<const VkBaseInStructure*>(source.pNext)->sType !=
+    if (source.pNext && static_cast<const VkBaseInStructure*>(source.pNext)->sType !=
         VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO)
       throw std::runtime_error("unsupported pipeline snapshot extension chain");
-    rendering = *static_cast<const VkPipelineRenderingCreateInfo*>(source.pNext);
+    rendering = source.pNext ? *static_cast<const VkPipelineRenderingCreateInfo*>(source.pNext) :
+        targetMetadata ? *targetMetadata : VkPipelineRenderingCreateInfo{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
     vertex = *source.pVertexInputState;
     assembly = *source.pInputAssemblyState;
     viewport = *source.pViewportState;
@@ -92,6 +94,13 @@ public:
     formats = copy(rendering.pColorAttachmentFormats, rendering.colorAttachmentCount);
   }
 
+  // Portable recipes retain formats, never process-local render-pass handles.
+  // Metadata remains available even when the Vulkan create info has no pNext.
+  const VkPipelineRenderingCreateInfo& rendering_targets() {
+    rendering.pColorAttachmentFormats = formats.data();
+    return rendering;
+  }
+
   // Returned pointers are valid until this snapshot is moved or destroyed.
   // Rebind on every use so default copy/move cannot retain pointers into a source.
   const VkGraphicsPipelineCreateInfo* get() {
@@ -103,7 +112,7 @@ public:
     viewport.pViewports = viewports.empty() ? nullptr : viewports.data();
     viewport.pScissors = scissors.empty() ? nullptr : scissors.data();
     multisample.pSampleMask = sampleMasks.empty() ? nullptr : sampleMasks.data();
-    info.pNext = &rendering;
+    info.pNext = info.renderPass ? nullptr : &rendering;
     info.pStages = stages.data();
     info.pVertexInputState = &vertex;
     info.pInputAssemblyState = &assembly;

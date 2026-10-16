@@ -1,3 +1,4 @@
+#include "pass.h"
 #include "overlay/window_target.h"
 #include "deferred_dispatch.h"
 // Shader presentation matches Metal's source-grid FXAA and scaling filters.
@@ -203,13 +204,26 @@ struct PresentApi {
 #define FIELD(name) PFN_##name name=nullptr;
  PRESENT_FUNCTIONS(FIELD)
 #undef FIELD
+ PassApi passes;
  PFN_vkCmdBeginRendering vkCmdBeginRendering=nullptr;
  PFN_vkCmdEndRendering vkCmdEndRendering=nullptr;
- void init(VkDevice device,bool khr) {
+ void init(VkDevice device,bool khr,bool renderPasses) {
 #define LOAD(name) name=reinterpret_cast<PFN_##name>(vkGetDeviceProcAddr(device,#name)); \
   if(!name)throw std::runtime_error("Missing presentation function " #name);
   PRESENT_FUNCTIONS(LOAD)
 #undef LOAD
+  if(renderPasses) {
+#define LOAD_PASS(field,name) passes.field=reinterpret_cast<PFN_##name>(vkGetDeviceProcAddr(device,#name)); \
+   if(!passes.field)throw std::runtime_error("Missing presentation function " #name);
+   LOAD_PASS(createRenderPass,vkCreateRenderPass)
+   LOAD_PASS(destroyRenderPass,vkDestroyRenderPass)
+   LOAD_PASS(createFramebuffer,vkCreateFramebuffer)
+   LOAD_PASS(destroyFramebuffer,vkDestroyFramebuffer)
+   LOAD_PASS(beginRenderPass,vkCmdBeginRenderPass)
+   LOAD_PASS(endRenderPass,vkCmdEndRenderPass)
+#undef LOAD_PASS
+   return;
+  }
   vkCmdBeginRendering=reinterpret_cast<PFN_vkCmdBeginRendering>(vkGetDeviceProcAddr(device,khr?"vkCmdBeginRenderingKHR":"vkCmdBeginRendering"));
   vkCmdEndRendering=reinterpret_cast<PFN_vkCmdEndRendering>(vkGetDeviceProcAddr(device,khr?"vkCmdEndRenderingKHR":"vkCmdEndRendering"));
   if(!vkCmdBeginRendering || !vkCmdEndRendering)throw std::runtime_error("Missing presentation dynamic rendering functions");
@@ -218,6 +232,8 @@ struct PresentApi {
 };
 struct PresentResources {
  PresentApi api;
+ std::unique_ptr<PassCaches> ownedPasses;
+ PassCaches* passes=nullptr;
  VkDevice device=VK_NULL_HANDLE;
  VkDescriptorSetLayout descriptors=VK_NULL_HANDLE;
  VkPipelineLayout layout=VK_NULL_HANDLE;
@@ -238,10 +254,19 @@ VkShaderModule module(PresentResources& resources,const char* source,bool vertex
  VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};ci.codeSize=words.size()*4;ci.pCode=words.data();
  VkShaderModule result;vk_check(resources.api.vkCreateShaderModule(resources.device,&ci,nullptr,&result),"presentation shader");return result;
 }
-void ensure_resources(PresentResources& resources,VkDevice device,bool khr) {
+void ensure_resources(PresentResources& resources,VkDevice device,bool khr,bool renderPasses=false) {
  if(resources.device && resources.device!=device)
   exception_report::raise("Vulkan presentation resources must be reset before device replacement");
- if(!resources.device) { resources.api.init(device,khr);resources.device=device; }
+ if(!resources.device) {
+  resources.api.init(device,khr,renderPasses);resources.device=device;
+  if(renderPasses) {
+   if(device==R.device)resources.passes=&pass_caches();
+   else {
+    resources.ownedPasses=std::make_unique<PassCaches>(device,resources.api.passes);
+    resources.passes=resources.ownedPasses.get();
+   }
+  }
+ }
  if(!resources.descriptors) {
   VkDescriptorSetLayoutBinding binding{0,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr};
   VkDescriptorSetLayoutCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};ci.bindingCount=1;ci.pBindings=&binding;
@@ -288,7 +313,9 @@ VkPipeline pipeline(PresentResources& resources,VkFormat format,Kind kind=kImage
   VkPipelineColorBlendStateCreateInfo bs{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};bs.attachmentCount=1;bs.pAttachments=&blend;
   VkDynamicState states[]={VK_DYNAMIC_STATE_VIEWPORT,VK_DYNAMIC_STATE_SCISSOR};VkPipelineDynamicStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};ds.dynamicStateCount=2;ds.pDynamicStates=states;
   VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};rendering.colorAttachmentCount=1;rendering.pColorAttachmentFormats=&format;
-  VkGraphicsPipelineCreateInfo ci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};ci.pNext=&rendering;ci.stageCount=2;ci.pStages=stages;ci.pVertexInputState=&vi;ci.pInputAssemblyState=&ia;ci.pViewportState=&vp;ci.pRasterizationState=&rs;ci.pMultisampleState=&ms;ci.pColorBlendState=&bs;ci.pDynamicState=&ds;ci.layout=resources.layout;
+  VkGraphicsPipelineCreateInfo ci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};ci.pNext=&rendering;
+  if(resources.passes) { ci.pNext=nullptr;ci.renderPass=resources.passes->render_pass(pass_formats(rendering),VK_ATTACHMENT_LOAD_OP_LOAD); }
+  ci.stageCount=2;ci.pStages=stages;ci.pVertexInputState=&vi;ci.pInputAssemblyState=&ia;ci.pViewportState=&vp;ci.pRasterizationState=&rs;ci.pMultisampleState=&ms;ci.pColorBlendState=&bs;ci.pDynamicState=&ds;ci.layout=resources.layout;
   const auto started=std::chrono::steady_clock::now();
   const VkResult compiled=resources.device==R.device ?
       stutter::create_graphics(R.frame,"present_pipeline",resources.device,R.pipelineCache,1,&ci,nullptr,&result) :
@@ -300,7 +327,7 @@ VkPipeline pipeline(PresentResources& resources,VkFormat format,Kind kind=kImage
  }catch(...){if(result)resources.api.vkDestroyPipeline(resources.device,result,nullptr);if(vs)resources.api.vkDestroyShaderModule(resources.device,vs,nullptr);if(fs)resources.api.vkDestroyShaderModule(resources.device,fs,nullptr);throw;}
  resources.api.vkDestroyShaderModule(resources.device,vs,nullptr);resources.api.vkDestroyShaderModule(resources.device,fs,nullptr);return result;
 }
-void ensure_resources() { ensure_resources(resources,R.device,R.dynamicRenderingKHR); }
+void ensure_resources() { ensure_resources(resources,R.device,R.dynamicRenderingKHR,R.renderPasses); }
 VkPipeline pipeline(VkFormat format,Kind kind=kImage) {
  ensure_resources();return pipeline(resources,format,kind);
 }
@@ -319,7 +346,9 @@ std::vector<VkImageView> take_present_screen_views(Screen& screen) {
  auto views=std::move(found->second.views);resources.screens.erase(found);return views;
 }
 void reset_present_screen(Screen& screen) {
- for(auto view:take_present_screen_views(screen))vkDestroyImageView(resources.device,view,nullptr);
+ auto views=take_present_screen_views(screen);
+ forget_framebuffers(views.data(),views.size(),false);
+ for(auto view:views)vkDestroyImageView(resources.device,view,nullptr);
 }
 void prepare_present_screen(Screen& screen,bool colorAttachmentSupported,bool captureTransferSupported) {
  ensure_resources();reset_present_screen(screen);auto& state=resources.screens[&screen];state.drawable=colorAttachmentSupported;state.captureTransfer=captureTransferSupported;
@@ -338,7 +367,10 @@ void reset_present_resources() {
  if(present_capture().buffer.buffer) { defer_buffer(present_capture().buffer);present_capture().buffer={}; }
  // Caller has drained the device; command/descriptor pools must not execute
  // references to these process-lifetime presentation objects afterwards.
- for(auto& [screen,state]:resources.screens)for(auto view:state.views)vkDestroyImageView(resources.device,view,nullptr);
+ for(auto& [screen,state]:resources.screens) {
+  forget_framebuffers(state.views.data(),state.views.size(),false);
+  for(auto view:state.views)vkDestroyImageView(resources.device,view,nullptr);
+ }
  if(resources.diagnosticTarget.image)destroy_surface_image(&resources.diagnosticTarget);
  destroy_resources(resources);
  reset_overlay_resources();
@@ -380,7 +412,8 @@ void compose(VkImage image,VkImageView view,VkImageLayout& layout,VkExtent2D ext
  VkRenderingAttachmentInfo attachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};attachment.imageView=view;attachment.imageLayout=VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;attachment.loadOp=VK_ATTACHMENT_LOAD_OP_CLEAR;attachment.storeOp=VK_ATTACHMENT_STORE_OP_STORE;
  attachment.clearValue.color.float32[3]=1;
  VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};rendering.renderArea.extent=extent;rendering.layerCount=1;rendering.colorAttachmentCount=1;rendering.pColorAttachments=&attachment;
- record::vkCmdBeginRendering(cmd,&rendering);R.rendering=true;R.passTracked=false;
+ layout=VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+ begin_pass(cmd,rendering,[&] { return color_pass(format,layout); });R.rendering=true;R.passTracked=false;
  VkRect2D scissor{{0,0},extent};record::vkCmdSetScissor(cmd,0,1,&scissor);
  const bool targetLinear=srgb_format(format)||hdrOutput;
  const float whiteScale=hdrOutput?std::min(hdr::menuWhite.load(),hdr::parameters().peak)/80.0f:1.0f;
@@ -422,7 +455,7 @@ void compose(VkImage image,VkImageView view,VkImageLayout& layout,VkExtent2D ext
    overlay_draw(overlay,cmd,format,extent,targetLinear,1,whiteScale);
   } else overlay_draw(overlay,cmd,format,extent,targetLinear,-1,whiteScale);
  }
- record::vkCmdEndRendering(cmd);
+ end_pass(cmd);
  barrier.oldLayout=VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;barrier.newLayout=finalLayout;barrier.srcAccessMask=VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;barrier.dstAccessMask=0;
  record::vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,0,0,nullptr,0,nullptr,1,&barrier);layout=finalLayout;
  R.rendering=false;R.passTracked=false;
@@ -621,6 +654,7 @@ void compose_headless_diagnostic(Screen& screen) {
    (unsigned long long)counter.vertices,(unsigned long long)counter.indices,(unsigned long long)counter.commands);
 }
 
+static void prepare_present_pass(PresentResources&,PresentImageDraw&,VkFormat);
 std::optional<PresentImageDraw> prepare_present_image(Screen& screen,uint32_t imageIndex,
     const Surface& snapshot,bool sourceLinear,int filter,bool fxaa) {
  auto found=resources.screens.find(&screen);
@@ -641,9 +675,22 @@ std::optional<PresentImageDraw> prepare_present_image(Screen& screen,uint32_t im
  const float scale=std::min(box.w/snapshot.extent.width,box.h/snapshot.extent.height);
  draw.params=present_params(fxaa&&linear,filter,scale,
      sourceLinear||srgb_format(snapshot.fmt.pixel),srgb_format(screen.swapFormat));
+ prepare_present_pass(resources,draw,screen.swapFormat);
  return draw;
 }
 
+static void prepare_present_pass(PresentResources& resources,PresentImageDraw& draw,VkFormat format) {
+ if(!resources.passes)return;
+ VkRenderingAttachmentInfo attachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+ attachment.imageView=draw.targetView;attachment.imageLayout=VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+ attachment.loadOp=VK_ATTACHMENT_LOAD_OP_CLEAR;attachment.storeOp=VK_ATTACHMENT_STORE_OP_STORE;
+ attachment.clearValue.color.float32[3]=1;
+ VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
+ rendering.renderArea.extent=draw.extent;rendering.layerCount=1;
+ rendering.colorAttachmentCount=1;rendering.pColorAttachments=&attachment;
+ const auto prepared=prepare_pass(*resources.passes,rendering,color_pass(format,attachment.imageLayout));
+ draw.renderPass=prepared.info.renderPass;draw.framebuffer=prepared.info.framebuffer;
+}
 static void record_present_image(const PresentApi& api,const PresentImageDraw& draw,VkCommandBuffer cmd,VkDescriptorPool pool) {
  VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
  barrier.oldLayout=draw.oldLayout;barrier.newLayout=VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
@@ -669,14 +716,20 @@ static void record_present_image(const PresentApi& api,const PresentImageDraw& d
  VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
  rendering.renderArea.extent=draw.extent;rendering.layerCount=1;
  rendering.colorAttachmentCount=1;rendering.pColorAttachments=&attachment;
- api.vkCmdBeginRendering(cmd,&rendering);
+ if(draw.renderPass) {
+  VkClearValue clear{};clear.color.float32[3]=1;
+  VkRenderPassBeginInfo begin{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+  begin.renderPass=draw.renderPass;begin.framebuffer=draw.framebuffer;
+  begin.renderArea=rendering.renderArea;begin.clearValueCount=1;begin.pClearValues=&clear;
+  api.passes.beginRenderPass(cmd,&begin,VK_SUBPASS_CONTENTS_INLINE);
+ } else api.vkCmdBeginRendering(cmd,&rendering);
  VkRect2D scissor{{0,0},draw.extent};api.vkCmdSetScissor(cmd,0,1,&scissor);
  api.vkCmdSetViewport(cmd,0,1,&draw.viewport);
  api.vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,draw.pipeline);
  api.vkCmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,draw.layout,0,1,&set,0,nullptr);
  api.vkCmdPushConstants(cmd,draw.layout,VK_SHADER_STAGE_FRAGMENT_BIT,0,sizeof(draw.params),&draw.params);
  api.vkCmdDraw(cmd,3,1,0,0);
- api.vkCmdEndRendering(cmd);
+ if(draw.renderPass)api.passes.endRenderPass(cmd);else api.vkCmdEndRendering(cmd);
  barrier.oldLayout=VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;barrier.newLayout=draw.finalLayout;
  barrier.srcAccessMask=VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;barrier.dstAccessMask=0;
  api.vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
@@ -690,10 +743,13 @@ struct IndependentPresenter::Impl {
  PresentResources resources;
  ~Impl() { destroy_resources(resources); }
 };
-IndependentPresenter::IndependentPresenter(VkDevice device,bool dynamicRenderingKHR):impl(std::make_unique<Impl>()) {
- ensure_resources(impl->resources,device,dynamicRenderingKHR);
+IndependentPresenter::IndependentPresenter(VkDevice device,bool dynamicRenderingKHR,bool renderPasses):impl(std::make_unique<Impl>()) {
+ ensure_resources(impl->resources,device,dynamicRenderingKHR,renderPasses);
 }
 IndependentPresenter::~IndependentPresenter()=default;
+void IndependentPresenter::forget_views(const VkImageView* views,size_t count) {
+ if(auto* cache=impl->resources.passes)cache->destroy_framebuffers(cache->forget_views(views,count));
+}
 PresentImageDraw IndependentPresenter::prepare(VkImageView source,VkExtent2D sourceExtent,bool sourceLinear,
     VkImage target,VkImageView targetView,VkFormat targetFormat,VkExtent2D targetExtent,
     VkImageLayout oldLayout,int filter,bool fxaa,VkImageLayout finalLayout) {
@@ -711,6 +767,7 @@ PresentImageDraw IndependentPresenter::prepare(VkImageView source,VkExtent2D sou
  draw.viewport={box.x,box.y,box.w,box.h,0,1};
  const float scale=std::min(box.w/sourceExtent.width,box.h/sourceExtent.height);
  draw.params=present_params(fxaa,filter,scale,sourceLinear,srgb_format(targetFormat));
+ prepare_present_pass(resources,draw,targetFormat);
  return draw;
 }
 void IndependentPresenter::record(const PresentImageDraw& draw,VkCommandBuffer cmd,VkDescriptorPool pool) const {
@@ -777,7 +834,7 @@ void draw_mod_overlay(Surface& scan) {
  attachment.loadOp=VK_ATTACHMENT_LOAD_OP_LOAD;attachment.storeOp=VK_ATTACHMENT_STORE_OP_STORE;
  const VkExtent2D extent{scan.extent.width,scan.extent.height};
  VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};rendering.renderArea.extent=extent;rendering.layerCount=1;rendering.colorAttachmentCount=1;rendering.pColorAttachments=&attachment;
- record::vkCmdBeginRendering(cmd,&rendering);R.rendering=true;R.passTracked=false;
+ begin_pass(cmd,rendering,[&] { return color_pass(scan.fmt.pixel,scan.layout); });R.rendering=true;R.passTracked=false;
  const float w=float(extent.width),h=float(extent.height);
  VkRect2D scissor{{0,0},extent};
  if(wheel) {
@@ -798,7 +855,7 @@ void draw_mod_overlay(Surface& scan) {
   PresentParams params{};const float u[4]={move.stamina,move.alpha,move.exhausted?2.0f:move.swimming?1.0f:0.0f,0};memcpy(&params,u,16);
   record::vkCmdPushConstants(cmd,resources.layout,VK_SHADER_STAGE_FRAGMENT_BIT,0,sizeof(params),&params);record::vkCmdDraw(cmd,3,1,0,0);
  }
- record::vkCmdEndRendering(cmd);R.rendering=false;R.passTracked=false;
+ end_pass(cmd);R.rendering=false;R.passTracked=false;
 }
 
 bool present_capture_requested() { return present_capture().enabled; }

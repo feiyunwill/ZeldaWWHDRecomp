@@ -18,6 +18,8 @@
 #include <jni.h>
 #endif
 #include "backend.h"
+#include "pass.h"
+#include "rendering_path.h"
 #include "stereo.h"
 #include "../hdr.h"
 #include "attachment_view_usage.h"
@@ -191,7 +193,7 @@ void init_pipeline_cache() try {
     std::copy(std::begin(R.properties.pipelineCacheUUID),std::end(R.properties.pipelineCacheUUID),uuid.begin());
     pipelineCachePath=*pipeline_cache_override(std::nullopt,directoryStorage,
         R.properties.vendorID,R.properties.deviceID,uuid);
-    adopt_legacy_pipeline_cache(pipelineCachePath,*pipeline_cache_override(std::nullopt,directoryStorage,
+    if (!R.renderPasses) adopt_legacy_pipeline_cache(pipelineCachePath,*pipeline_cache_override(std::nullopt,directoryStorage,
         R.properties.vendorID,R.properties.deviceID,uuid,true));
   } else if (const char* shaderPath=shaderStorage ? shaderStorage->c_str() : nullptr;
              !shaderPath || std::strcmp(shaderPath,"0")) {
@@ -219,8 +221,9 @@ void init_pipeline_cache() try {
     };
     const auto vendor=R.properties.vendorID, device=R.properties.deviceID;
     pipelineCachePath=place(device_pipeline_cache_filename(vendor,device,uuid));
-    adopt_legacy_pipeline_cache(pipelineCachePath,place(legacy_device_pipeline_cache_filename(vendor,device,uuid)));
+    if (!R.renderPasses) adopt_legacy_pipeline_cache(pipelineCachePath,place(legacy_device_pipeline_cache_filename(vendor,device,uuid)));
   }
+  if (R.renderPasses && !pipelineCachePath.empty()) pipelineCachePath += "-rp";
   std::vector<uint8_t> bytes;
   if (!pipelineCachePath.empty()) {
     std::error_code ec;
@@ -273,7 +276,8 @@ void init_pipeline_cache() try {
     put(36, R.properties.limits.maxDescriptorSetUniformBuffersDynamic);
     put(40, 3); // Runtime-build identity, portable content IDs, exact descriptors and fixed-state recipe schema.
     put(44, (R.portabilitySubset ? 1u : 0u) | (R.separateStencilMaskRef ? 2u : 0u) |
-        (R.constantAlphaColorBlendFactors ? 4u : 0u) | (R.vertexAttributeAccessBeyondStride ? 8u : 0u));
+        (R.constantAlphaColorBlendFactors ? 4u : 0u) | (R.vertexAttributeAccessBeyondStride ? 8u : 0u) |
+        (R.vertexFormats.fallbackMask << 4));
     const char* warmup = std::getenv("WWHD_VK_PIPELINE_WARMUP");
     if (!warmup || std::strcmp(warmup, "0")) try {
       const auto headstart=path_environment_utf8("WWHD_HEADSTART");
@@ -542,6 +546,7 @@ UploadSlice allocate_upload(VkDeviceSize size, VkDeviceSize alignment) {
 void defer_buffer(Buffer b) { R.garbageBuffers.push_back(b); }
 void defer_surface_image(VkImage image, VkDeviceMemory memory,
                          std::vector<VkImageView> views) {
+  forget_framebuffers(views.data(), views.size(), true);
   R.garbageImages.push_back({image, memory, std::move(views)});
 }
 void forget_texture_views() {
@@ -851,7 +856,7 @@ GpuScopeToken gpu_begin_feedback_scope(const Surface& source) {
 void gpu_end_feedback_scope(GpuScopeToken token) { end_gpu_scope(token); }
 void end_encoder() {
   if (R.rendering) {
-    record::vkCmdEndRendering(R.cmd);
+    end_pass(R.cmd);
     R.rendering = false;
     R.passTracked = false;
     if(R.gpuPassTimestampsEnabled) {
@@ -983,6 +988,8 @@ static void cleanup_submission(Renderer::Submission& slot) {
   slot.garbageBuffers.clear();
   buffer_cache_free(slot.garbageCacheRegions);
   slot.garbageCacheRegions.clear();
+  for (auto framebuffer : slot.garbageFramebuffers) vkDestroyFramebuffer(R.device, framebuffer, nullptr);
+  slot.garbageFramebuffers.clear();
   for (auto &i : slot.garbageImages) {
     for (auto v : i.views)
       if (v)
@@ -1027,6 +1034,7 @@ static void activate_submission(size_t index) {
   R.uploadBlocks=std::move(slot.uploadBlocks);
   R.garbageBuffers=std::move(slot.garbageBuffers);
   R.garbageImages=std::move(slot.garbageImages);
+  R.garbageFramebuffers=std::move(slot.garbageFramebuffers);
   R.garbageCacheRegions=std::move(slot.garbageCacheRegions);
   R.recording=false;R.rendering=false;R.passTracked=false;
 }
@@ -1093,6 +1101,7 @@ static void submit(VkSemaphore wait = VK_NULL_HANDLE,
     slot.completions=std::move(R.completions);
     slot.garbageBuffers=std::move(R.garbageBuffers);
     slot.garbageImages=std::move(R.garbageImages);
+    slot.garbageFramebuffers=std::move(R.garbageFramebuffers);
     slot.garbageCacheRegions=std::move(R.garbageCacheRegions);
     slot.retainedUnsubmitted=true;slot.deferredOwner=owner;
     R.recording=false;
@@ -1141,13 +1150,13 @@ static void submit(VkSemaphore wait = VK_NULL_HANDLE,
 void flush_async() {
   // Deferred objects may reference earlier queued work even if this slot has
   // no draw commands. Submit an empty command buffer to retire them in order.
-  if (!R.recording && (!R.garbageBuffers.empty() || !R.garbageImages.empty() ||
+  if (!R.recording && (!R.garbageBuffers.empty() || !R.garbageImages.empty() || !R.garbageFramebuffers.empty() ||
                        !R.garbageCacheRegions.empty())) command_buffer();
   submit(VK_NULL_HANDLE,VK_NULL_HANDLE,true);
 }
 void flush() {
   if(active_deferred_commands)active_deferred_commands->finish_exact();
-  if (!R.recording && (!R.garbageBuffers.empty() || !R.garbageImages.empty() ||
+  if (!R.recording && (!R.garbageBuffers.empty() || !R.garbageImages.empty() || !R.garbageFramebuffers.empty() ||
                        !R.garbageCacheRegions.empty())) command_buffer();
   submit();
   drain_submissions();
@@ -1484,6 +1493,7 @@ struct RetiredSecondarySwapchain {
   ANativeWindow* window=nullptr;
   bool ownsSurface=false;
   std::vector<VkImageView> views;
+  std::vector<VkFramebuffer> framebuffers;
   AsyncPresentState presentation;
   std::array<SecondaryPresentFence,3> presents;
   std::vector<std::pair<size_t,uint64_t>> submissions;
@@ -1718,6 +1728,7 @@ static void retire_secondary_swapchain(bool surface) {
   old.surface=screen.surface;
   old.ownsSurface=surface;
   old.views=take_present_screen_views(screen);
+  if(R.renderPasses)old.framebuffers=pass_caches().forget_views(old.views.data(),old.views.size());
   old.presentation=std::move(asyncPresent[1]);
   asyncPresent[1]={};
   old.presents=secondaryPresentFences;
@@ -1753,6 +1764,7 @@ static void collect_secondary_swapchains() {
     if(it->ownsSurface)for(auto& other:retiredSecondarySwapchains)
       if(&other!=&*it && other.surface==it->surface && it->surface)complete=false;
     if(!complete){++it;continue;}
+    for(auto framebuffer:it->framebuffers)vkDestroyFramebuffer(R.device,framebuffer,nullptr);
     for(auto view:it->views)vkDestroyImageView(R.device,view,nullptr);
     if(it->swapchain)vkDestroySwapchainKHR(R.device,it->swapchain,nullptr);
     for(auto sem:it->presentation.acquire)if(sem)vkDestroySemaphore(R.device,sem,nullptr);
@@ -2795,7 +2807,7 @@ void swap() {
     static bool havePreviousSwap = false;
     static std::array<double, 120> swapIntervals{};
     static size_t intervalCount = 0, slowIntervals = 0;
-    static uint64_t frame=0,draws=0,bytes=0,allocs=0,passes=0;
+    static uint64_t frame=0,draws=0,bytes=0,allocs=0,passes=0,framebuffers=0;
     static uint64_t descriptorLookups=0,descriptorHits=0,descriptorAllocations=0,descriptorFastHits=0;
     static uint64_t vertexDeclaredBytes=0,vertexCopiedBytes=0;
     static uint64_t vertexReuseChecks=0,vertexReuseHits=0,vertexReuseBytes=0,vertexReuseCompareNs=0;
@@ -2836,6 +2848,12 @@ void swap() {
           (unsigned long long)R.frame,(R.frame-frame)/seconds,
           double(R.drawCount-draws)/(R.frame-frame),double(R.uploadBytes-bytes)/(R.frame-frame)/(1<<20),
           (unsigned long long)(R.uploadAllocations-allocs), double(R.renderPassCount-passes)/(R.frame-frame));
+      if (R.renderPasses) {
+        const auto created = pass_caches().framebuffers_created();
+        LOG("[vulkan render passes] %.3f framebuffers created/frame, %zu cached",
+            double(created-framebuffers)/(R.frame-frame), pass_caches().framebuffer_count());
+        framebuffers=created;
+      }
       if (intervalCount) {
         std::sort(swapIntervals.begin(), swapIntervals.begin()+intervalCount);
         // Nearest-rank percentiles; the first report contains 119 intervals.
@@ -3067,37 +3085,38 @@ static std::string driver_version_text(const VkPhysicalDeviceProperties &p) {
 std::string device_description() {
   if (!R.properties.deviceName[0]) return "";
   return reporthdr::vulkan_gpu(R.properties.deviceName, R.properties.vendorID, R.properties.driverVersion,
-                               R.properties.apiVersion, kWindows);
+                               R.properties.apiVersion, kWindows) + "; rendering path: " +
+      rendering_path_name(R.renderPasses ? RenderingPath::RenderPass :
+          R.dynamicRenderingKHR ? RenderingPath::KHR : RenderingPath::Core) + " (" + R.renderingReason + ")";
 }
-// How a GPU provides dynamic rendering, the renderer's only way of drawing: Vulkan 1.3 core, or
-// VK_KHR_dynamic_rendering on a Vulkan 1.1 / 1.2 driver. Shaders are SPIR-V 1.3 (Vulkan 1.1).
-enum class DynamicRendering { None, Core, KHR };
-static DynamicRendering dynamic_rendering(VkPhysicalDevice device, const VkPhysicalDeviceProperties &properties,
-                                          const std::vector<VkExtensionProperties> &des) {
-  const uint32_t api = device_api_version(properties);
-  if (api < VK_API_VERSION_1_1)
-    return DynamicRendering::None;
-  if (api >= VK_API_VERSION_1_3) {
-    VkPhysicalDeviceVulkan13Features f13{
-        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
-    VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
-    f2.pNext = &f13;
-    vkGetPhysicalDeviceFeatures2(device, &f2);
-    if (f13.dynamicRendering)
-      return DynamicRendering::Core;
+// Probe dynamic-rendering capabilities independently of the selected fallback.
+static RenderingChoice rendering_path(VkPhysicalDevice device, const VkPhysicalDeviceProperties &properties,
+                                     const std::vector<VkExtensionProperties> &extensions) {
+  RenderingCapabilities caps{device_api_version(properties)};
+  if (caps.api >= VK_API_VERSION_1_3) {
+    VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    features.pNext = &f13;
+    vkGetPhysicalDeviceFeatures2(device, &features);
+    caps.core = f13.dynamicRendering;
   }
-  // the extension requires VK_KHR_depth_stencil_resolve (core in 1.2), which requires
-  // VK_KHR_create_renderpass2 (core in 1.2)
-  if (!has_extension(des, VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME) ||
-      (api < VK_API_VERSION_1_2 && (!has_extension(des, VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME) ||
-                                    !has_extension(des, VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME))))
-    return DynamicRendering::None;
-  VkPhysicalDeviceDynamicRenderingFeaturesKHR fdr{
-      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES_KHR};
-  VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
-  f2.pNext = &fdr;
-  vkGetPhysicalDeviceFeatures2(device, &f2);
-  return fdr.dynamicRendering ? DynamicRendering::KHR : DynamicRendering::None;
+  if (!caps.core && caps.api >= VK_API_VERSION_1_1 &&
+      has_extension(extensions, VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME) &&
+      (caps.api >= VK_API_VERSION_1_2 || (has_extension(extensions, VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME) &&
+                                        has_extension(extensions, VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME)))) {
+    VkPhysicalDeviceDynamicRenderingFeaturesKHR dynamic{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES_KHR};
+    VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    features.pNext = &dynamic;
+    vkGetPhysicalDeviceFeatures2(device, &features);
+    caps.khr = dynamic.dynamicRendering;
+  }
+#ifdef _WIN32
+  constexpr bool windows = true;
+#else
+  constexpr bool windows = false;
+#endif
+  return choose_rendering_path(caps, properties.vendorID, properties.driverVersion, windows,
+                               getenv("WWHD_VK_FORCE_RENDERPASS"));
 }
 static const char kUpdateDriver[] =
 #ifdef _WIN32
@@ -3245,6 +3264,7 @@ static void init_device(std::vector<const char *> extensions,
   vkEnumeratePhysicalDevices(R.instance, &n, devices.data());
   devices.resize(n);
   std::string unsuitable;
+  std::vector<RenderingChoice> renderingChoices(devices.size());
   std::vector<uint32_t> deviceQueues(devices.size(), UINT32_MAX);
   std::vector<VkQueueFamilyProperties> deviceQueueProperties(devices.size());
   device_inventory.clear();
@@ -3252,7 +3272,7 @@ static void init_device(std::vector<const char *> extensions,
     auto device = devices[i];
     VkPhysicalDeviceProperties properties;
     vkGetPhysicalDeviceProperties(device, &properties);
-    const auto have = dynamic_rendering(device, properties, device_extensions(device));
+    const auto have = renderingChoices[i] = rendering_path(device, properties, device_extensions(device));
     DeviceInfo info;
     info.name = properties.deviceName;
     info.vendor = properties.vendorID;
@@ -3263,7 +3283,8 @@ static void init_device(std::vector<const char *> extensions,
                 properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU ? "CPU" : "other";
     info.driver = driver_version_text(properties);
     info.version = version_text(device_api_version(properties));
-    info.core = have == DynamicRendering::Core;
+    info.core = have.path == RenderingPath::Core;
+    info.renderPasses = have.path == RenderingPath::RenderPass;
     if (device_api_version(properties) >= VK_API_VERSION_1_1) {
       VkPhysicalDeviceIDProperties id{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
       VkPhysicalDeviceProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
@@ -3279,9 +3300,8 @@ static void init_device(std::vector<const char *> extensions,
     }
     if (info.identity.empty()) info.identity = "id:" + std::to_string(info.vendor) + ":" +
         std::to_string(info.device) + ":" + info.name;
-    if (have == DynamicRendering::None)
-      info.unavailable = device_api_version(properties) < VK_API_VERSION_1_1 ?
-          "older than Vulkan 1.1" : "VK_KHR_dynamic_rendering missing";
+    if (have.path == RenderingPath::None)
+      info.unavailable = have.reason;
     else {
       uint32_t qn;
       vkGetPhysicalDeviceQueueFamilyProperties(device, &qn, nullptr);
@@ -3312,7 +3332,10 @@ static void init_device(std::vector<const char *> extensions,
     R.queueFamily = deviceQueues[i];
     R.computeQueue = (deviceQueueProperties[i].queueFlags & VK_QUEUE_COMPUTE_BIT) != 0;
     R.gpuTimestampValidBits = deviceQueueProperties[i].timestampValidBits;
-    R.dynamicRenderingKHR = !device_inventory[i].core;
+    R.dynamicRenderingKHR = renderingChoices[i].path == RenderingPath::KHR;
+    R.renderPasses = renderingChoices[i].path == RenderingPath::RenderPass;
+    R.renderingReason = renderingChoices[i].reason;
+    LOG("[vulkan] rendering path: %s (%s)", rendering_path_name(renderingChoices[i].path), renderingChoices[i].reason);
     active_device = device_inventory[i].name;
     device_fallback = choice.fallback.empty() ? "" : choice.fallback + "; using " + active_device + ".";
     if (!device_fallback.empty()) LOG("[vulkan] %s (%s)", device_fallback.c_str(), deviceEnv ? "env" : "setting");
@@ -3322,8 +3345,7 @@ static void init_device(std::vector<const char *> extensions,
     exception_report::raise(
         devices.empty()
             ? std::string("No graphics card with a Vulkan driver was found.\n\n") + kUpdateDriver
-            : "The graphics driver does not support the Vulkan features the game needs: Vulkan 1.3, or "
-              "Vulkan 1.1 / 1.2 with the VK_KHR_dynamic_rendering extension.\n" + unsuitable +
+            : "The graphics driver does not support the Vulkan features the game needs: Vulkan 1.1 or newer.\n" + unsuitable +
                   "\n\n" + kUpdateDriver);
   vkGetPhysicalDeviceProperties(R.physicalDevice, &R.properties);
   const uint32_t deviceApi = device_api_version(R.properties);
@@ -3420,8 +3442,12 @@ static void init_device(std::vector<const char *> extensions,
   VkPhysicalDeviceDynamicRenderingFeaturesKHR fdr{
       VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES_KHR};
   f13.dynamicRendering = fdr.dynamicRendering = VK_TRUE;
-  void *chain = R.dynamicRenderingKHR ? static_cast<void *>(&fdr) : &f13;
-  tail = R.dynamicRenderingKHR ? &fdr.pNext : &f13.pNext;
+  void *chain = nullptr;
+  if (R.renderPasses) tail = &chain;
+  else {
+    chain = R.dynamicRenderingKHR ? static_cast<void *>(&fdr) : &f13;
+    tail = R.dynamicRenderingKHR ? &fdr.pNext : &f13.pNext;
+  }
   if (vulkan12) {
     *tail = &enabled12;
     tail = &enabled12.pNext;
@@ -3485,9 +3511,26 @@ static void init_device(std::vector<const char *> extensions,
   di.pEnabledFeatures = &enabled;
   di.enabledExtensionCount = de.size();
   di.ppEnabledExtensionNames = de.data();
+  // Prime the support cache once, before any shader translation jobs start.
+  std::string missingVertexFormats;
+  for (auto format : vk::vertex_formats) {
+    if (!(format_properties(format).bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT)) {
+      if (!missingVertexFormats.empty()) missingVertexFormats += ", ";
+      missingVertexFormats += vk::vertex_format_name(format);
+    }
+  }
+  if (!missingVertexFormats.empty())
+    LOG("[vulkan] vertex formats without vertex-buffer support: %s", missingVertexFormats.c_str());
+  const char* forceVertexFallback = std::getenv("WWHD_VK_VERTEX_FALLBACK");
+  R.vertexFormats = vk::vertex_format_policy([](VkFormat format) {
+    return bool(format_properties(format).bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT);
+  }, forceVertexFallback && !std::strcmp(forceVertexFallback, "1"));
+  if (R.vertexFormats.fallbackMask)
+    LOG("[vulkan] vertex format fallback mask: %u", R.vertexFormats.fallbackMask);
   vk_check(vkCreateDevice(R.physicalDevice, &di, nullptr, &R.device),
            "create Vulkan device");
-  load_device_functions(R.device, R.dynamicRenderingKHR);
+  load_device_functions(R.device, R.dynamicRenderingKHR, R.renderPasses);
+  init_pass_caches();
   vkGetDeviceQueue(R.device, R.queueFamily, 0, &R.queue);
 #ifdef __ANDROID__
   if(secondary) {
@@ -3496,7 +3539,7 @@ static void init_device(std::vector<const char *> extensions,
   }
   if(isolateSecondary) {
     try {
-      isolatedSecondary=std::make_unique<AndroidIsolatedPresenter>(R.instance,R.physicalDevice,R.device,R.queueFamily,R.dynamicRenderingKHR);
+      isolatedSecondary=std::make_unique<AndroidIsolatedPresenter>(R.instance,R.physicalDevice,R.device,R.queueFamily,R.dynamicRenderingKHR,R.renderPasses);
       R.secondaryQueue=isolatedSecondary->queue();R.secondaryIsolated=true;R.secondaryPresentFences=false;
       LOG("[vulkan] isolated secondary logical device enabled; queue index 0 on each device");
     } catch(const std::exception& error) {
@@ -3621,7 +3664,13 @@ void init() {
 #else
   // test runs: WWHD_HIDDEN_WINDOWS=1 never puts the windows on screen (nothing pops up or takes the
   // focus); the swapchains still exist, so frame dumps and present dumps work as with visible windows
+  // Linux (issue #201): high pixel density, so Wayland with desktop scaling gives a swapchain at the
+  // screen's real pixel size instead of the logical size the compositor then stretches (blurry). The
+  // swapchain and the overlay already use the window's size in pixels and its pixel density.
   const SDL_WindowFlags windowFlags = SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE |
+#if defined(__linux__)
+                                      SDL_WINDOW_HIGH_PIXEL_DENSITY |
+#endif
                                       (hidden_windows() ? SDL_WINDOW_HIDDEN : 0);
 #endif
   R.tv.window = SDL_CreateWindow("Wind Waker HD — Vulkan", 1280, 720, windowFlags);
@@ -3690,6 +3739,7 @@ void shutdown_renderer_caches() {
   destroy_gpu_timestamp_queries();
   vk::save_shader_cache();
   save_pipeline_cache();
+  reset_pass_caches();
 }
 #ifdef WWHD_SDL_HOST
 // GamePad touch screen: the left mouse button on the GamePad picture, in the GamePad window (window

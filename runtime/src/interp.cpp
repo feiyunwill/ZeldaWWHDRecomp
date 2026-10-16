@@ -1,6 +1,7 @@
 #include "interp.h"
 #include "countdown.h"
 #include "mods/guest_mods.h"
+#include "mods/mods.h"
 #include "mods/packages.h"
 // Frame interpolation (60, 120 or 240 fps output, game logic unchanged at 30 steps per second).
 //
@@ -399,6 +400,7 @@ static void cam_trace(uint32_t cam, const char* what) {
 extern "C" void hook_024FFC40(Cpu* c) {
     using namespace interp;
     uint32_t cam = c->r[3];
+    mods::moon_jump_camera(cam);
     Prev* p = prev_for(cam);
     if (g_blend_draw && !true60::runs_60(cam)) {  // blended between the step drawn last (S) and the new one (S+1)
         CamState cur = read_cam(cam);
@@ -503,13 +505,30 @@ uint32_t fw(float f) { return __builtin_bswap32(f32_as_u32(f)); }
 
 // debug: WWHD_INTERP_MODEL_TRACE=n logs n draws of one model (the first with at least
 // WWHD_INTERP_MODEL_TRACE_JOINTS joints, default 40): root joint translation as drawn
+// _ALL=1 follows every eligible model; _START=n starts at logic step n. _FILE=path
+// also writes CSV: step,t,decision,joint-block,joint-count,joint-index,12 matrix floats.
 void trace_model(const char* what, uint32_t jnt, uint32_t n, const uint32_t* w) {
     static int left = getenv("WWHD_INTERP_MODEL_TRACE") ? atoi(getenv("WWHD_INTERP_MODEL_TRACE")) : 0;
     static const uint32_t min_joints = getenv("WWHD_INTERP_MODEL_TRACE_JOINTS") ? atoi(getenv("WWHD_INTERP_MODEL_TRACE_JOINTS")) : 40;
+    static const bool all = getenv("WWHD_INTERP_MODEL_TRACE_ALL") != nullptr;
+    static const uint64_t start = getenv("WWHD_INTERP_MODEL_TRACE_START") ? strtoull(getenv("WWHD_INTERP_MODEL_TRACE_START"), nullptr, 10) : 0;
     static uint32_t which = 0;
-    if (left <= 0 || n < min_joints || (which && which != jnt)) return;
+    if (left <= 0 || g_logic_steps < start || n < min_joints || (!all && which && which != jnt)) return;
     which = jnt;
     left--;
+    static FILE* matrices = [] {
+        const char* path = getenv("WWHD_INTERP_MODEL_TRACE_FILE");
+        return path ? fopen(path, "w") : nullptr;
+    }();
+    if (matrices) {
+        for (uint32_t joint = 0; joint < n; ++joint) {
+            fprintf(matrices, "%llu,%.6f,%s,%08X,%u,%u", (unsigned long long)g_logic_steps,
+                    pass_t(), what, jnt, n, joint);
+            for (int k = 0; k < 12; ++k) fprintf(matrices, ",%.9g", wf(w[joint * 12 + k]));
+            fputc('\n', matrices);
+        }
+        fflush(matrices);
+    }
     LOG("[interp] model %08X (%u joints, mtx %08X) step %llu t %.3f %-7s root %.2f %.2f %.2f", jnt, n, ld32(jnt + kJntMtx),
         (unsigned long long)g_logic_steps, pass_t(), what, wf(w[3]), wf(w[7]), wf(w[11]));
 }
@@ -681,6 +700,7 @@ void nodraw_reset();          // fopAc_Draw hook: the step's one-shot no-draw re
 void reticle_reset();
 // a save state was loaded: nothing may blend across the jump
 void ss_reset() {
+    mods::moon_jump_reset();
     countdown::reset();
     for (auto& p : g_prev) p = Prev{};
     g_last_step = 0;

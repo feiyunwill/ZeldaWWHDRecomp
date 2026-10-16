@@ -5,6 +5,7 @@
 #include "gfx/display_modes.h"
 #include "android_controller.h"
 #include "../mods/fast_forward.h"
+#include "../mods/mods.h"
 #ifdef WWHD_HAS_VULKAN
 #include "gfx/vulkan/stutter_trace.h"
 #include "gfx/vulkan/headstart.h"
@@ -207,7 +208,7 @@ static int keycode(SDL_Scancode code) {
  }
 }
 void set_touch(bool down,float x,float y){std::lock_guard lk(g_mu);g_touch=down;g_tx=x;g_ty=y;}
-void release_keys(){mods::fast_forward_reset();std::lock_guard lk(g_mu);g_mouse_bindings.consume();memset(g_keys,0,sizeof g_keys);g_touch=false;}
+void release_keys(){mods::fast_forward_reset();mods::lock_on_reset();std::lock_guard lk(g_mu);g_mouse_bindings.consume();memset(g_keys,0,sizeof g_keys);g_touch=false;}
 void held_keys(bool* keys){std::lock_guard lk(g_mu);for(int i=0;i<256;i++)keys[i]=g_keys[i]||g_script_keys[i];}
 void controller_values(float* out){std::lock_guard lk(g_mu);std::copy(std::begin(g_values),std::end(g_values),out);}
 void host_controller_values(float* out){controller_values(out);}
@@ -929,7 +930,14 @@ static void apply_scenario(PadState& s) {
 
 static std::atomic<bool> g_pro{getenv("WWHD_PRO_CONTROLLER") != nullptr};
 bool pro_controller() { return g_pro.load(std::memory_order_relaxed); }
-void set_pro_controller(bool on) { g_pro = on; LOG("[input] keyboard/controller act as %s", on ? "Pro Controller" : "GamePad"); }
+static std::atomic<void (*)(bool)> g_controller_listener{nullptr};
+void set_controller_listener(void (*fn)(bool pro)) { g_controller_listener = fn; }
+void set_pro_controller(bool on) {
+    const bool was = g_pro.exchange(on);
+    LOG("[input] keyboard/controller act as %s", on ? "Pro Controller" : "GamePad");
+    if (was != on)
+        if (auto fn = g_controller_listener.load()) fn(on);
+}
 
 PadState read() {
     static const std::vector<Press> script = scripted();

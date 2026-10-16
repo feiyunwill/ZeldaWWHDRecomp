@@ -10,15 +10,17 @@ struct DeviceInfo {
     std::string name, type, identity, driver, version, unavailable;
     unsigned vendor = 0, device = 0;
     bool core = false;
+    bool renderPasses = false;
     bool usable() const { return unavailable.empty(); }
 };
 struct DeviceChoice { int index = -1; std::string reason = "automatic: first usable", fallback; };
 inline DeviceChoice choose_device(const std::vector<DeviceInfo>& devices, const std::string& saved,
                                   const std::string& env) {
     DeviceChoice result;
-    for (bool core : {true, false}) {
+    for (int path = 0; path < 3; ++path) {
         for (size_t i = 0; i < devices.size(); ++i)
-            if (result.index < 0 && devices[i].usable() && devices[i].core == core) result.index = int(i);
+            if (result.index < 0 && devices[i].usable() &&
+                (devices[i].core ? 0 : devices[i].renderPasses ? 2 : 1) == path) result.index = int(i);
     }
     if (env.empty() && saved.empty()) return result;
     int selected = -1;

@@ -9,6 +9,8 @@
 #include "shader_binary.h"
 #include "worker_metrics.h"
 #include "backend.h"
+#include "vertex_formats.h"
+#include "vertex_format_shader.h"
 #include "headstart.h"
 #include "stutter_trace.h"
 #include "mods/cemu_pack.h"
@@ -684,6 +686,28 @@ bool decompile(Shader& shader, const uint32_t* regs, bool vertex, LatteFetchShad
                 accepted?"applied":"rejected: ",accepted?"":error.c_str());
         }
     }
+    if (vertex && R.vertexFormats.fallbackMask) {
+        uint32_t tailLocation = vertex_tail_location(shader.mapping.attributeMapping);
+        // Rewrite the input declaration, leaving every existing endian/sign/
+        // normalization decoder intact. Vulkan supplies w=1 for native RGB.
+        // Apply after pack replacement too: packs use the same raw interface.
+        for (const auto& group : fetch->bufferGroups) {
+            for (int i = 0; i < group.attribCount; ++i) {
+                const auto& attribute = group.attrib[i];
+                if (!R.vertexFormats.fallback(vertex_format(attribute.format))) continue;
+                const auto location = shader.mapping.attributeMapping[attribute.semanticId];
+                if (location < 0) continue;
+                const auto name = "attrDataSem" + std::to_string(attribute.semanticId);
+                if (!rewrite_vertex_fallback_input(shader.glsl, name, location, tailLocation) ||
+                    (!shader.translatedGlsl.empty() &&
+                     !rewrite_vertex_fallback_input(shader.translatedGlsl, name, location, tailLocation))) {
+                    shader.error = "cannot adapt graphics-pack vertex input for RGB fallback";
+                    return false;
+                }
+                ++tailLocation;
+            }
+        }
+    }
     return true;
 }
 bool translate_owned(Shader& shader, const uint32_t* regs, bool vertex,
@@ -959,7 +983,7 @@ Shader* translate(const uint32_t* regs, bool vertex, LatteFetchShader* fetch, ui
     // Level 1: program, fetch shader and linkage.
     std::array<uint32_t, kLinkageWords> words;
     const size_t count = gather_linkage(regs, vertex, fetch, words.data());
-    const uint64_t seed = base ^ (vertex ? fsKey * 31 : 0);
+    const uint64_t seed = base ^ (vertex ? (fsKey * 31) ^ R.vertexFormats.shader_salt() : 0);
     ++stats.stateHashLookups;
     static const bool memoEnabled = [] {
         const char* value = getenv("WWHD_VK_SHADER_STATE_MEMO");

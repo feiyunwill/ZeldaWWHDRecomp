@@ -516,12 +516,12 @@ void tab_saves() {
     if (!msg.empty()) note("%s", msg.c_str());
     heading("Save states");
     const bool full = ss::full_states();
+    const char* keys = ext::features().keyboard ? " Shift+F1..F5 save in game, F2..F5 load (F1 opens this menu)." : "";
     if (full)
-        note("Full save states: the whole running game (large, contain game data: never share them). Shift+F1..F5 save in "
-             "game, F2..F5 load (F1 opens this menu).");
+        note("Full save states: the whole running game (large, contain game data: never share them).%s", keys);
     else
         note("A save state keeps your progress and where Link stands (a few KB, no game data). Loading enters that place "
-             "with that progress; enemies and cutscenes start fresh. Shift+F1..F5 save in game, F2..F5 load (F1 opens this menu).");
+             "with that progress; enemies and cutscenes start fresh.%s", keys);
     if (ImGui::BeginTable("slots", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_SizingStretchProp)) {
         ImGui::TableSetupColumn("Slot", ImGuiTableColumnFlags_WidthFixed);
         ImGui::TableSetupColumn("Saved");
@@ -1084,11 +1084,8 @@ void tab_display() {
 }
 
 mods::catalogue::Version catalogue_port_version() {
-    std::string version=build::version();
-    if(version.starts_with("v"))version.erase(0,1);
-    // "0.2.11+meta" and development builds "0.2.11-devel.<commit>" count as their release
-    version=version.substr(0,version.find_first_of("+-"));
-    try { return mods::catalogue::Version::parse(version); } catch (...) { return {}; }
+    // a build ahead of its release counts as the next one (mods::catalogue::port_version_from_build)
+    return mods::catalogue::port_version_from_build(build::version());
 }
 using setupflow::setup_run;
 using setupflow::setup_run_tick;
@@ -1176,6 +1173,18 @@ void builtin_options(const std::string& id) {
         float speed = mods::camera_speed();
         if (ImGui::SliderFloat("Camera speed", &speed, .5f, 2.f, "%.2fx"))
             hostui::post([speed] { mods::set_camera_speed(speed); hostui::set("mod.direct-camera.speed", std::to_string(speed)); mods::packages::remember_option("direct-camera.speed", speed); });
+    } else if (id == "lock-on") {
+        float range = mods::lock_on_range();
+        if (ImGui::SliderFloat("Enemy lock-on range", &range, 1.f, 3.f, "%.2fx"))
+            hostui::post([range] { mods::set_lock_on_range(range); hostui::set("mod.lock-on.range", std::to_string(range)); mods::packages::remember_option("lock-on.range", range); });
+        bool cycling = mods::lock_on_cycling();
+        if (ImGui::Checkbox("Cycle enemy targets with R3", &cycling))
+            hostui::post([cycling] { mods::set_lock_on_cycling(cycling); hostui::set("mod.lock-on.cycling", cycling ? "1" : "0"); mods::packages::remember_option("lock-on.cycling", cycling); });
+        help("Range 1 keeps the original enemy targeting distance. Press R3 while locked on "
+             "to cycle enemy targets. Disabling this mod restores original targeting behavior.");
+        for (const char* env : {"WWHD_MOD_LOCK_ON_RANGE", "WWHD_MOD_LOCK_ON_CYCLING"})
+            if (const char* override = std::getenv(env))
+                note("%s=%s overrides the saved option at startup.", env, override);
     } else if (id == "fast-forward") {
         for (unsigned rate : {2u, 3u, 4u}) {
             if (rate != 2) ImGui::SameLine();
@@ -1268,8 +1277,10 @@ void cheats() {
     cheat("Equip Master Sword + Mirror Shield (until reload)", mods::kCheatSword);
     cheat("20 hearts, double magic, 5000 rupees", mods::kCheatStats);
     static const std::pair<const char*, int> inf[] = {{"Infinite health", mods::kInfHealth}, {"Infinite magic", mods::kInfMagic},
-                                                      {"Infinite arrows and bombs", mods::kInfAmmo}};
-    for (int i = 0; i < 3; i++) {
+                                                      {"Infinite arrows and bombs", mods::kInfAmmo},
+                                                      {"Moon jump (hold L; left stick steers)", mods::kMoonJump},
+                                                      {"No fall damage after moon jump", mods::kMoonNoFall}};
+    for (int i = 0; i < 5; i++) {
         int bit = inf[i].second;
         if (check(inf[i].first, mods::infinite(bit), &v)) hostui::post([bit, v] { mods::set_infinite(bit, v); });
     }
@@ -1302,6 +1313,8 @@ modsui::Host& mods_host() {
 #endif
         h.test = g_no_host && getenv("WWHD_MOD_MANAGER_DIR");
         h.file_picker = ext::features().file_picker;
+        h.code_mods = ext::features().code_mods;
+        h.mod_downloads = ext::features().mod_downloads;
         return h;
     }();
     h.back = false;
@@ -1579,11 +1592,10 @@ void tab_controls() {
         input_map::set_face_auto(m, true);
         input_map::set_current(m);
     }
-    help("How the controller's face buttons drive the Wii U's A/B/X/Y. By position: the bottom "
-         "button is B (Nintendo layout). By label: the button named A is A — on an Xbox pad that "
-         "makes A accept/act and B go back (issue #78). Automatic reads the labels printed on the "
-         "pad that was plugged in first and follows them. Only these four bindings are rewritten; "
-         "keyboard keys and the other inputs stay as they are.");
+    help("Which physical button does each Wii U action. By position: right is A, bottom B, "
+         "top X and left Y. By label: A does A, B does B, X does X and Y does Y. Automatic "
+         "reads the connected pad's labels. Button prompts below chooses how those buttons "
+         "look in the game. Only the four face bindings change.");
     if (m.face_auto) {
         ImGui::SameLine();
         ImGui::TextDisabled("(-> %s)", input_map::face_layout_label(fl));
@@ -1607,10 +1619,12 @@ void tab_controls() {
             }
         }
         ImGui::PopID();
-        help("How the game's button icons look while the face buttons are by label. Automatic: "
-             "PlayStation shapes on a PlayStation controller, the Xbox colours and positions on any "
-             "other. Original keeps the game's look. By position always keeps the game's look: its "
-             "prompts then already match the buttons' positions.");
+        help("How the game's button icons look, with any face-button setting. Xbox and "
+             "PlayStation show the button bound to each Wii U action. By position on Xbox, "
+             "roll shows B and sword shows A. Automatic follows the connected pad; Nintendo "
+             "keeps the game's look. By label keeps its existing automatic Xbox fallback. "
+             "Original keeps the game's look. Custom bindings need four distinct face buttons; "
+             "otherwise the original icons are used.");
         ImGui::SameLine();
         ImGui::TextDisabled("(-> %s)", look.face == input_map::FaceStyle::kPlayStation ? "PlayStation"
                                        : look.face == input_map::FaceStyle::kXbox      ? "Xbox"
@@ -1869,17 +1883,25 @@ void tab_about() {
     if (*build::variant())  // the decomp build (docs/decomp-build.md)
         ImGui::Text("%s (%s), %s build: the game code runs from the decompiled source (experimental)", build::version(),
                     build::commit(), build::variant());
+    if (!ext::features().keyboard) {  // a controller only
+        note("Settings overlay: hold Select / press Home on a controller. B closes. L / R switch tabs. The game keeps "
+             "running and sees no input while this menu is open.");
+        note("When the game asks for text (your name), a text window appears over the game: D-pad / left stick choose a "
+             "key, A types it, B deletes, X adds a space, Y is Shift, L / R switch between letters, accents and symbols, "
+             "Start confirms.");
+    } else {
 #ifdef __APPLE__
-    note("Settings overlay: F1 (Fn+F1 on most Mac keyboards), Cmd+, or Settings... in the app menu, or hold Select / "
-         "press Home on a controller. Esc, F1 or B closes. "
+        note("Settings overlay: F1 (Fn+F1 on most Mac keyboards), Cmd+, or Settings... in the app menu, or hold Select / "
+             "press Home on a controller. Esc, F1 or B closes. "
 #else
-    note("Settings overlay: F1, or hold Select / press Home on a controller. Esc, F1 or B closes. "
+        note("Settings overlay: F1, or hold Select / press Home on a controller. Esc, F1 or B closes. "
 #endif
-         "L / R switch tabs on a controller. The game keeps running and sees no input while this menu is open.");
-    note("When the game asks for text (your name), a text window appears over the game: type on the keyboard "
-         "(Enter = OK, Esc = Cancel), click the on-screen keys, or use a controller: D-pad / left stick choose a key, "
-         "A types it, B deletes, X adds a space, Y is Shift, L / R switch between letters, accents and symbols, "
-         "Start confirms.");
+             "L / R switch tabs on a controller. The game keeps running and sees no input while this menu is open.");
+        note("When the game asks for text (your name), a text window appears over the game: type on the keyboard "
+             "(Enter = OK, Esc = Cancel), click the on-screen keys, or use a controller: D-pad / left stick choose a key, "
+             "A types it, B deletes, X adds a space, Y is Shift, L / R switch between letters, accents and symbols, "
+             "Start confirms.");
+    }
     note("Built with Dear ImGui %s (MIT License, Omar Cornut and contributors).", IMGUI_VERSION);
 }
 
@@ -1939,10 +1961,12 @@ void tab_audio() {
     if (audio::master_volume_from_env())
         note("WWHD_AUDIO_VOLUME=%s is set for this start and takes precedence; changes here are not saved.",
              getenv("WWHD_AUDIO_VOLUME"));
-    int speakers = audio::requested_surround() ? 1 : 0;
-    if (combo("Speakers", &speakers, "Stereo\0Surround 5.1\0"))
-        hostui::post([speakers] { audio::set_requested_surround(speakers == 1); });
-    note("Restart the game after changing Speakers.");
+    if (ext::features().speaker_choice) {
+        int speakers = audio::requested_surround() ? 1 : 0;
+        if (combo("Speakers", &speakers, "Stereo\0Surround 5.1\0"))
+            hostui::post([speakers] { audio::set_requested_surround(speakers == 1); });
+        note("Restart the game after changing Speakers.");
+    }
     if (audio::surround_fallback())
         note("Surround 5.1 unavailable on this output. Using stereo; restart after connecting a 5.1 device.");
     if (audio::output_device_changed())
@@ -2056,6 +2080,7 @@ void set_open(bool open, OpenReason reason, KeyOrigin origin) {
     input::release_keys();  // keys held now belong to the menu (opening) or are not stuck in the game (closing)
     if (open) {
         mods::fast_forward_reset();
+        mods::lock_on_reset();
         mods::mouse_release();
         U.just_opened = true;
         U.slots_time = -1;

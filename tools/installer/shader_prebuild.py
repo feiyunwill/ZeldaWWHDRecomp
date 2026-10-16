@@ -67,7 +67,7 @@ def launch_identity(game, template, package, runtime):
 
 def read_marker(path):
     try:
-        value = json.loads(Path(path).read_text())
+        value = json.loads(Path(path).read_text(encoding='utf-8'))
         return value if isinstance(value, dict) else {}
     except (OSError, ValueError, TypeError):
         return {}

@@ -217,6 +217,23 @@ int main(int argc,char** argv) {
         listed(ui::kMore);
         for(int i=0;i<3;i++){ImGui_ImplSDLRenderer3_NewFrame();ImGui::NewFrame();ImGui::Begin("Settings");draw_tab(host);ImGui::End();ImGui::Render();}
         assert(s.area==ui::kMore);
+        // Features::code_mods / mod_downloads / file_picker off (a platform without them, overlay/extensions.h):
+        // More has no Code-mod support, Mod list or GameCube game section, Community no mods to download
+        auto more_sections=[&] {
+            s.rects.clear();
+            ImGui_ImplSDLRenderer3_NewFrame();ImGui::NewFrame();
+            ImGui::SetNextWindowPos(ImVec2(0,0),ImGuiCond_Always);ImGui::SetNextWindowSize(ImVec2(float(width),float(height)));
+            ImGui::Begin("Settings");draw_tab(host);ImGui::End();ImGui::Render();
+            return std::set<std::string>{s.rects.contains("Code-mod support")?"code":"",s.rects.contains("Mod list")?"list":"",
+                                         s.rects.contains("GameCube game for mods")?"gc":""};
+        };
+        assert((more_sections()==std::set<std::string>{"code","list","gc"}));
+        host.code_mods=host.mod_downloads=host.file_picker=false;
+        assert((more_sections()==std::set<std::string>{""}));
+        assert((listed(ui::kCommunity)==std::set<std::string>{id}));  // the installed one only
+        host.code_mods=host.mod_downloads=host.file_picker=true;
+        listed(ui::kMore);
+        fprintf(stderr,"[tabs] Features off: Code-mod support, Mod list, GameCube game and downloads left out\n");
         // controller L / R over the tab bar as the overlay does it (ext::shoulder with the Mods areas): through
         // an added tab's own sub-tabs, into Mods and its areas, on to the next added tab, and back
         namespace ext=overlay::ext;

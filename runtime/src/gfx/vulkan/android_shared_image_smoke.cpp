@@ -72,7 +72,7 @@ struct TestDevice {
     queueInfo.queueFamilyIndex=R.queueFamily;queueInfo.queueCount=1;queueInfo.pQueuePriorities=&priority;
     VkDeviceCreateInfo create{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     create.queueCreateInfoCount=1;create.pQueueCreateInfos=&queueInfo;
-    create.enabledExtensionCount=std::size(extensions);create.ppEnabledExtensionNames=extensions.data();create.pNext=&rendering;
+    create.enabledExtensionCount=std::size(extensions);create.ppEnabledExtensionNames=extensions.data();create.pNext=R.renderPasses?nullptr:&rendering;
     check(gfxvk::vkCreateDevice(R.physicalDevice,&create,nullptr,&device),"create isolated probe device");
 #define LOAD(name) name=reinterpret_cast<PFN_##name>(gfxvk::vkGetDeviceProcAddr(device,#name)); \
     if(!name)throw std::runtime_error("Missing isolated probe function " #name);
@@ -211,7 +211,7 @@ void android_shared_image_smoke(bool generalLayout) {
     }
   } sourceViewGuard{consumer};
   consumer.make_target(in.image,extent);
-  IndependentPresenter presenter(consumer.device,R.dynamicRenderingKHR);
+  IndependentPresenter presenter(consumer.device,R.dynamicRenderingKHR,R.renderPasses);
   const std::array<std::array<float,4>,3> colors{{{.25f,.5f,.75f,1},{1,0,0,1},{0,1,0,1}}};
   // Always drain before destroying imported images, even when an assertion
   // throws. These waits belong to an explicit debug probe, never normal frames.

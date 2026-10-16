@@ -20,6 +20,9 @@
 #include <string>
 
 #include "guest_addr.h"
+#include "input.h"
+#include "true60.h"
+#include "moon_jump_policy.h"
 #include "mods.h"
 #include "runtime.h"
 #include "savestate.h"
@@ -129,7 +132,25 @@ int parse_env(const char* var, std::initializer_list<std::pair<const char*, int>
 std::atomic<int> g_pending{parse_env("WWHD_CHEAT", {{"items", kCheatItems}, {"sword", kCheatSword}, {"stats", kCheatStats},
                                                     {"songs", kCheatSongs}, {"triforce", kCheatTriforce},
                                                     {"dungeon", kCheatDungeon}, {"key", kCheatKey}})};
-std::atomic<int> g_infinite{parse_env("WWHD_CHEAT_INFINITE", {{"health", kInfHealth}, {"magic", kInfMagic}, {"ammo", kInfAmmo}})};
+std::atomic<int> g_infinite{parse_env("WWHD_CHEAT_INFINITE", {{"health", kInfHealth}, {"magic", kInfMagic}, {"ammo", kInfAmmo}, {"moonjump", kMoonJump}, {"nofall", kMoonNoFall}})};
+std::atomic<uint32_t> moon_buttons{0}, moon_camera{0};
+std::atomic<uint64_t> moon_camera_scene{0};
+std::atomic<float> moon_stick_x{0}, moon_stick_y{0};
+std::atomic<bool> moon_reset_requested{false};
+struct Flight {
+    uint32_t link = 0;
+    uint64_t scene = 0;
+    bool flying = false;
+    int16_t facing = 0;
+    float x = 0, z = 0;
+};
+Flight flight, preview_saved;
+bool preview_saved_valid = false;
+// WWHD daPy_lk_c fields shared with climb.cpp and true60_link.cpp.
+constexpr uint32_t moon_proc = 0x65F0, moon_mode = 0x6A70;
+constexpr uint32_t moon_speed_y = 0x340, moon_pos_y = 0x318;
+constexpr uint32_t moon_angle = 0x322, moon_shape_angle = 0x32A;
+constexpr uint32_t moon_ground_flags = 0x834, moon_fall_height = 0x6A48;
 }  // namespace
 
 void request_cheat(int which) { g_pending |= which; }
@@ -137,11 +158,104 @@ bool infinite(int which) { return g_infinite.load(std::memory_order_relaxed) & w
 void set_infinite(int which, bool on) {
     if (on) g_infinite |= which;
     else g_infinite &= ~which;
-    LOG("[cheats] infinite %s %s", which == kInfHealth ? "health" : which == kInfMagic ? "magic" : "ammo", on ? "on" : "off");
+    if (which == kMoonJump) moon_reset_requested.store(true, std::memory_order_release);
+    LOG("[cheats] infinite %s %s", which == kInfHealth ? "health" : which == kInfMagic ? "magic" :
+        which == kInfAmmo ? "ammo" : which == kMoonJump ? "moon jump" : "no fall damage", on ? "on" : "off");
+}
+
+void moon_jump_input(const input::PadState& pad) {
+    if (!infinite(kMoonJump)) return;
+    moon_stick_x.store(pad.lx, std::memory_order_relaxed);
+    moon_stick_y.store(pad.ly, std::memory_order_relaxed);
+    moon_buttons.store(pad.buttons, std::memory_order_release);
+}
+
+void moon_jump_camera(uint32_t camera) {
+    if (!infinite(kMoonJump)) return;
+    const uint64_t scene = (uint64_t(ld32(kStageName)) << 32) | ld32(kStageName + 4);
+    moon_camera_scene.store(scene, std::memory_order_relaxed);
+    moon_camera.store(camera, std::memory_order_release);
+}
+
+void moon_jump_reset() {
+    flight = {}; preview_saved = {}; preview_saved_valid = false;
+    moon_camera.store(0, std::memory_order_relaxed);
+    moon_camera_scene.store(0, std::memory_order_relaxed);
+    moon_buttons.store(0, std::memory_order_relaxed);
+}
+
+void moon_jump_step(Cpu* cpu, uint32_t link, bool before) {
+    if (!infinite(kMoonJump)) return; // stock path: no guest reads or writes
+    const bool preview = true60::dt() < 1.f;
+    if (before) {
+        if (moon_reset_requested.exchange(false, std::memory_order_acquire)) moon_jump_reset();
+        // Do not allow a malformed actor or title/file-select input to dereference fields.
+        if (link < 0x10000 || link > 0xFFFF9000 || !save_loaded(save_addr())) {
+            flight = {};
+            preview_saved_valid = false;
+            moon_camera.store(0, std::memory_order_relaxed);
+            moon_camera_scene.store(0, std::memory_order_relaxed);
+            return;
+        }
+        const uint64_t scene = (uint64_t(ld32(kStageName)) << 32) | ld32(kStageName + 4);
+        if (flight.link != link || flight.scene != scene) {
+            // A freed camera can be reused before the new scene draws its camera.
+            // Preserve the initial draw's camera, but invalidate a prior actor/scene.
+            if (flight.link) moon_camera.store(0, std::memory_order_relaxed);
+            flight = {}; flight.link = link; flight.scene = scene;
+        }
+        if (preview) { preview_saved = flight; preview_saved_valid = true; }
+    } else if (flight.link != link) return;
+    const bool held = (moon_buttons.load(std::memory_order_acquire) & input::kL) != 0;
+    if (before && held && !preview) {
+        if (ld32(link + moon_proc) != 0x27) {
+            const Cpu saved = *cpu;
+            cpu->f[1].ps0 = cpu->f[1].ps1 = 5.;
+            guest_call(cpu, GC(0x023F6564), {link, 0}); // daPy_lk_c::procFall_init
+            *cpu = saved;
+        }
+        if (!flight.flying) flight.facing = int16_t(ld16(link + moon_shape_angle));
+        flight.flying = true;
+        st32(link + moon_ground_flags, ld32(link + moon_ground_flags) & ~0xE0u);
+    }
+    if (flight.flying) {
+        const uint32_t mode = ld32(link + moon_mode);
+        if (!held && (!(mode & 2) || (mode & 0x40000))) flight.flying = false;
+    }
+    if (flight.flying) {
+        if (held) stf32(link + moon_speed_y, 25.f);
+        if (infinite(kMoonNoFall)) st32(link + moon_fall_height, ld32(link + moon_pos_y));
+        if (before) {
+            float fx = 0, fz = 0;
+            const uint32_t camera = moon_camera.load(std::memory_order_acquire);
+            if (moon_camera_scene.load(std::memory_order_relaxed) == flight.scene &&
+                camera >= 0x10000 && camera <= 0xFFFFFE00) {
+                fx = ldf32(camera + 0xE8) - ldf32(camera + 0xDC);
+                fz = ldf32(camera + 0xF0) - ldf32(camera + 0xE4);
+            }
+            auto movement = moon_jump_policy::steer(flight.facing,
+                moon_stick_x.load(std::memory_order_relaxed), moon_stick_y.load(std::memory_order_relaxed),
+                fx, fz, preview ? true60::dt() : 1.f);
+            flight.facing = movement.facing; flight.x = movement.x; flight.z = movement.z;
+        }
+        st16(link + moon_angle, uint16_t(flight.facing));
+        st16(link + moon_shape_angle, uint16_t(flight.facing));
+    }
+    // Guest preview memory is rolled back by true60. Its host steering state must
+    // also be temporary, otherwise every preview would turn the next full step twice.
+    if (!before && preview_saved_valid) { flight = preview_saved; preview_saved_valid = false; }
+}
+
+bool moon_jump_move(uint32_t link, float& x, float& z) {
+    if (!infinite(kMoonJump) || !flight.flying || flight.link != link) return false;
+    x = flight.x; z = flight.z;
+    st16(link + moon_angle, uint16_t(flight.facing));
+    st16(link + moon_shape_angle, uint16_t(flight.facing));
+    return true;
 }
 
 void cheats_service() {
-    int inf = g_infinite.load(std::memory_order_relaxed);
+    int inf = g_infinite.load(std::memory_order_relaxed) & (kInfHealth | kInfMagic | kInfAmmo);
     if (!g_pending.load(std::memory_order_relaxed) && !inf) return;
     uint32_t s = save_addr();
     if (!save_loaded(s)) return;  // stays pending until a file is loaded

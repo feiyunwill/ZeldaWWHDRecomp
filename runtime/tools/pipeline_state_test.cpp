@@ -50,6 +50,17 @@ int main() {
     assert(owned->pMultisampleState->pSampleMask[1] == 0x87654321);
   });
   utilityWorker.join();
+  // Classic pass snapshots retain borrowed compatibility handles and owned
+  // portable target formats without exposing dynamic-rendering pNext to Vulkan.
+  auto targets = fixture.rendering_targets();
+  ci = *fixture.get(); ci.pNext = nullptr;
+  ci.renderPass = reinterpret_cast<VkRenderPass>(uintptr_t(123));
+  GraphicsPipelineState classic(ci, &targets);
+  auto classicCopy = classic;
+  assert(classicCopy.get()->renderPass == ci.renderPass && !classicCopy.get()->pNext);
+  assert(classicCopy.rendering_targets().pColorAttachmentFormats[0] == VK_FORMAT_R8G8B8A8_UNORM);
+  GraphicsPipelineState classicUtility(ci);
+  assert(classicUtility.get()->renderPass == ci.renderPass && !classicUtility.get()->pNext);
   VkGraphicsPipelineCreateInfo invalid{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
   bool rejected = false;
   try { GraphicsPipelineState unsupported(invalid); }

@@ -550,9 +550,7 @@ int main(int argc, char** argv) {
         mods::required::Context rc;
         std::string version = build::version();
         rc.catalogue = mods::required::catalogue_url(version);
-        if (version.starts_with("v")) version.erase(0, 1);
-        version = version.substr(0, version.find_first_of("+-"));
-        try { rc.port = mods::catalogue::Version::parse(version); } catch (...) {}
+        rc.port = mods::catalogue::port_version_from_build(version);  // ahead of a release: the next one
         rc.fetch = host::download_https;
         rc.build = g_guest_build_name;
         const std::string dir = mods::packages::directory();

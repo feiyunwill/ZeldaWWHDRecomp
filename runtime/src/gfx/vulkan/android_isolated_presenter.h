@@ -11,7 +11,7 @@ class AndroidIsolatedPresenter {
 public:
  enum class Operation { Surface, Acquire, Present };
  struct Result { Operation operation; VkResult status; VkExtent2D extent{}; uint64_t elapsedNs=0; };
- AndroidIsolatedPresenter(VkInstance,VkPhysicalDevice,VkDevice primary,uint32_t family,bool dynamicRenderingKHR);
+ AndroidIsolatedPresenter(VkInstance,VkPhysicalDevice,VkDevice primary,uint32_t family,bool dynamicRenderingKHR,bool renderPasses=false);
  ~AndroidIsolatedPresenter();
  AndroidIsolatedPresenter(const AndroidIsolatedPresenter&)=delete;
  AndroidIsolatedPresenter& operator=(const AndroidIsolatedPresenter&)=delete;

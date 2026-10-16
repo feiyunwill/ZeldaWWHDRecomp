@@ -222,6 +222,38 @@ int main(int argc, char** argv) {
 
     namespace fs=std::filesystem;
     using namespace mods::packages;
+    if(argc==3&&std::string(argv[1])=="--lock-on-startup") {
+        auto root=fs::temp_directory_path()/("wwhd-lock-on-"+std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+        fs::create_directories(root);
+        env("WWHD_NO_HOST_INPUT",nullptr);env("WWHD_MOD_MANAGER_DIR",root.string().c_str());
+        const std::string mode=argv[2];
+        const bool override=mode=="env", legacy=mode=="legacy", invalid=mode=="invalid";
+        env("WWHD_MOD_LOCK_ON",override?"0":nullptr);
+        env("WWHD_MOD_LOCK_ON_RANGE",override?"1":nullptr);
+        env("WWHD_MOD_LOCK_ON_CYCLING",override?"1":nullptr);
+        preferences["mod.lock-on.enabled"]="1";
+        preferences["mod.lock-on.range"]="2";preferences["mod.lock-on.cycling"]="0";
+        auto database=mods::json::parse(R"({"format_version":1,"active":"Default","profiles":{"Default":{"builtins":{"lock-on":true},"builtin_options":{}}}})");
+        if (!legacy) {
+            auto& options=database["profiles"]["Default"]["builtin_options"];
+            options["lock-on.range"]=invalid?4.0:3.0;
+            options["lock-on.cycling"]=invalid?mods::json::Value("invalid"):mods::json::Value(true);
+        }
+        std::ofstream(root/"profiles.json")<<mods::json::dump(database);
+        mods::manager::load_saved();
+        assert(mods::extended_lock_on()==!override);
+        assert(mods::lock_on_range()==(override?1.f:2.f));
+        assert(mods::lock_on_cycling()==override);
+        initialize();
+        assert(mods::extended_lock_on()==!override);
+        assert(mods::lock_on_range()==(override||invalid?1.f:legacy?2.f:3.f));
+        assert(mods::lock_on_cycling()==!legacy);
+        std::string error;
+        assert(select_profile("Default",error));
+        assert(mods::lock_on_range()==(override||invalid||legacy?1.f:3.f));
+        assert(mods::lock_on_cycling());
+        fs::remove_all(root);return 0;
+    }
     if(argc==4&&std::string(argv[1])=="--move-anim-startup") {
         auto root=fs::temp_directory_path()/("wwhd-move-anim-"+std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
         fs::create_directories(root);
@@ -672,14 +704,33 @@ int main(int argc, char** argv) {
     assert(enable("climb-preset",false,error));frame(2);assert(!state[3]);
     mods::set_fast_forward_rate(3); mods::set_fast_forward_button(0x20); mods::set_fast_forward_mute(false);
     remember_option("fast-forward.rate", 3); remember_option("fast-forward.button", 0x20); remember_option("fast-forward.mute", 0);
+    for (const char* mode : {"saved", "legacy", "invalid", "env"}) {
+        auto result=host::run_process({argv[0],"--lock-on-startup",mode});
+        if(result.code!=0)std::cerr<<result.output;
+        assert(result.code==0);
+    }
+    assert(!mods::extended_lock_on() && mods::lock_on_range()==1.f && mods::lock_on_cycling());
+    mods::set_lock_on_range(2.5f);mods::set_lock_on_cycling(false);
+    assert(mods::manager::set_enabled("lock-on",true));
+    remember_option("lock-on.range",2.5);remember_option("lock-on.cycling",0);
     assert(create_profile("Adventure",error));
+    mods::set_lock_on_range(1.f);mods::set_lock_on_cycling(true);
+    assert(mods::manager::set_enabled("lock-on",false));
+    remember_option("lock-on.range",1);remember_option("lock-on.cycling",1);
     mods::set_fast_forward_rate(4); mods::set_fast_forward_button(0x80); mods::set_fast_forward_mute(true);
     remember_option("fast-forward.rate", 4); remember_option("fast-forward.button", 0x80); remember_option("fast-forward.mute", 1);
     assert(enable("climb-preset",true,error));frame(20);assert(state[3]);
     assert(select_profile("Adventure",error));frame(21);assert(!state[3]);
     assert(mods::fast_forward_rate()==3 && mods::fast_forward_button()==0x20 && !mods::fast_forward_mute());
+    assert(mods::extended_lock_on() && mods::lock_on_range()==2.5f && !mods::lock_on_cycling());
+    {std::ifstream saved_file(root/"storage/profiles.json");
+     auto saved=mods::json::parse(std::string{std::istreambuf_iterator<char>(saved_file),{}});
+     const auto& options=saved.get("profiles").get("Adventure").get("builtin_options");
+     assert(options.get("lock-on.range").number==2.5);
+     assert(options.get("lock-on.cycling").type==mods::json::Value::Bool && !options.get("lock-on.cycling").boolean);}
     assert(current_profile()=="Adventure");assert(!delete_profile("Adventure",error));
     assert(select_profile("Default",error));assert(mods::fast_forward_rate()==4 && mods::fast_forward_button()==0x80 && mods::fast_forward_mute());assert(delete_profile("Adventure",error));
+    assert(!mods::extended_lock_on() && mods::lock_on_range()==1.f && mods::lock_on_cycling());
     assert(install(package("missing-dep",",\"dependencies\":[{\"id\":\"absent\"}]"),error));
     assert(!enable("missing-dep",true,error));
     assert(remove("missing-dep",error));

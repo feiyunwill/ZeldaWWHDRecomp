@@ -50,7 +50,7 @@ std::optional<Value> read(const std::string& key) {
 }
 namespace input {PadState read() {return {};}}
 namespace true60 {float dt() {return 0.5f;}}
-namespace mem { std::string read_cstr(uint32_t) { return "option"; } }
+namespace mem { std::string read_cstr(uint32_t) { return "option"; } uint32_t host_alloc(uint32_t,uint32_t) { return 0; } }
 namespace dispatch { void set(uint32_t, PpcFunc) {} }
 namespace mods::packages {
 static bool in_startup_callback=false, inspected=false;
@@ -92,6 +92,19 @@ bool imported() {return false;}
 void set_game_calls(void (*)(Cpu*,uint32_t),uint32_t (*)(Cpu*,uint32_t,std::initializer_list<uint32_t>)) {}
 void install(const std::function<std::string(uint32_t)>&,const std::function<void(uint32_t,void (*)(Cpu*))>&) {}
 void state_loaded() {}
+size_t declared() {return 0;}
+}
+// and so have the mod treasure charts (their tests)
+namespace story_treasure {
+std::vector<Hook> chest_hooks() {return {};}
+void set_game_calls(void (*)(Cpu*,uint32_t),uint32_t (*)(Cpu*,uint32_t,std::initializer_list<uint32_t>)) {}
+void set_scratch_memory(uint32_t) {}
+void install(const std::function<std::string(uint32_t)>&,const std::function<void(uint32_t,void (*)(Cpu*))>&) {}
+}
+namespace story_treasure_chest {
+void state_loaded() {}
+void set_item_get_next(void (*)(Cpu*),void (*)(Cpu*,uint32_t)) {}
+namespace hooks { void exec_item_get(Cpu*) {} }
 }
 // and so has the story notebook (story_notebook_test)
 namespace config { std::string game_dir; }
@@ -121,6 +134,56 @@ int32_t flag(const std::string&,const std::string&,uint32_t) {return kResultInva
 bool imported() {return false;}
 void set_game_ui(const GameUi*) {}
 const GameUi& game_ui() {static GameUi none;return none;}
+}
+// and so have the mod items (story_items_test) and the item icon archive (item_icons_test)
+namespace story_items {
+bool define(const std::string&,const std::string&,const story_notebook::ManifestItem&,std::string&) {return false;}
+std::vector<Item> installed() {return {};}
+void set_frame_source(int (*)(uint16_t)) {}
+int32_t give(const std::string&,const std::string&,uint32_t,const char*,bool) {return kResultInvalid;}
+int32_t take(const std::string&,const std::string&,uint32_t) {return kResultInvalid;}
+int32_t count(const std::string&,const std::string&) {return kResultInvalid;}
+int32_t used(const std::string&,const std::string&) {return kResultInvalid;}
+void set_presenter(ShowInfo) {}
+void set_use_calls(bool (*)(const char*),int32_t (*)(const std::string&,const std::string&,uint32_t)) {}
+void note_import() {}
+bool imported() {return false;}
+void install(const std::function<std::string(uint32_t)>&,const std::function<void(uint32_t,void (*)(Cpu*))>&) {}
+void set_game_calls(void (*)(Cpu*,uint32_t),uint32_t (*)(Cpu*,uint32_t,std::initializer_list<uint32_t>)) {}
+namespace hooks { void exec_item_get(Cpu*) {} }
+}
+namespace item_icons {
+void set_items(const std::vector<Item>&,const std::filesystem::path&) {}
+int frame(uint16_t) {return -1;}
+}
+namespace story_mail { void set_item_get_next(void (*)(Cpu*)) {} }
+namespace story_notebook {
+int32_t reach(const std::string&,const std::string&,uint32_t) {return kResultInvalid;}
+void set_icon_open(const std::string&) {}
+void set_layout_description(const std::string&,const std::string&) {}
+}
+// and the story layouts, the notebook's page layout, the bag's extra pages and the item buttons (their tests)
+namespace story_lyt {
+void set_game_calls(void (*)(Cpu*,uint32_t),uint32_t (*)(Cpu*,uint32_t,std::initializer_list<uint32_t>)) {}
+void install(const std::function<void(uint32_t,void (*)(Cpu*))>&) {}
+}
+namespace story_lyt_screen {
+void set_game_calls(void (*)(Cpu*,uint32_t),uint32_t (*)(Cpu*,uint32_t,std::initializer_list<uint32_t>)) {}
+void install(const std::function<std::string(uint32_t)>&,const std::function<void(uint32_t,void (*)(Cpu*))>&) {}
+void state_loaded() {}
+void service(Cpu*) {}
+}
+namespace story_notebook_layout { bool configure() {return false;} }
+namespace story_bag {
+bool configure(const std::filesystem::path&) {return false;}
+void set_after_assign(void (*)(Cpu*)) {}
+void set_game_calls(void (*)(Cpu*,uint32_t),uint32_t (*)(Cpu*,uint32_t,std::initializer_list<uint32_t>)) {}
+void state_loaded() {}
+}
+namespace story_item_buttons {
+void set_game_calls(void (*)(Cpu*,uint32_t),uint32_t (*)(Cpu*,uint32_t,std::initializer_list<uint32_t>)) {}
+void refresh_strip(Cpu*) {}
+void install(const std::function<std::string(uint32_t)>&,const std::function<void(uint32_t,void (*)(Cpu*))>&) {}
 }
 // and so has the story progress store (story_notebook_test)
 namespace story_store {

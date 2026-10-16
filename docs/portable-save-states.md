@@ -137,4 +137,4 @@ load, Link is on the boat and the boat at its place and heading; with gametest `
 save while the King of Red Lions talks is refused and writes nothing, a full save at the same
 moment works, a portable save after the dialogue works. Last, full save states still save and load.
 
-Controller metadata: format 1 accepts optional `controller = 1` (GamePad) or `controller = 2` (Pro Controller). Loading restores that host input mode. Missing metadata or `0` leaves the current mode unchanged. Unknown values are refused; the existing field and total-size guards still apply.
+Controller metadata: format 1 accepts optional `controller = 1` (GamePad) or `controller = 2` (Pro Controller). It is shown in the slot label only: loading never changes the controller the player has chosen (Input menu / Controls). After any load, full or progress, the game itself is switched to that controller if it is in the other mode, through its own Options controller change (see `runtime/src/controller_reapply.h`). Missing metadata or `0` is accepted. Unknown values are refused; the existing field and total-size guards still apply.

@@ -362,18 +362,31 @@ PadFamily pad_family_from_labels(const FaceLabel labels[4]) {
 
 PromptStyle prompt_style(const Mapping& m, PadFamily family) {
     PromptStyle s;
-    if (face_layout(m) == FaceLayout::kLabels) {
+    const bool labels = face_layout(m) == FaceLayout::kLabels;
+    bool unambiguous = true;
+    unsigned used = 0;
+    for (int i = 0; i < 4; ++i) {
+        const int button = m.pad[kA + i] - kPadA;
+        // Non-face inputs and duplicate bindings cannot describe a four-button pad picture.
+        // Fall back as a complete set rather than mixing original and restyled icons.
+        if (button < 0 || button >= 4 || (used & (1u << button))) { unambiguous = false; break; }
+        used |= 1u << button;
+        s.buttons[i] = button;
+    }
+    if (unambiguous) {
         switch (m.prompts) {
         case Mapping::Prompts::kAuto:
-            s.face = family == PadFamily::kPlayStation ? FaceStyle::kPlayStation : FaceStyle::kXbox;
+            s.face = family == PadFamily::kPlayStation ? FaceStyle::kPlayStation
+                   : labels || family == PadFamily::kXbox ? FaceStyle::kXbox : FaceStyle::kOriginal;
             break;
         case Mapping::Prompts::kXbox: s.face = FaceStyle::kXbox; break;
         case Mapping::Prompts::kPlayStation: s.face = FaceStyle::kPlayStation; break;
         case Mapping::Prompts::kOriginal: break;
         }
     }
-    s.positions = s.face != FaceStyle::kOriginal;
-    s.colours = s.positions && m.prompt_colours;
+    if (s.face == FaceStyle::kOriginal) s.buttons = {0, 1, 2, 3};
+    s.positions = s.face != FaceStyle::kOriginal && labels;
+    s.colours = s.face != FaceStyle::kOriginal && m.prompt_colours;
     switch (m.shoulder_names) {
     case Mapping::ShoulderNames::kAuto:
         s.shoulders = s.face == FaceStyle::kXbox ? ShoulderStyle::kXbox

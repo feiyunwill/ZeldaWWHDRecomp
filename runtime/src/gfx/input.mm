@@ -1,4 +1,5 @@
 #include "../mods/fast_forward.h"
+#include "../mods/mods.h"
 #ifdef WWHD_HAS_VULKAN
 #include "gfx/vulkan/stutter_trace.h"
 #include "gfx/vulkan/headstart.h"
@@ -195,6 +196,7 @@ void held_keys(bool* keys) {
 
 void release_keys() {
     mods::fast_forward_reset();
+    mods::lock_on_reset();
     std::lock_guard<std::mutex> lk(g_mu);
     g_mouse_bindings.consume();
     memset(g_keys, 0, sizeof(g_keys));
@@ -678,7 +680,14 @@ static void apply_scenario(PadState& s) {
 
 static std::atomic<bool> g_pro{getenv("WWHD_PRO_CONTROLLER") != nullptr};
 bool pro_controller() { return g_pro.load(std::memory_order_relaxed); }
-void set_pro_controller(bool on) { g_pro = on; LOG("[input] keyboard/controller act as %s", on ? "Pro Controller" : "GamePad"); }
+static std::atomic<void (*)(bool)> g_controller_listener{nullptr};
+void set_controller_listener(void (*fn)(bool pro)) { g_controller_listener = fn; }
+void set_pro_controller(bool on) {
+    const bool was = g_pro.exchange(on);
+    LOG("[input] keyboard/controller act as %s", on ? "Pro Controller" : "GamePad");
+    if (was != on)
+        if (auto fn = g_controller_listener.load()) fn(on);
+}
 
 PadState read() {
     static const std::vector<Press> script = scripted();

@@ -58,6 +58,7 @@ class Store {
     std::map<std::string,std::vector<std::weak_ptr<const Image>>> allocations;
     std::map<std::pair<std::string,uint32_t>,std::shared_ptr<const List>> published;
     std::atomic<bool> visible{false};
+    std::atomic<float> pixel_scale[2]{0.f,0.f};
     std::map<std::string,std::string> errors;
     Handle handle() {return next<=UINT32_MAX?uint32_t(next++):0;}
     static bool geometry(const Command& c) {
@@ -188,6 +189,13 @@ public:
         visible.store(!published.empty(),std::memory_order_release);
     }
     uint64_t state_generation() {std::lock_guard lock(mutex);return generation;}
+    // The real pixels per screen unit a screen's lists were last presented at (the TV: its 1280 x 720
+    // units, the GamePad: its 854 x 480), from the renderer; 0 before the first presentation. A list
+    // can compose its pictures at that size (story_notebook_font.h).
+    void note_pixels(uint32_t screen,float pixels) {
+        if(screen<2&&std::isfinite(pixels)&&pixels>0)pixel_scale[screen].store(pixels,std::memory_order_relaxed);
+    }
+    float pixels(uint32_t screen) const {return screen<2?pixel_scale[screen].load(std::memory_order_relaxed):0.f;}
     bool active() const {return visible.load(std::memory_order_acquire);}
     void reset() {
         std::lock_guard lock(mutex);pending.clear();images.clear();published.clear();

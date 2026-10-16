@@ -41,6 +41,9 @@ struct Quest {
     // the quest's steps as its manifest declares them (the notebook's progress line); empty when the
     // mod's code keeps its own steps
     std::vector<std::string> steps;        // step 1, 2, ...: what each asks for
+    // the mod chart the current step points to ("find": "chart:<id>"), while Link owns it: the page
+    // offers "Open chart" (the MAP screen's chart list with that chart selected)
+    std::string chart_mod, chart;
 };
 
 enum class Status : uint8_t { InProgress, New, NotAvailable, Done };
